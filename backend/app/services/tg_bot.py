@@ -228,7 +228,11 @@ class TGService:
                     "share_url": share_url,
                     "entities": segment_info["entities"] if segment_info else ser_entities
                 }
-                save_res = await p115_service.save_and_share(share_url, metadata=metadata)
+                save_res = await p115_service.save_and_share(
+                    share_url, 
+                    metadata=metadata,
+                    skip_large_package=settings.TG_SKIP_LARGE_PACKAGE
+                )
                 
                 if save_res:
                     if save_res.get("status") == "success":
@@ -247,6 +251,10 @@ class TGService:
                             await message.reply(f"✅ 处理成功！\n长期分享链接：\n{share_link}")
                             await message.reply(f"🔔 链接保存成功！\n原链接: {share_url}\n新分享: {share_link}")
                             return True, share_link
+                    elif save_res.get("status") == "skipped":
+                        msg_text = "⚠️ 此分享链接为大包，已跳过处理"
+                        await message.reply(msg_text)
+                        return "skipped", None
                     elif save_res.get("status") == "pending":
                         # Handle different pending reasons
                         reason = save_res.get("reason", "auditing")
@@ -339,6 +347,7 @@ class TGService:
         success_count = 0
         pending_count = 0
         failed_count = 0
+        skip_count = 0
         failed_details = []  # Store failed link details: [(url, error_msg)]
         
         last_res = None
@@ -377,6 +386,8 @@ class TGService:
                     )
             elif res == "pending":
                 pending_count += 1
+            elif res == "skipped":
+                skip_count += 1
             else:
                 failed_count += 1
                 # Record failure details
@@ -401,6 +412,12 @@ class TGService:
             elif pending_count == 1:
                 # For single auditing link, use a more friendly message
                 await status_msg.edit_text("🔍 分享链接正在审核中，将在审核通过后，进行保存分享处理")
+            elif skip_count == 1:
+                # For single skipped link, delete the processing status message
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
             else:
                 # For single failed link
                 error_text = "❌ 处理完成，但链接处理失败。"
@@ -422,6 +439,8 @@ class TGService:
             result_text = f"✅ 批量处理完成！\n\n成功: {success_count}\n"
             if pending_count:
                 result_text += f"⏳ 审核/快照中 (转换后自动发布): {pending_count}\n"
+            if skip_count:
+                result_text += f"⏭️ 已跳过 (大包限制): {skip_count}\n"
             if failed_count:
                 result_text += f"❌ 失败: {failed_count}\n"
                 # Add detailed failure information

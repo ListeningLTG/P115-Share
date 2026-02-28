@@ -19,6 +19,7 @@ class ConfigUpdate(BaseModel):
     tg_user_id: Optional[str] = None
     tg_allow_chats: Optional[str] = None
     tg_channels: Optional[str] = None
+    tg_skip_large_package: Optional[bool] = None
     p115_cookie: Optional[str] = None
     p115_save_dir: Optional[str] = None
     p115_cleanup_dir_cron: Optional[str] = None
@@ -76,6 +77,8 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
         await settings.save_setting("TG_ALLOW_CHATS", cfg.tg_allow_chats)
     if "tg_channels" in update_data:
         await settings.save_setting("TG_CHANNELS", cfg.tg_channels)
+    if "tg_skip_large_package" in update_data:
+        await settings.save_setting("TG_SKIP_LARGE_PACKAGE", cfg.tg_skip_large_package)
     
     # 2. Update 115 settings
     if "p115_cookie" in update_data and settings.P115_COOKIE != cfg.p115_cookie:
@@ -153,6 +156,7 @@ async def get_config(user=Depends(get_current_user)):
         "tg_user_id": settings.TG_USER_ID,
         "tg_allow_chats": settings.TG_ALLOW_CHATS,
         "tg_channels": settings.TG_CHANNELS,
+        "tg_skip_large_package": settings.TG_SKIP_LARGE_PACKAGE,
         "p115_cookie": settings.P115_COOKIE,
         "p115_logged_in": p115_service.is_connected,
         "p115_save_dir": settings.P115_SAVE_DIR,

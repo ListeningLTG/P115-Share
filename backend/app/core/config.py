@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     TG_USER_ID: str = ""
     TG_ALLOW_CHATS: str = "" # Comma separated list of IDs
     TG_CHANNELS: str = "[]"  # JSON list of {id, enabled, concise}
+    TG_SKIP_LARGE_PACKAGE: bool = False
     
     # 115
     P115_COOKIE: str = ""

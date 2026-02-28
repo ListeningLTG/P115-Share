@@ -64,6 +64,13 @@
           <a-form-item label="Chat ID 白名单" name="tg_allow_chats">
             <a-input v-model:value="formState.tg_allow_chats" placeholder="允许使用机器人的 ID (多个用逗号分隔)" />
           </a-form-item>
+
+          <a-form-item label="跳过大包 (500文件限制)">
+            <template #extra>
+              <div style="font-size: 12px; color: #999; margin-top: 4px">开启后，机器人收到的链接如果是大包将直接跳过并提醒，不进行分批转存</div>
+            </template>
+            <a-switch v-model:checked="formState.tg_skip_large_package" />
+          </a-form-item>
           
           <a-divider />
           <a-button type="primary" @click="onFinish('tg')" :loading="loading" block>保存 Telegram 配置</a-button>
@@ -209,6 +216,7 @@ const formState = reactive({
   tg_bot_token: '',
   tg_user_id: '',
   tg_allow_chats: '',
+  tg_skip_large_package: false,
   p115_cookie: '',
   p115_save_dir: '',
   p115_cleanup_dir_cron: '',
@@ -278,6 +286,7 @@ const loadConfig = async () => {
     formState.tg_bot_token = res.data.tg_bot_token || '';
     formState.tg_user_id = res.data.tg_user_id || '';
     formState.tg_allow_chats = res.data.tg_allow_chats || '';
+    formState.tg_skip_large_package = res.data.tg_skip_large_package || false;
     
     // Handle tg_channels JSON
     if (res.data.tg_channels) {
@@ -321,7 +330,7 @@ const loadConfig = async () => {
 const onFinish = async (section: 'tg' | 'p115' | 'proxy' = 'tg') => {
   try {
     const sectionFields: Record<string, string[]> = {
-      tg: ['tg_bot_token', 'tg_user_id', 'tg_allow_chats'],
+      tg: ['tg_bot_token', 'tg_user_id', 'tg_allow_chats', 'tg_skip_large_package'],
       p115: [
         'p115_cookie', 'p115_save_dir', 'p115_cleanup_dir_cron', 
         'p115_cleanup_trash_cron', 'p115_recycle_password',
