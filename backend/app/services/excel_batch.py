@@ -377,7 +377,8 @@ class ExcelBatchService:
                     ExcelTaskItem, 
                     ExcelTask.target_channels,
                     ExcelTask.white_list_keywords,
-                    ExcelTask.black_list_keywords
+                    ExcelTask.black_list_keywords,
+                    ExcelTask.skip_large_package
                 )
                 .join(ExcelTask, ExcelTask.id == ExcelTaskItem.task_id)
                 .where(ExcelTaskItem.id == item_id)
@@ -388,6 +389,7 @@ class ExcelBatchService:
                 target_channels = row[1]
                 white_list = row[2]
                 black_list = row[3]
+                skip_large_package = row[4]
             except Exception:
                 logger.error(f"Item {item_id} not found or task deleted")
                 return
@@ -475,7 +477,8 @@ class ExcelBatchService:
                 save_res = await p115_service.save_and_share(
                     url_to_save, 
                     metadata=metadata,
-                    target_dir=settings.P115_SAVE_DIR
+                    target_dir=settings.P115_SAVE_DIR,
+                    skip_large_package=skip_large_package
                 )
                 
                 if save_res:
@@ -507,6 +510,9 @@ class ExcelBatchService:
                     elif save_res.get("status") == "pending":
                         item.status = "成功"
                         item.error_msg = "已在115审核队列"
+                    elif save_res.get("status") == "skipped":
+                        item.status = "跳过"
+                        item.error_msg = save_res.get("message", "跳过处理")
                     else:
                         item.status = "失败"
                         item.error_msg = save_res.get("message", "转存失败")
@@ -546,7 +552,7 @@ class ExcelBatchService:
             )
             await session.commit()
 
-    async def start_task(self, task_id: int, skip_count: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None):
+    async def start_task(self, task_id: int, skip_count: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False):
         async with async_session() as session:
             # Get currrent status
             result = await session.execute(select(ExcelTask).where(ExcelTask.id == task_id))
@@ -575,6 +581,8 @@ class ExcelBatchService:
                 task.white_list_keywords = white_list_keywords
             if black_list_keywords is not None:
                 task.black_list_keywords = black_list_keywords
+            
+            task.skip_large_package = skip_large_package
             
             if not is_resume:
                 task.skip_count = skip_count

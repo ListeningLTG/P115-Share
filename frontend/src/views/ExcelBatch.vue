@@ -210,6 +210,12 @@
                          :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)"
                       />
                   </div>
+                  <div class="form-item" style="margin-left: 24px; flex: none; width: 140px">
+                     <label>跳过大包 (500文件限制)</label>
+                     <div style="height: 32px; display: flex; align-items: center">
+                        <a-switch v-model:checked="skipLargePackage" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
+                     </div>
+                  </div>
                 </div>
                 
                 <div class="form-row">
@@ -467,6 +473,7 @@ const creatingTask = ref(false);
 const pausing = ref(false);
 const cancelling = ref(false);
 const skipCount = ref(0);
+const skipLargePackage = ref(false);
 const pendingFile = ref<File | null>(null);
 const parseResult = ref<any>(null);
 const mapping = reactive({
@@ -555,6 +562,7 @@ const fetchCurrentTask = async () => {
       }
       if (updatedTask.white_list_keywords !== undefined) whiteListKeywords.value = updatedTask.white_list_keywords || '';
       if (updatedTask.black_list_keywords !== undefined) blackListKeywords.value = updatedTask.black_list_keywords || '';
+      if (updatedTask.skip_large_package !== undefined) skipLargePackage.value = updatedTask.skip_large_package || false;
     }
   } catch (e) {
     console.error('获取任务详情失败', e);
@@ -598,6 +606,7 @@ const selectTask = (id: number) => {
 
   whiteListKeywords.value = task?.white_list_keywords || '';
   blackListKeywords.value = task?.black_list_keywords || '';
+  skipLargePackage.value = task?.skip_large_package || false;
   
   pagination.current = 1;
   pagination.pageSize = 50;
@@ -672,7 +681,8 @@ const handleStartTask = async () => {
       interval_max: intervalMax.value,
       target_channels: selectedChannels.value,
       white_list_keywords: whiteListKeywords.value,
-      black_list_keywords: blackListKeywords.value
+      black_list_keywords: blackListKeywords.value,
+      skip_large_package: skipLargePackage.value
     });
     message.success(isResume ? '正在继续转存分享...' : '正在启动转存分享...');
     await fetchTasks();

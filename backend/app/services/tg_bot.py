@@ -835,6 +835,10 @@ class TGService:
         if channel_ids is not None:
             target_ids = set(str(cid) for cid in channel_ids)
             enabled_channels = [c for c in enabled_channels if str(c.get("id")) in target_ids]
+        else:
+            # 普通消息推送：仅发送至开启了“自动转发”的频道
+            # 注意：默认为 True 以保证向后兼容性 (已有频道默认开启)
+            enabled_channels = [c for c in enabled_channels if c.get("auto_forward", True)]
         
         if not enabled_channels:
             logger.debug(f"没有符合条件的目标频道 (channel_ids={channel_ids})，跳过广播")

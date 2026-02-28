@@ -39,6 +39,10 @@
                     <span class="switch-label">简洁</span>
                     <a-switch v-model:checked="channel.concise" size="small" />
                   </span>
+                  <span class="switch-item">
+                    <span class="switch-label">自动转发</span>
+                    <a-switch v-model:checked="channel.auto_forward" size="small" />
+                  </span>
                 </a-space>
               </a-col>
               <a-col :flex="'60px'" style="text-align: right">
@@ -194,6 +198,7 @@ interface ChannelConfig {
   id: string;
   enabled: boolean;
   concise: boolean;
+  auto_forward: boolean;
   name?: string;
   loading?: boolean;
 }
@@ -221,7 +226,7 @@ const formState = reactive({
 });
 
 const addChannel = () => {
-  tgChannels.value.push({ id: '', enabled: true, concise: false, name: '' });
+  tgChannels.value.push({ id: '', enabled: true, concise: false, auto_forward: true, name: '' });
 };
 
 const removeChannel = (index: number) => {
@@ -277,14 +282,21 @@ const loadConfig = async () => {
     // Handle tg_channels JSON
     if (res.data.tg_channels) {
       try {
-        tgChannels.value = JSON.parse(res.data.tg_channels);
+        const channels = JSON.parse(res.data.tg_channels);
+        // Ensure defaults for existing channels
+        tgChannels.value = channels.map((c: any) => ({
+          ...c,
+          enabled: c.enabled !== undefined ? c.enabled : true,
+          concise: c.concise !== undefined ? c.concise : false,
+          auto_forward: c.auto_forward !== undefined ? c.auto_forward : true
+        }));
       } catch (e) {
         console.error("Failed to parse tg_channels:", e);
         tgChannels.value = [];
       }
     } else if (res.data.tg_channel_id) {
       // Compatibility for old single channel
-      tgChannels.value = [{ id: res.data.tg_channel_id, enabled: true, concise: false }];
+      tgChannels.value = [{ id: res.data.tg_channel_id, enabled: true, concise: false, auto_forward: true }];
     }
     
     formState.p115_cookie = res.data.p115_cookie || '';

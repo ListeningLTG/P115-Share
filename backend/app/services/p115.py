@@ -372,14 +372,14 @@ class P115Service:
                 "message": f"保存失败，且重试转存报错: {str(check_e)}"
             }
 
-    async def save_share_link(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None):
+    async def save_share_link(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False):
         """通过队列保存链接"""
-        return await self._enqueue_op("save_share", self._save_share_link_internal, share_url, metadata, target_dir)
+        return await self._enqueue_op("save_share", self._save_share_link_internal, share_url, metadata, target_dir, skip_large_package)
 
-    async def save_and_share(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None):
+    async def save_and_share(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False):
         """通过队列进行转存并分享"""
         async def _internal_flow():
-            save_res = await self._save_share_link_internal(share_url, metadata, target_dir)
+            save_res = await self._save_share_link_internal(share_url, metadata, target_dir, skip_large_package)
             if save_res and save_res.get("status") == "success":
                 share_res = await self.create_share_link(save_res)
                 if isinstance(share_res, str):
@@ -400,7 +400,7 @@ class P115Service:
 
         return await self._enqueue_op(f"save_and_share({share_url})", _internal_flow)
 
-    async def _save_share_link_internal(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None):
+    async def _save_share_link_internal(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False):
         """Internal logic for saving a 115 share link (no locking)"""
         if not self.client:
             logger.warning("P115Client not initialized, cannot save link")
@@ -594,6 +594,12 @@ class P115Service:
                 errno_val = error_info.get("errno") if isinstance(error_info, dict) else None
                 
                 if errno_val == 4200044 or "超过当前等级限制" in str(recv_error):
+                    if skip_large_package:
+                        logger.info(f"⏭️ 检测为大包且开启了跳过选项，跳过处理: {share_url}")
+                        return {
+                            "status": "skipped",
+                            "message": "检测为大包，跳过处理"
+                        }
                     logger.warning(f"⚠️ 触发 115 非会员 500 文件保存限制，尝试递归分批保存: {share_url}")
                     recursive_links = await self._save_share_recursive(share_url, to_cid)
                     logger.info(f"✅ 递归分批保存指令已处理完毕: {share_url}")
@@ -800,8 +806,16 @@ class P115Service:
                             self.client.fs_files_app2, save_dir_cid, async_=True,
                             **self._get_ios_ua_kwargs()
                         )
-                        ls_items = ls_resp.get("data", [])
-                        ls_names = [it["n"] for it in ls_items]
+                        check_response(ls_resp)
+                        ls_data = ls_resp.get("data", [])
+                        ls_items = ls_data.get("list", []) if isinstance(ls_data, dict) else ls_data
+                        
+                        ls_names = []
+                        for it in ls_items:
+                            # 尝试多种可能的键名提取文件名
+                            item_name = it.get("n") or it.get("fn") or it.get("name") or it.get("file_name") or it.get("title")
+                            if item_name:
+                                ls_names.append(item_name)
                         
                         if ls_names:
                             intermediate_link = await self.create_share_link({"to_cid": save_dir_cid, "names": ls_names})

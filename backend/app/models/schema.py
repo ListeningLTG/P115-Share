@@ -56,6 +56,7 @@ class ExcelTask(Base):
     target_channels: Mapped[dict] = mapped_column(JSON, nullable=True)  # List of channel IDs to push to
     white_list_keywords: Mapped[str] = mapped_column(Text, nullable=True)  # Comma separated
     black_list_keywords: Mapped[str] = mapped_column(Text, nullable=True)  # Comma separated
+    skip_large_package: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 class ExcelTaskItem(Base):
