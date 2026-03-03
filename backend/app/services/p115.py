@@ -1248,11 +1248,68 @@ class P115Service:
             logger.error(f"❌ 内部清理保存目录失败: {e}")
             return False
 
-    async def get_storage_stats(self) -> Tuple[int, int]:
-        """Get storage stats (used, total) of 115 Drive in bytes"""
+    async def get_storage_stats(self) -> dict:
+        """Get storage stats (used, total) of 115 Drive in bytes.
+        Supports both entire cloud drive and specific save directory based on settings.
+        """
         if not self.client:
-            return 0, 0
+            return {"used": 0, "total": 0}
+            
+        def extract_size(val) -> int:
+            if isinstance(val, dict):
+                val = val.get("size") or val.get("size_total") or val.get("size_use") or 0
+            
+            if val is None:
+                return 0
+            if isinstance(val, (int, float)):
+                return int(val)
+            
+            # Handle string format (e.g., "2.04TB")
+            s_val = str(val).strip().upper()
+            if not s_val:
+                return 0
+            
+            import re
+            match = re.match(r"^([0-9.]+)\s*([A-Z]*B?)$", s_val)
+            if not match:
+                try:
+                    return int(float(s_val))
+                except:
+                    return 0
+            
+            number, unit = match.groups()
+            number = float(number)
+            
+            units = {
+                "": 1, "B": 1,
+                "K": 1024, "KB": 1024,
+                "M": 1024**2, "MB": 1024**2,
+                "G": 1024**3, "GB": 1024**3,
+                "T": 1024**4, "TB": 1024**4,
+                "P": 1024**5, "PB": 1024**5
+            }
+            
+            return int(number * units.get(unit, 1))
+
         try:
+            # 1. Directory Mode
+            if hasattr(settings, "P115_CLEANUP_CAPACITY_TYPE") and settings.P115_CLEANUP_CAPACITY_TYPE == "DIRECTORY":
+                cid = await self.get_save_dir_cid()
+                if not cid:
+                    logger.error("❌ 无法获取保存目录 CID，无法进行目录容量检测")
+                    return {"used": 0, "total": 0}
+                
+                resp = await self._api_call_with_timeout(
+                    self.client.fs_category_get, cid, async_=True,
+                    timeout=API_TIMEOUT, label="fs_category_get",
+                    **self._get_ios_ua_kwargs()
+                )
+                check_response(resp)
+                used = extract_size(resp.get("size", 0))
+                # For directory mode, total is essentially infinite or not applicable in this context
+                return {"used": used, "total": 0}
+            
+            # 2. Entire Drive Mode (Default)
             resp = await self._api_call_with_timeout(
                 self.client.user_space_info, async_=True,
                 timeout=API_TIMEOUT, label="user_space_info",
@@ -1260,24 +1317,21 @@ class P115Service:
             )
             check_response(resp)
             data = resp.get("data", {})
-            
-            def extract_size(val) -> int:
-                if isinstance(val, dict):
-                    # Handle cases like {'size': '...', 'size_format': '...'} or {'size_total': ...}
-                    return int(val.get("size") or val.get("size_total") or val.get("size_use") or 0)
-                try:
-                    return int(val) if val is not None else 0
-                except (ValueError, TypeError):
-                    return 0
-
-            # Try common keys for used and total space
             used = extract_size(data.get("all_used") or data.get("all_use") or data.get("used") or 0)
             total = extract_size(data.get("all_total") or data.get("total") or 0)
+            return {"used": used, "total": total}
             
-            return used, total
         except Exception as e:
-            logger.error("❌ 获取网盘容量失败: {}", str(e))
-            return 0, 0
+            logger.error("❌ 获取网盘存储状态失败: {}", str(e))
+            return {"used": 0, "total": 0}
+
+    async def get_save_dir_cid(self) -> Optional[int]:
+        """Get the CID for the current save directory"""
+        try:
+            return await self._ensure_save_dir()
+        except Exception as e:
+            logger.error(f"❌ 获取保存目录 CID 失败: {e}")
+            return None
 
     async def check_and_prepare_capacity(self, file_count: int = 0, total_size: int = 0):
         """Check capacity and optionally clean up before starting a task (internal/no-lock).
@@ -1289,97 +1343,69 @@ class P115Service:
         if not settings.P115_CLEANUP_CAPACITY_ENABLED:
             return
 
-        used_bytes, total_bytes = await self.get_storage_stats()
-        if total_bytes == 0:
-            return
-            
-        remaining_bytes = total_bytes - used_bytes
-
-        # 1. Predictive cleanup for batch tasks
-        # Only cleanup if we have many files AND they might not fit
-        if file_count > 500 and total_size > remaining_bytes:
-            logger.info(f"🚀 预测性清理：检测到大批量文件 ({file_count} 个, {total_size/(1024**3):.2f}GB)，剩余空间不足，执行清理...")
-            await self._do_cleanup_logic()
-            await asyncio.sleep(3) # Wait for 115 to sync
-            return
-
-        # 2. Threshold-based maintenance cleanup
-        # Modified: Only cleanup if the new file(s) won't fit, regardless of threshold
-        # If total_size is 0 (unknown), we skip cleanup unless we are critically low (e.g. < 1GB)
-        # But per user request: "remove the logic that cleans up just because it's over threshold"
+        stats = await self.get_storage_stats()
+        used_bytes = stats["used"]
+        total_bytes = stats["total"]
         
-        if total_size > 0 and total_size > remaining_bytes:
-             logger.warning(f"⚠️ 剩余空间不足 (需 {total_size/(1024**3):.2f}GB, 剩 {remaining_bytes/(1024**3):.2f}GB)，执行清理...")
-             await self._do_cleanup_logic()
-             await asyncio.sleep(3)
+        # Only perform predictive cleanup if in ENTIRE mode (since DIRECTORY mode doesn't have a fixed remainder in the same sense)
+        if hasattr(settings, "P115_CLEANUP_CAPACITY_TYPE") and settings.P115_CLEANUP_CAPACITY_TYPE == "ENTIRE":
+            if total_bytes > 0:
+                remaining_bytes = total_bytes - used_bytes
+                if (file_count > 500 and total_size > remaining_bytes) or (total_size > 0 and total_size > remaining_bytes):
+                    logger.info(f"🚀 容量检查：检测到待转存内容较多或空间不足，执行清理...")
+                    await self._do_cleanup_logic()
+                    await asyncio.sleep(3)
 
     async def check_capacity_and_cleanup(self, mode: str = "manual"):
         """Check current capacity and trigger cleanup if it exceeds limit.
-        
-        Args:
-            mode: "manual", "scheduled", or "batch"
         """
         # Determine if we should wait for the lock
         wait_for_lock = True
         if mode == "scheduled":
             wait_for_lock = False # Skip if busy
-            # 提前检查锁，以便在转存运行时给出明确的“跳过”日志，即便空间充足也告知用户
             try:
-                async with self._acquire_task_lock("capacity_check_probe", wait=False):
+                # 提前探测锁，避免不必要的阻塞
+                async with self._acquire_task_lock("cleanup", wait=False):
                     pass
             except BlockingIOError:
-                logger.info("⏭️ 定时容量检查：检测到转存任务运行中，按计划跳过锁定监测")
+                logger.debug("⏭️ 定时容量检查：检测到任务执行中，按计划跳过")
                 return False
         
-        logger.debug(f"🔍 [容量检查] 模式: {mode}, 正在获取存储状态...")
-            
-        # 1. Determine the threshold
-        # If batch mode and auto-cleanup is disabled, use 10% fallback
-        use_fallback = (mode == "batch" and not settings.P115_CLEANUP_CAPACITY_ENABLED)
+        # 1. Check current capacity
+        stats = await self.get_storage_stats()
+        used_bytes = stats["used"]
         
-        limit = settings.P115_CLEANUP_CAPACITY_LIMIT
+        limit_val = settings.P115_CLEANUP_CAPACITY_LIMIT
         unit = settings.P115_CLEANUP_CAPACITY_UNIT
+        limit_bytes = limit_val * (1024**4 if unit == "TB" else 1024**3)
         
-        used_bytes, total_bytes = await self.get_storage_stats()
-        if total_bytes <= 0:
+        detection_type = getattr(settings, "P115_CLEANUP_CAPACITY_TYPE", "ENTIRE")
+        detection_name = "全网盘" if detection_type == "ENTIRE" else f"保存目录({settings.P115_SAVE_DIR})"
+        
+        if used_bytes < limit_bytes:
+            logger.info(f"✅ {detection_name}容量充足: {used_bytes / (1024**3 if unit=='GB' else 1024**4):.2f}/{limit_val:.2f} {unit}")
             return False
 
-        should_cleanup = False
+        logger.warning(f"⚠️ {detection_name}容量不足: {used_bytes / (1024**3 if unit=='GB' else 1024**4):.2f} {unit} > 限制 {limit_val:.2f} {unit}")
         
-        if use_fallback:
-            # check for 10% remaining
-            if (total_bytes - used_bytes) < (total_bytes * 0.1):
-                logger.warning(f"🚨 [批量任务] 剩余空间不足 10% ({(total_bytes-used_bytes)/(1024**4):.2f}TB)，触发硬性清理")
-                should_cleanup = True
-        elif settings.P115_CLEANUP_CAPACITY_ENABLED and limit > 0:
-            limit_bytes = limit * (1024**4) if unit == "TB" else limit * (1024**3)
-            if used_bytes > limit_bytes:
-                logger.info(f"📊 [{mode}] 网盘已用空间 ({used_bytes/(1024**4):.2f}TB) 超过阈值 ({limit} {unit})")
-                should_cleanup = True
-        
-        if should_cleanup or mode == "manual":
-            # Execute cleanup with non-blocking support for scheduled tasks
-            try:
-                # We don't acquire the lock here directly, but pass wait down to atomic cleanup methods
-                # which DO acquire the lock. 
-                # Actually, check_capacity_and_cleanup held lock in original version.
-                # Let's wrap the actual cleanup calls in the lock.
-                async with self._acquire_task_lock("cleanup", wait=wait_for_lock):
-                    logger.info(f"🧹 执行容量管理清理 (模式: {mode})...")
-                    # Note: we call internal versions or handle logic here to avoid re-acquiring lock
-                    # But cleanup_save_directory has its own lock. So we need a way to bypass it or透传.
-                    # Best is to have an internal _cleanup method.
-                    await self._do_cleanup_logic()
-                    return True
-            except BlockingIOError:
-                if mode == "scheduled":
-                    # 理论上这里由于之前的 probe 不会轻易触发，但作为安全兜底保留
-                    logger.info("⏭️ 定时容量检查：转存锁获取冲突，按计划跳过任务")
-                return False
-        else:
-            # Always log available space for debugging
-            logger.debug(f"✅ [容量检查] 模式: {mode}, 当前空间充足 ({used_bytes/(1024**4):.2f}TB)，无需清理")
-        return False
+        # Execute cleanup with non-blocking support for scheduled tasks
+        try:
+            # We don't acquire the lock here directly, but pass wait down to atomic cleanup methods
+            # which DO acquire the lock. 
+            # Actually, check_capacity_and_cleanup held lock in original version.
+            # Let's wrap the actual cleanup calls in the lock.
+            async with self._acquire_task_lock("cleanup", wait=wait_for_lock):
+                logger.info(f"🧹 执行容量管理清理 (模式: {mode})...")
+                # Note: we call internal versions or handle logic here to avoid re-acquiring lock
+                # But cleanup_save_directory has its own lock. So we need a way to bypass it or透传.
+                # Best is to have an internal _cleanup method.
+                await self._do_cleanup_logic()
+                return True
+        except BlockingIOError:
+            if mode == "scheduled":
+                # 理论上这里由于之前的 probe 不会轻易触发，但作为安全兜底保留
+                logger.info("⏭️ 定时容量检查：转存锁获取冲突，按计划跳过任务")
+            return False
 
     async def _do_cleanup_logic(self):
         """Helper to execute both cleanup tasks without lock acquisition."""

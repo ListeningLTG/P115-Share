@@ -34,6 +34,7 @@ class ConfigUpdate(BaseModel):
     p115_cleanup_capacity_enabled: Optional[bool] = None
     p115_cleanup_capacity_limit: Optional[float] = None
     p115_cleanup_capacity_unit: Optional[str] = None
+    p115_cleanup_capacity_type: Optional[str] = None
 
     @field_validator('p115_cleanup_dir_cron', 'p115_cleanup_trash_cron')
     @classmethod
@@ -46,12 +47,7 @@ class ConfigUpdate(BaseModel):
         except Exception:
             raise ValueError('无效的 Cron 表达式')
 
-    @field_validator('p115_cleanup_capacity_limit')
-    @classmethod
-    def validate_capacity_limit(cls, v: Optional[float]):
-        if v is not None and v < 1:
-            raise ValueError('容量限制最小值为 1 TB')
-        return v
+    # Removed @field_validator('p115_cleanup_capacity_limit') as Field(ge=0) handles it
 
 @router.post("/update")
 async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
@@ -109,7 +105,6 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
             need_restart_bot = True
     
     # 4. Update Cron tasks
-    # 4. Update Cron tasks
     if "p115_cleanup_dir_cron" in update_data and settings.P115_CLEANUP_DIR_CRON != cfg.p115_cleanup_dir_cron:
         await settings.save_setting("P115_CLEANUP_DIR_CRON", cfg.p115_cleanup_dir_cron)
         from app.services.scheduler import cleanup_scheduler
@@ -121,7 +116,7 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
         cleanup_scheduler.update_cleanup_trash_job()
 
     # 4.5 Update Capacity Cleanup (Consolidated)
-    capacity_fields = ["p115_cleanup_capacity_enabled", "p115_cleanup_capacity_limit", "p115_cleanup_capacity_unit"]
+    capacity_fields = ["p115_cleanup_capacity_enabled", "p115_cleanup_capacity_limit", "p115_cleanup_capacity_unit", "p115_cleanup_capacity_type"]
     capacity_changed = False
     for field in capacity_fields:
         if field in update_data:
@@ -172,6 +167,7 @@ async def get_config(user=Depends(get_current_user)):
         "p115_cleanup_capacity_enabled": settings.P115_CLEANUP_CAPACITY_ENABLED,
         "p115_cleanup_capacity_limit": settings.P115_CLEANUP_CAPACITY_LIMIT,
         "p115_cleanup_capacity_unit": settings.P115_CLEANUP_CAPACITY_UNIT,
+        "p115_cleanup_capacity_type": settings.P115_CLEANUP_CAPACITY_TYPE,
         "version": VERSION
     }
 

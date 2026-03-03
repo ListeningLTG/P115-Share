@@ -105,21 +105,30 @@
           </a-form-item>
 
           <div v-if="formState.p115_cleanup_capacity_enabled">
-            <a-form-item label="容量清理限制" name="p115_cleanup_capacity_limit">
+            <a-form-item label="容量检测方式">
+              <a-radio-group v-model:value="formState.p115_cleanup_capacity_type">
+                <a-radio value="ENTIRE">全网盘容量</a-radio>
+                <a-radio value="DIRECTORY">保存目录容量</a-radio>
+              </a-radio-group>
+            </a-form-item>
+
+            <a-form-item :label="formState.p115_cleanup_capacity_type === 'ENTIRE' ? '网盘已用空间上限' : '目录占用空间上限'" name="p115_cleanup_capacity_limit">
               <a-row :gutter="8">
                 <a-col :span="20">
                   <a-input-number 
                     v-model:value="formState.p115_cleanup_capacity_limit" 
-                    :min="1" 
+                    :min="0.1" 
                     :precision="2"
                     style="width: 100%" 
                     placeholder="请输入容量值"
                   >
-                    <template #addonAfter>TB</template>
+                    <template #addonAfter>{{ formState.p115_cleanup_capacity_unit }}</template>
                   </a-input-number>
                 </a-col>
               </a-row>
-              <div style="font-size: 12px; color: #999; margin-top: 4px">最小值为 1 TB</div>
+              <div style="font-size: 12px; color: #999; margin-top: 4px">
+                {{ formState.p115_cleanup_capacity_type === 'ENTIRE' ? '当网盘已用空间超过此值时触发清理' : '当保存目录占用空间超过此值时触发清理' }}
+              </div>
             </a-form-item>
           </div>
           
@@ -230,7 +239,8 @@ const formState = reactive({
   proxy_type: 'HTTP',
   p115_cleanup_capacity_enabled: false,
   p115_cleanup_capacity_limit: 0,
-  p115_cleanup_capacity_unit: 'GB'
+  p115_cleanup_capacity_unit: 'GB',
+  p115_cleanup_capacity_type: 'ENTIRE'
 });
 
 const addChannel = () => {
@@ -274,7 +284,7 @@ const rules = computed(() => ({
   p115_cleanup_trash_cron: [{ validator: validateCron, trigger: 'blur' }],
   p115_cleanup_capacity_limit: [
     { required: true, message: '请输入清理容量', trigger: 'blur' },
-    { type: 'number', min: 1, message: '容量限制最小值为 1 TB', trigger: 'blur' }
+    { type: 'number', min: 0.1, message: '容量限制最小值不能为 0', trigger: 'blur' }
   ],
   proxy_host: [{ validator: validateProxyHost, trigger: 'change' }],
   proxy_port: [{ validator: validateProxyPort, trigger: 'change' }]
@@ -320,8 +330,9 @@ const loadConfig = async () => {
     formState.proxy_pass = res.data.proxy_pass || '';
     formState.proxy_type = res.data.proxy_type || 'HTTP';
     formState.p115_cleanup_capacity_enabled = res.data.p115_cleanup_capacity_enabled || false;
-    formState.p115_cleanup_capacity_limit = res.data.p115_cleanup_capacity_limit || 1;
-    formState.p115_cleanup_capacity_unit = 'TB'; // Support TB only
+    formState.p115_cleanup_capacity_limit = res.data.p115_cleanup_capacity_limit || 0;
+    formState.p115_cleanup_capacity_unit = res.data.p115_cleanup_capacity_unit || 'GB';
+    formState.p115_cleanup_capacity_type = res.data.p115_cleanup_capacity_type || 'ENTIRE';
   } catch (e) {
     console.error(e);
   }
@@ -334,7 +345,7 @@ const onFinish = async (section: 'tg' | 'p115' | 'proxy' = 'tg') => {
       p115: [
         'p115_cookie', 'p115_save_dir', 'p115_cleanup_dir_cron', 
         'p115_cleanup_trash_cron', 'p115_recycle_password',
-        'p115_cleanup_capacity_enabled', 'p115_cleanup_capacity_limit', 'p115_cleanup_capacity_unit'
+        'p115_cleanup_capacity_enabled', 'p115_cleanup_capacity_limit', 'p115_cleanup_capacity_unit', 'p115_cleanup_capacity_type'
       ],
       proxy: ['proxy_enabled', 'proxy_host', 'proxy_port', 'proxy_user', 'proxy_pass', 'proxy_type']
     };

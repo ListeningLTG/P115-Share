@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     P115_CLEANUP_CAPACITY_ENABLED: bool = False
     P115_CLEANUP_CAPACITY_LIMIT: float = 0.0  # Threshold value
     P115_CLEANUP_CAPACITY_UNIT: str = "GB"    # GB or TB
+    P115_CLEANUP_CAPACITY_TYPE: str = "ENTIRE" # ENTIRE or DIRECTORY
     
     # Proxy settings
     PROXY_ENABLED: bool = False
