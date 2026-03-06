@@ -124,6 +124,7 @@ class ExcelBatchService:
                         'phone_number': 'phone_number',
                         'blockquote': 'blockquote',
                         'spoiler': 'spoiler',
+                        'link': 'url',
                     }
                     
                     if entity_type in tg_to_aio:
@@ -161,6 +162,25 @@ class ExcelBatchService:
 
                             extracted_data.append({
                                 "链接": href,
+                                "标题": current_title,
+                                "提取码": password or "",
+                                "item_metadata": {
+                                    "full_text": full_text,
+                                    "entities": entities
+                                }
+                            })
+
+                # Also handle 'link' type entities (bare URLs in text field)
+                for entity in text_entities:
+                    if entity.get('type') == 'link':
+                        url = entity.get('text', '')
+                        match = link_pattern.search(url)
+                        if match:
+                            password = match.group(2)
+                            current_title = title or f"Message_{msg.get('id')}"
+
+                            extracted_data.append({
+                                "链接": url,
                                 "标题": current_title,
                                 "提取码": password or "",
                                 "item_metadata": {
