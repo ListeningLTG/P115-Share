@@ -147,8 +147,18 @@ class ExcelBatchService:
                 for entity in text_entities:
                     if entity.get('type') == 'bold' and not title:
                         title = entity.get('text', '').strip()
-                        title = re.sub(r'^[🎬🎥🎞️📀📁]\s*', '', title)
                         break
+
+                # New fallback: If no bold title, use the first line of full_text if it looks like a title
+                if not title and full_text:
+                    first_line = full_text.split('\n')[0].strip()
+                    # Check if it starts with common resource icons or "电视剧"/"电影"
+                    if any(icon in first_line for icon in ['📺', '🎬', '🎥', '🎞️', '📁']) or \
+                       any(keyword in first_line for keyword in ['电视剧', '电影']):
+                        title = first_line
+
+                if title:
+                    title = re.sub(r'^[🎬🎥🎞️📀📁📺]\s*', '', title)
 
                 for entity in text_entities:
                     if entity.get('type') == 'text_link':
