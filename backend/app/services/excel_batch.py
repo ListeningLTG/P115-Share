@@ -255,6 +255,7 @@ class ExcelBatchService:
         while True:
             try:
                 item_id = None
+                is_processed = False
                 # Check for tasks that are "running"
                 async with async_session() as session:
                     result = await session.execute(
@@ -331,7 +332,7 @@ class ExcelBatchService:
                             await asyncio.sleep(600)  # 等待 10 分钟再重看
                             continue
 
-                        await self._process_item(item_id)
+                        is_processed = await self._process_item(item_id)
                         
                     finally:
                         # Find next row and set is_waiting to True before sleep
@@ -366,24 +367,28 @@ class ExcelBatchService:
                 # Rate limiting (Random interval)
 
                 # Rate limiting (Random interval) with capacity check
-                interval = random.randint(interval_min, interval_max)
-                
-                # 利用等待时间检查容量 (不占用转存时间，且无锁冲突)
-                start_check = datetime.now()
-                try:
-                    # mode="batch" 包含 10% 兜底逻辑
-                    await p115_service.check_capacity_and_cleanup(mode="batch")
-                except Exception as ce:
-                    logger.error(f"批量任务间隙容量检查失败: {ce}")
-                
-                # 计算剩余需要 sleep 的时间
-                elapsed = (datetime.now() - start_check).total_seconds()
-                remaining_sleep = interval - elapsed
-                
-                if remaining_sleep > 0:
-                    await asyncio.sleep(remaining_sleep)
+                if is_processed:
+                    interval = random.randint(interval_min, interval_max)
+                    
+                    # 利用等待时间检查容量 (不占用转存时间，且无锁冲突)
+                    start_check = datetime.now()
+                    try:
+                        # mode="batch" 包含 10% 兜底逻辑
+                        await p115_service.check_capacity_and_cleanup(mode="batch")
+                    except Exception as ce:
+                        logger.error(f"批量任务间隙容量检查失败: {ce}")
+                    
+                    # 计算剩余需要 sleep 的时间
+                    elapsed = (datetime.now() - start_check).total_seconds()
+                    remaining_sleep = interval - elapsed
+                    
+                    if remaining_sleep > 0:
+                        await asyncio.sleep(remaining_sleep)
+                    else:
+                        logger.debug(f"容量检查耗时 {elapsed:.2f}s > 间隔 {interval}s，跳过额外等待")
                 else:
-                    logger.debug(f"容量检查耗时 {elapsed:.2f}s > 间隔 {interval}s，跳过额外等待")
+                    # 如果是被跳过的项目，不进入间隔，直接处理下一个
+                    pass
                 
             except Exception as e:
                 logger.error(f"Excel 工作线程出错: {e}")
@@ -433,7 +438,7 @@ class ExcelBatchService:
                         item.error_msg = f"命中黑名单关键词: {kw}"
                         await session.commit()
                         await self._update_task_counts(task_id)
-                        return
+                        return False
             
             # 2. Check Whitelist
             if white_list:
@@ -451,7 +456,7 @@ class ExcelBatchService:
                         item.error_msg = "未命中白名单关键词"
                         await session.commit()
                         await self._update_task_counts(task_id)
-                        return
+                        return False
             # --- End Filtering Logic ---
             
             original_url = item.original_url
@@ -460,7 +465,7 @@ class ExcelBatchService:
                 item.error_msg = "链接为空"
                 await session.commit()
                 await self._update_task_counts(task_id)
-                return
+                return True
 
             # 1. Check history first
             history_url = await p115_service.get_history_link(original_url)
@@ -475,7 +480,7 @@ class ExcelBatchService:
                         await tg_service.broadcast_to_channels({original_url: history_url}, item.item_metadata, channel_ids=target_channels)
                     else:
                         await tg_service.broadcast_to_channels({original_url: history_url}, {"full_text": f"资源名称：{item.title or '未知'}\n分享链接：{{{{share_link}}}}"}, channel_ids=target_channels)
-                return
+                return True
 
             try:
                 # Prepare metadata for broadcasting
@@ -546,6 +551,7 @@ class ExcelBatchService:
             
             await session.commit()
             await self._update_task_counts(task_id)
+            return True
 
     async def _update_task_counts(self, task_id: int):
         async with async_session() as session:
