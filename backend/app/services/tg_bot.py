@@ -212,12 +212,26 @@ class TGService:
                     await message.reply(f"🔔 链接保存成功！\n原链接: {share_url}\n新分享: {history_share_link}")
                     return True, history_share_link
 
-                # 1. Check queue status
+                # 1. Check restriction & queue status
                 q_size = p115_service.queue_size
-                is_busy = p115_service.is_busy
-                if q_size > 0 or is_busy:
-                    position = q_size + (1 if is_busy else 0)
-                    await message.reply(f"⏳ 系统繁忙，您的请求已加入队列（当前排在第 {position} 位），请稍候...")
+                is_restricted = p115_service.is_restricted
+                
+                # 探测恢复逻辑：如果处于限制中，仅检查链接合法性，但不直接清除全局标志
+                probing = False
+                if is_restricted:
+                    logger.info(f"🕵️ 限制期间嗅探探测: {share_url}")
+                    status = await p115_service.get_share_status(share_url)
+                    if status and not status.get("is_prohibited"):
+                        logger.info("📡 嗅探发现链接有效，由于当前处于受限状态，将该链接作为‘探路探测’执行...")
+                        probing = True
+                    else:
+                        await message.reply(f"⏳ 115 账号当前处于接收限制中，系统将在解封后自动处理该链接。")
+                        return # 链接无效或确认为持续受限（API不通）
+                
+                if not probing:
+                    if q_size > 0 or p115_service.is_busy:
+                        position = q_size + (1 if p115_service.is_busy else 0)
+                        await message.reply(f"⏳ 系统繁忙，您的请求已加入队列（当前排在第 {position} 位），请稍候...")
 
                 # 2. Save link with metadata
                 # Use segmented metadata if available
@@ -231,7 +245,8 @@ class TGService:
                 save_res = await p115_service.save_and_share(
                     share_url, 
                     metadata=metadata,
-                    skip_large_package=settings.TG_SKIP_LARGE_PACKAGE
+                    skip_large_package=settings.TG_SKIP_LARGE_PACKAGE,
+                    db_id=None # 初次入库时不带ID
                 )
                 
                 if save_res:
@@ -258,15 +273,13 @@ class TGService:
                     elif save_res.get("status") == "pending":
                         # Handle different pending reasons
                         reason = save_res.get("reason", "auditing")
-                        if reason == "snapshotting":
-                            logger.info(f"🔍 分享链接正在生成快照: {share_url}")
-                            if total_links == 1:
-                                await status_msg.edit_text("🔍 分享链接正在生成快照，请稍后，系统将自动重试处理")
+                        if reason == "restricted":
+                            logger.info(f"🚫 账号受限排队中: {share_url}")
                         else:
                             logger.info(f"🔍 分享链接正在审核中: {share_url}")
                         
                         asyncio.create_task(self.poll_pending_link(message, save_res))
-                        return "pending", None
+                        return save_res, None
                     elif save_res.get("status") == "error":
                         error_type = save_res.get("error_type")
                         error_msg = save_res.get("message") or "未知错误"
@@ -409,9 +422,15 @@ class TGService:
                     await status_msg.delete()
                 except Exception:
                     pass
-            elif pending_count == 1:
-                # For single auditing link, use a more friendly message
-                await status_msg.edit_text("🔍 分享链接正在审核中，将在审核通过后，进行保存分享处理")
+            elif isinstance(last_res, dict) and last_res.get("status") == "pending":
+                # For single pending link, use a more friendly message based on reason
+                reason = last_res.get("reason", "auditing")
+                if reason == "restricted":
+                    await status_msg.edit_text("⏳ 115 账号当前处于接收限制中，系统将在解封后自动处理")
+                elif reason == "snapshotting":
+                    await status_msg.edit_text("🔍 分享链接正在生成快照，系统将自动重试处理")
+                else:
+                    await status_msg.edit_text("🔍 分享链接正在审核中，将在审核通过后，进行保存分享处理")
             elif skip_count == 1:
                 # For single skipped link, delete the processing status message
                 try:
@@ -472,12 +491,21 @@ class TGService:
                         if len(failed_details) > 3:
                             admin_msg += f"... 还有 {len(failed_details) - 3} 个失败链接"
                 
-                await self.bot.send_message(settings.TG_USER_ID, admin_msg)
+                await self.send_admin_msg(admin_msg)
             except Exception as e:
                 logger.error(f"Failed to notify admin: {e}")
 
+    async def send_admin_msg(self, text: str):
+        """Send a message to the admin user"""
+        if not self.bot or not settings.TG_USER_ID:
+            return
+        try:
+            await self.bot.send_message(settings.TG_USER_ID, text)
+        except Exception as e:
+            logger.error(f"Failed to send admin message: {e}")
 
-    async def poll_pending_link(self, message: types.Message, pending_info: dict):
+
+    async def poll_pending_link(self, message: types.Message, pending_info: dict, silent: bool = False):
         """Poll the status of a pending link and process it when ready"""
         share_url = pending_info["share_url"]
         metadata = pending_info.get("metadata", {})
@@ -488,8 +516,8 @@ class TGService:
             interval = 1800 
         elif reason == "restricted":
             interval = 3600
-            if attempt == 1:
-                await message.reply(f"⚠️ 触发 115 账号限制（接收/分享），该链接已进入排队，将每小时尝试一次直到恢复。\n链接: {share_url}")
+            if not silent:
+                await message.reply(f"⚠️ 触发 115 账号限制（接收/分享），该链接已进入排队，将每小时尝试一次。或者您可以发来一个新的有效链接，系统将通过该链接嗅探限制是否解除。\n链接: {share_url}")
         else:
             interval = 300
             
@@ -498,7 +526,17 @@ class TGService:
         logger.info(f"⏳ 开始为链接启动轮询任务 (原因: {reason}, 间隔: {interval}s): {share_url}")
         
         for attempt in range(1, max_attempts + 1):
-            await asyncio.sleep(interval)
+            if reason == "restricted":
+                # 分布休眠以便能实时响应全局限制的消除
+                slept = 0
+                while slept < interval:
+                    if not p115_service.is_restricted:
+                        logger.info(f"🔓 检测到全局限制已解除，立即触发队列重试: {share_url}")
+                        break
+                    await asyncio.sleep(5)
+                    slept += 5
+            else:
+                await asyncio.sleep(interval)
             
             logger.info(f"🔄 正在进行第 {attempt}/{max_attempts} 次审核状态检查: {share_url}")
             status_info = await p115_service.get_share_status(share_url)
@@ -524,7 +562,7 @@ class TGService:
                     p115_service.clear_restriction()
 
                 logger.info(f"🎉 链接可以开始处理 (status: {status_info['share_state']}): {share_url}")
-                save_res = await p115_service.save_and_share(share_url, metadata=metadata)
+                save_res = await p115_service.save_and_share(share_url, metadata=metadata, db_id=pending_info.get("db_id"))
                 
                 if save_res and save_res.get("status") == "success":
                     logger.info(f"✅ 审核通过后转存成功: {share_url}")
@@ -537,15 +575,32 @@ class TGService:
                         
                         # Use the title if available or a generic success msg
                         success_text = f"✅ 处理完成！\n原链接: {share_url}\n新分享: {share_link}"
-                        await message.reply(success_text)
                         
-                        if settings.TG_USER_ID and str(message.chat.id) != str(settings.TG_USER_ID):
+                        # 管理员通知不受 silent 影响（除非 chat ID 本身就是管理员）
+                        is_admin_chat = settings.TG_USER_ID and str(message.chat.id) == str(settings.TG_USER_ID)
+                        
+                        if not silent:
+                            await message.reply(success_text)
+                        elif not is_admin_chat:
+                            # 如果静默模式且当前不是管理员私聊，则单独发给管理员一份
                             try:
-                                await self.bot.send_message(settings.TG_USER_ID, f"🔔 [后台任务] {success_text}")
+                                await self.send_admin_msg(f"🔔 [后台任务] {success_text}")
+                            except Exception:
+                                pass
+                        
+                        # 原本就有的广播给管理员的逻辑（针对非管理员用户的请求）
+                        if not is_admin_chat:
+                            try:
+                                await self.bot.send_message(settings.TG_USER_ID, f"🔔 [后台处理] {success_text}")
                             except Exception:
                                 pass
                     await self._delete_pending_task(pending_info.get("db_id"))
                     return 
+                elif save_res and save_res.get("status") == "pending":
+                    new_reason = save_res.get("reason", reason)
+                    logger.warning(f"⚠️ 尝试转存时再次返回排队状态(原因: {new_reason})，维持轮询: {share_url}")
+                    reason = new_reason
+                    continue
                 else:
                     logger.error(f"❌ 审核通过后转存仍然失败: {share_url}")
                     error_msg = "自动转存失败，请手动尝试"
@@ -555,7 +610,8 @@ class TGService:
                         elif save_res.get("message"):
                             error_msg = save_res.get("message")
                     
-                    await message.reply(f"❌ 链接审核已通过，但{error_msg}: {share_url}")
+                    if not silent:
+                        await message.reply(f"❌ 链接审核已通过，但{error_msg}: {share_url}")
                     await self._delete_pending_task(pending_info.get("db_id"))
                     return
         
@@ -896,6 +952,12 @@ class TGService:
             result = await session.execute(select(PendingLink).where(PendingLink.status.in_(["auditing", "snapshotting", "restricted"])))
             tasks = result.scalars().all()
             if tasks:
+                # 统计受限链接并发送汇总消息
+                restricted_tasks = [t for t in tasks if t.status == "restricted"]
+                if restricted_tasks and p115_service.is_restricted:
+                    summary_msg = f"目前 115 云盘账号已被限制接收分享文件，共有 {len(restricted_tasks)} 个链接已进入排队队列，将在检测到解除限制后，开始处理队列中的任务。"
+                    await self.send_admin_msg(summary_msg)
+                
                 for task in tasks:
                     pending_info = {
                         "share_url": task.share_url, 
@@ -915,7 +977,7 @@ class TGService:
                 except Exception: pass
         user_id = settings.TG_USER_ID or "0"
         mock_msg = MockMessage(self.bot, user_id)
-        await self.poll_pending_link(mock_msg, pending_info)
+        await self.poll_pending_link(mock_msg, pending_info, silent=True)
 
     async def verify_connection(self) -> bool:
         if not self.bot:

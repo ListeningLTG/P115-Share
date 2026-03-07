@@ -35,9 +35,10 @@ class P115Service:
         self._task_lock: Optional[asyncio.Lock] = None  # Lazy initialize
         self._current_task: str | None = None  # Track current task type
         self._save_dir_cid: int = 0  # Cached save directory CID
-        # 任务队列机制
+        # 任务队列和监测机制
         self._task_queue = asyncio.Queue()
         self._worker_task = None
+        self._monitor_task = None
         self._worker_lock = asyncio.Lock()
         self._current_task_info = None # 存储当前正在处理的任务信息
         self._restriction_until: float = 0 # 限制结束的时间戳
@@ -60,16 +61,73 @@ class P115Service:
         """检查当前是否处于 115 限制状态"""
         return time.time() < self._restriction_until
 
-    def set_restriction(self, hours: float = 1.0):
+    async def set_restriction(self, hours: float = 1.0):
         """设置全局限制状态"""
         self._restriction_until = time.time() + (hours * 3600)
-        logger.warning(f"🚫 115 服务已进入全局限制模式，预计持续 {hours} 小时 (直到 {time.strftime('%H:%M:%S', time.localtime(self._restriction_until))})")
+        msg = f"🚫 115 服务已进入全局限制模式，预计持续 {hours} 小时 (直到 {time.strftime('%H:%M:%S', time.localtime(self._restriction_until))})。\n系统将自动暂停正在运行的批量任务，并转为后台轮询处理受限链接。"
+        logger.warning(msg)
+        
+        # 1. Notify TG - Removed per user request
+        pass
 
-    def clear_restriction(self):
+        # 2. Pause Batch Tasks
+        try:
+            from app.services.excel_batch import excel_batch_service
+            if excel_batch_service and excel_batch_service.active_task_id:
+                task_id = excel_batch_service.active_task_id
+                import asyncio
+                asyncio.create_task(excel_batch_service.pause_task(task_id))
+                # if tg_service:
+                #     await tg_service.send_admin_msg(f"⏸️ 检测到账号受限，批量转存任务 {task_id} 已自动暂停。")
+        except Exception as e:
+            logger.error(f"暂停批量任务失败: {e}")
+
+    async def clear_restriction(self):
         """清除全局限制状态"""
         if self._restriction_until > 0:
             self._restriction_until = 0
-            logger.info("🔓 115 全局限制模式已解除")
+            msg = "🔓 115 全局限制模式已解除，队列中的任务将按顺序恢复处理。"
+            logger.info(msg)
+            try:
+                from app.services.tg_bot import tg_service
+                if tg_service:
+                    asyncio.create_task(tg_service.send_admin_msg(msg))
+            except Exception as e:
+                logger.warning(f"发送解除限制通知失败: {e}")
+
+    async def _restriction_monitor(self):
+        """后台监测受限状态，如果长时间无活动则主动探路"""
+        logger.info("🕵️ 115 受限状态监测协程已启动")
+        last_check_time = time.time()
+        while True:
+            try:
+                if self.is_restricted:
+                    now = time.time()
+                    # 如果受限且超过 1 小时未进行任何操作，尝试取队列第一个任务探路
+                    if now - last_check_time > 3600:
+                        logger.info("🔍 受限时长超过 1 小时，尝试主动探路检测状态...")
+                        # 逻辑：查找一个 pending 的链接或者队列中的任务进行尝试
+                        # 这里简化处理：由 tg_bot 的 handle_message 或是下次任务启动自动触发检测
+                        # 或者我们可以从数据库读一个 pending 的任务来试一下
+                        async with async_session() as session:
+                            from app.models.schema import PendingLink
+                            result = await session.execute(
+                                select(PendingLink).where(PendingLink.status == "restricted").limit(1)
+                            )
+                            pending = result.scalar_one_or_none()
+                            if pending:
+                                logger.info(f"🧪 正在使用待处理链接进行探路: {pending.share_url}")
+                                status = await self.get_share_status(pending.share_url)
+                                if status and not status.get("is_prohibited"):
+                                    # 如果状态正常，清除限制并让轮询任务接管
+                                    await self.clear_restriction()
+                        last_check_time = now
+                else:
+                    last_check_time = time.time()
+            except Exception as e:
+                logger.error(f"受限监测协程出错: {e}")
+            
+            await asyncio.sleep(300) # 每 5 分钟检查一次
 
     def _get_ios_ua_kwargs(self):
         """获取 iOS 用户代理相关的参数"""
@@ -191,6 +249,10 @@ class P115Service:
                 if self._worker_task is None or self._worker_task.done():
                     self._worker_task = asyncio.create_task(self._task_worker())
                     logger.info("⚡ 延迟启动 P115 任务队列 Worker")
+                
+                if self._monitor_task is None or self._monitor_task.done():
+                    self._monitor_task = asyncio.create_task(self._restriction_monitor())
+                    logger.info("🕵️ 延迟启动 P115 受限状态监测协程")
 
         future = asyncio.get_running_loop().create_future()
         await self._task_queue.put((func, args, kwargs, future, task_type))
@@ -303,6 +365,7 @@ class P115Service:
             found_count = len(found_files)
             if found_count > 0:
                 logger.info(f"✅ 在保存目录中找到 {found_count} 个同名文件，继续处理")
+                await self.clear_restriction()
                 return {
                     "status": "success", 
                     "to_cid": to_cid, 
@@ -339,6 +402,7 @@ class P115Service:
                 )
                 check_response(recv_resp)
                 logger.info(f"✅ 在新目录转存成功: {share_url} -> CID {new_cid}")
+                await self.clear_restriction()
                 
                 return {
                     "status": "success", 
@@ -376,10 +440,10 @@ class P115Service:
         """通过队列保存链接"""
         return await self._enqueue_op("save_share", self._save_share_link_internal, share_url, metadata, target_dir, skip_large_package)
 
-    async def save_and_share(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False):
+    async def save_and_share(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, db_id: Optional[int] = None):
         """通过队列进行转存并分享"""
         async def _internal_flow():
-            save_res = await self._save_share_link_internal(share_url, metadata, target_dir, skip_large_package)
+            save_res = await self._save_share_link_internal(share_url, metadata, target_dir, skip_large_package, db_id=db_id)
             if save_res and save_res.get("status") == "success":
                 share_res = await self.create_share_link(save_res)
                 if isinstance(share_res, str):
@@ -400,7 +464,7 @@ class P115Service:
 
         return await self._enqueue_op(f"save_and_share({share_url})", _internal_flow)
 
-    async def _save_share_link_internal(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False):
+    async def _save_share_link_internal(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, db_id: Optional[int] = None):
         """Internal logic for saving a 115 share link (no locking)"""
         if not self.client:
             logger.warning("P115Client not initialized, cannot save link")
@@ -452,6 +516,17 @@ class P115Service:
             if share_state == 0 or is_snapshotting:
                 reason = "snapshotting" if is_snapshotting else "auditing"
                 logger.info(f"🔍 分享链接处于{ '审核中' if reason == 'auditing' else '快照生成中' }，进入轮询等待队列: {share_url}")
+                
+                # 如果已经有 db_id，说明是轮询重试场景，不再新建任务
+                if db_id:
+                    return {
+                        "status": "pending",
+                        "reason": reason,
+                        "share_url": share_url,
+                        "metadata": metadata or {},
+                        "db_id": db_id
+                    }
+
                 # Save to DB for persistence
                 async with async_session() as session:
                     new_task = PendingLink(
@@ -610,6 +685,7 @@ class P115Service:
                     # Other errors, re-raise
                     raise
             
+            await self.clear_restriction()
             return {
                 "status": "success", 
                 "to_cid": to_cid, 
@@ -635,6 +711,16 @@ class P115Service:
             
             if "正在生成文件快照" in error_msg:
                 logger.info(f"🔍 分享链接正在生成快照，进入轮询等待队列: {share_url}")
+                
+                if db_id:
+                    return {
+                        "status": "pending",
+                        "reason": "snapshotting",
+                        "share_url": share_url,
+                        "metadata": metadata or {},
+                        "db_id": db_id
+                    }
+
                 async with async_session() as session:
                     new_task = PendingLink(
                         share_url=share_url,
@@ -656,8 +742,17 @@ class P115Service:
             # 检查是否由于账号限制导致失败
             if "限制接收" in error_msg:
                 logger.warning(f"🚫 触发 115 接收限制: {share_url}")
-                self.set_restriction(hours=1.0) # 设置 1 小时全局限制
+                await self.set_restriction(hours=1.0) # 设置 1 小时全局限制
                 
+                if db_id:
+                    return {
+                        "status": "pending",
+                        "reason": "restricted",
+                        "share_url": share_url,
+                        "metadata": metadata or {},
+                        "db_id": db_id
+                    }
+
                 async with async_session() as session:
                     new_task = PendingLink(
                         share_url=share_url,

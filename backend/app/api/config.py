@@ -154,6 +154,7 @@ async def get_config(user=Depends(get_current_user)):
         "tg_skip_large_package": settings.TG_SKIP_LARGE_PACKAGE,
         "p115_cookie": settings.P115_COOKIE,
         "p115_logged_in": p115_service.is_connected,
+        "p115_restricted": p115_service.is_restricted,
         "p115_save_dir": settings.P115_SAVE_DIR,
         "p115_cleanup_dir_cron": settings.P115_CLEANUP_DIR_CRON,
         "p115_cleanup_trash_cron": settings.P115_CLEANUP_TRASH_CRON,

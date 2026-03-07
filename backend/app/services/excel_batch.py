@@ -160,6 +160,16 @@ class ExcelBatchService:
                 if title:
                     title = re.sub(r'^[🎬🎥🎞️📀📁📺]\s*', '', title)
 
+                # Extract message date and format it as [MM-DD HH:MM]
+                date_suffix = ""
+                msg_date = msg.get('date')
+                if msg_date:
+                    try:
+                        dt = datetime.fromisoformat(msg_date)
+                        date_suffix = f" [{dt.strftime('%m-%d %H:%M')}]"
+                    except Exception:
+                        pass
+
                 for entity in text_entities:
                     if entity.get('type') == 'text_link':
                         href = entity.get('href', '')
@@ -168,15 +178,17 @@ class ExcelBatchService:
                             share_code = match.group(1)
                             password = match.group(2)
                             
-                            current_title = title or f"Message_{msg.get('id')}"
+                            current_title = (title or f"Message_{msg.get('id')}") + date_suffix
 
                             extracted_data.append({
                                 "链接": href,
                                 "标题": current_title,
+                                "消息时间": date_suffix.strip(' []') if date_suffix else "",
                                 "提取码": password or "",
                                 "item_metadata": {
                                     "full_text": full_text,
-                                    "entities": entities
+                                    "entities": entities,
+                                    "msg_date": date_suffix.strip(' []') if date_suffix else ""
                                 }
                             })
 
@@ -187,15 +199,17 @@ class ExcelBatchService:
                         match = link_pattern.search(url)
                         if match:
                             password = match.group(2)
-                            current_title = title or f"Message_{msg.get('id')}"
+                            current_title = (title or f"Message_{msg.get('id')}") + date_suffix
 
                             extracted_data.append({
                                 "链接": url,
                                 "标题": current_title,
+                                "消息时间": date_suffix.strip(' []') if date_suffix else "",
                                 "提取码": password or "",
                                 "item_metadata": {
                                     "full_text": full_text,
-                                    "entities": entities
+                                    "entities": entities,
+                                    "msg_date": date_suffix.strip(' []') if date_suffix else ""
                                 }
                             })
             
@@ -332,17 +346,41 @@ class ExcelBatchService:
 
                         # Process the item
                         if p115_service.is_restricted:
-                            logger.info(f"⏳ P115 服务当前处于受限状态，批量任务 {task.id} 暂停等待...")
-                            # 将 item 状态改回待处理，以便稍后重试
+                            logger.info(f"⏳ P115 服务当前处于受限状态，批量任务 {task.id} 自动暂停...")
                             async with async_session() as session:
                                 await session.execute(
-                                    update(ExcelTaskItem).where(ExcelTaskItem.id == item_id).values(status="待处理")
+                                    update(ExcelTask).where(ExcelTask.id == task.id).values(status="paused")
+                                )
+                                if item_id:
+                                    await session.execute(
+                                        update(ExcelTaskItem).where(ExcelTaskItem.id == item_id).values(status="待处理")
+                                    )
+                                await session.commit()
+                            
+                            if tg_service:
+                                await tg_service.send_admin_msg(f"⏸️ 检测到账号受限，批量转存任务 '{task.name}' 已自动暂停。")
+                            
+                            self.active_task_id = None
+                            break # 停止当前任务的 worker
+
+                        task_config = {
+                            "target_channels": task.target_channels,
+                            "white_list_keywords": task.white_list_keywords,
+                            "black_list_keywords": task.black_list_keywords,
+                            "skip_large_package": task.skip_large_package
+                        }
+
+                        is_processed = await self._process_item(item_id, task_config)
+                        
+                        if getattr(is_processed, "__eq__", None) and is_processed == "RESTRICTED":
+                            logger.info(f"⏳ 任务 {task.id} 当前项遇到受限，立即暂停后续处理...")
+                            async with async_session() as session:
+                                await session.execute(
+                                    update(ExcelTask).where(ExcelTask.id == task.id).values(status="paused")
                                 )
                                 await session.commit()
-                            await asyncio.sleep(600)  # 等待 10 分钟再重看
-                            continue
-
-                        is_processed = await self._process_item(item_id)
+                            self.active_task_id = None
+                            break
                         
                     finally:
                         # Find next row and set is_waiting to True before sleep
@@ -404,27 +442,28 @@ class ExcelBatchService:
                 logger.error(f"Excel 工作线程出错: {e}")
                 await asyncio.sleep(5)
 
-    async def _process_item(self, item_id: int):
+    async def _process_item(self, item_id: int, task_config: dict = None):
         async with async_session() as session:
-            # Query Item and Task together to get target_channels and keywords
             result = await session.execute(
-                select(
-                    ExcelTaskItem, 
-                    ExcelTask.target_channels,
-                    ExcelTask.white_list_keywords,
-                    ExcelTask.black_list_keywords,
-                    ExcelTask.skip_large_package
-                )
-                .join(ExcelTask, ExcelTask.id == ExcelTaskItem.task_id)
-                .where(ExcelTaskItem.id == item_id)
+                select(ExcelTaskItem).where(ExcelTaskItem.id == item_id)
             )
             try:
-                row = result.one()
-                item = row[0]
-                target_channels = row[1]
-                white_list = row[2]
-                black_list = row[3]
-                skip_large_package = row[4]
+                item = result.scalar_one()
+                # 如果传了配置字典则直接取，否则回退一次库查询（保险策略）
+                if task_config:
+                    target_channels = task_config.get("target_channels")
+                    white_list = task_config.get("white_list_keywords")
+                    black_list = task_config.get("black_list_keywords")
+                    skip_large_package = task_config.get("skip_large_package")
+                else:
+                    task_result = await session.execute(
+                        select(ExcelTask).where(ExcelTask.id == item.task_id)
+                    )
+                    t_row = task_result.scalar_one()
+                    target_channels = t_row.target_channels
+                    white_list = t_row.white_list_keywords
+                    black_list = t_row.black_list_keywords
+                    skip_large_package = t_row.skip_large_package
             except Exception:
                 logger.error(f"Item {item_id} not found or task deleted")
                 return
@@ -481,6 +520,7 @@ class ExcelBatchService:
             history_url = await p115_service.get_history_link(original_url)
             if history_url:
                 item.status = "成功"
+                item.error_msg = None
                 import json
                 item.new_share_url = json.dumps(history_url) if isinstance(history_url, list) else history_url
                 await session.commit()
@@ -532,6 +572,7 @@ class ExcelBatchService:
                             await p115_service.save_history_link(original_url, all_links)
                             item.new_share_url = link_to_store
                             item.status = "成功"
+                            item.error_msg = None
                             
                             # Broadcast to channels
                             if tg_service:
@@ -543,8 +584,19 @@ class ExcelBatchService:
                             item.status = "失败"
                             item.error_msg = "转存成功但生成分享链接返回为空"
                     elif save_res.get("status") == "pending":
-                        item.status = "成功"
-                        item.error_msg = "已在115审核队列"
+                        reason = save_res.get("reason")
+                        if reason == "snapshotting":
+                            item.status = "待处理"
+                            item.error_msg = "快照生成中，已在后台排队处理"
+                        elif reason == "restricted":
+                            item.status = "待处理"
+                            item.error_msg = "检测到115账号限制接收，等待恢复"
+                            await session.commit()
+                            await self._update_task_counts(task_id)
+                            return "RESTRICTED"
+                        else:
+                            item.status = "待处理"
+                            item.error_msg = "已在115审核队列"
                     elif save_res.get("status") == "skipped":
                         item.status = "跳过"
                         item.error_msg = save_res.get("message", "跳过处理")

@@ -1,5 +1,13 @@
 <template>
   <div class="excel-batch-container">
+    <a-alert
+      v-if="isP115Restricted"
+      message="当前 115 账号处于受限状态，批量转存已自动暂停，详情请查看机器人通知。"
+      type="warning"
+      show-icon
+      banner
+      style="margin-bottom: 16px; border-radius: 8px;"
+    />
     <template v-if="!currentTaskId && tasks.length === 0 && !uploading">
       <!-- Initial Upload View -->
       <div class="empty-upload-view">
@@ -134,8 +142,8 @@
 
           <!-- Stats Cards -->
           <div class="stats-cards">
-            <a-row :gutter="16">
-              <a-col :span="6">
+            <a-row :gutter="16" type="flex">
+              <a-col :flex="1">
                 <div class="stat-card total">
                   <div class="stat-icon"><FileOutlined /></div>
                   <div class="stat-value">
@@ -144,11 +152,11 @@
                   </div>
                 </div>
               </a-col>
-              <a-col :span="6">
+              <a-col :flex="1">
                 <div class="stat-card processing">
                   <div class="stat-icon"><SyncOutlined spin v-if="currentTask?.status === 'running'" /> <SyncOutlined v-else /></div>
                   <div class="stat-value">
-                     <h3>{{ (currentTask?.success_count || 0) + (currentTask?.fail_count || 0) }}</h3>
+                     <h3>{{ (currentTask?.success_count || 0) + (currentTask?.fail_count || 0) + (currentTask?.skipped_count || 0) }}</h3>
                      <p>已处理</p>
                      <div v-if="(currentTask?.status === 'running' || currentTask?.status === 'pausing' || currentTask?.status === 'cancelling') && (currentTask?.current_row > 0)" class="current-row-info">
                         {{ currentTask?.is_waiting ? '等待处理' : '正在处理' }}第 {{ currentTask?.current_row }} 行
@@ -156,7 +164,16 @@
                   </div>
                 </div>
               </a-col>
-              <a-col :span="6">
+              <a-col :flex="1">
+                <div class="stat-card warning">
+                  <div class="stat-icon"><StopOutlined /></div>
+                  <div class="stat-value">
+                     <h3>{{ currentTask?.skipped_count || 0 }}</h3>
+                     <p>已跳过</p>
+                  </div>
+                </div>
+              </a-col>
+              <a-col :flex="1">
                 <div class="stat-card success">
                   <div class="stat-icon"><CheckCircleOutlined /></div>
                   <div class="stat-value">
@@ -165,7 +182,7 @@
                   </div>
                 </div>
               </a-col>
-              <a-col :span="6">
+              <a-col :flex="1">
                 <div class="stat-card error">
                   <div class="stat-icon"><CloseCircleOutlined /></div>
                   <div class="stat-value">
@@ -306,7 +323,7 @@
                   <a-tag :color="getStatusColor(record.status)">{{ record.status }}</a-tag>
                 </template>
                 <template v-if="column.key === 'error_msg'">
-                  <span style="color: #ff4d4f">{{ record.error_msg }}</span>
+                  <span v-if="record.status !== '成功'" style="color: #ff4d4f">{{ record.error_msg }}</span>
                 </template>
                 </template>
             </a-table>
@@ -423,6 +440,7 @@ import {
   SyncOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
+  StopOutlined,
   SettingOutlined,
   UnorderedListOutlined,
   LinkOutlined,
@@ -443,6 +461,7 @@ const screens = useBreakpoint();
 const isMobile = computed(() => !screens.value.md && (screens.value.sm || screens.value.xs));
 
 // State
+const isP115Restricted = ref(false);
 const tasks = ref<any[]>([]);
 const currentTaskId = ref<number | null>(null);
 const currentTask = computed(() => tasks.value.find(t => t.id === currentTaskId.value));
@@ -489,6 +508,7 @@ const columns = [
   { title: '行号', dataIndex: 'row_index', key: 'row_index', width: 70 },
   { title: '分享链接', dataIndex: 'original_url', key: 'original_url', ellipsis: true },
   { title: '资源名称', dataIndex: 'title', key: 'title', ellipsis: true },
+  { title: '消息时间', dataIndex: 'message_time', key: 'message_time', width: 120 },
   { title: '状态', dataIndex: 'status', key: 'status', width: 100 },
   { title: '新分享链接', dataIndex: 'new_share_url', key: 'new_share_url', ellipsis: true },
   { title: '错误信息', dataIndex: 'error_msg', key: 'error_msg', ellipsis: true },
@@ -515,7 +535,8 @@ const fetchSettings = async () => {
       systemSaveDir.value = res.data.p115_save_dir;
     }
     
-    // Parse target channels
+    isP115Restricted.value = !!res.data.p115_restricted;
+
     if (res.data.tg_channels) {
       try {
         const channels = JSON.parse(res.data.tg_channels);
@@ -669,10 +690,11 @@ const handleMappingOk = async () => {
   }
 };
 
-const handleStartTask = async () => {
+const handleStartTask = async (forceParam?: any) => {
   if (!currentTaskId.value) return;
   // If paused, allow starting without selection (continue from where it left off)
   const isResume = currentTask.value?.status === 'paused';
+  const force = forceParam === true;
 
   try {
     await axios.post(`/api/excel/tasks/${currentTaskId.value}/start`, {
@@ -682,12 +704,33 @@ const handleStartTask = async () => {
       target_channels: selectedChannels.value,
       white_list_keywords: whiteListKeywords.value,
       black_list_keywords: blackListKeywords.value,
-      skip_large_package: skipLargePackage.value
+      skip_large_package: skipLargePackage.value,
+      force: force
+
     });
     message.success(isResume ? '正在继续转存分享...' : '正在启动转存分享...');
     await fetchTasks();
-  } catch (e) {
-    message.error(isResume ? '继续失败' : '启动失败');
+    await fetchSettings();
+  } catch (e: any) {
+    if (e.response && e.response.status === 400) {
+      const errorMsg = e.response.data.detail || '启动失败';
+      if (!force && errorMsg.includes('强制继续')) {
+        Modal.confirm({
+          title: '系统检测到受限状态',
+          content: '继续启动将尝试发起探路请求（强制解除受限标记），如果 115 依然限制可能会增加风险或立刻重新冻结。您确定要强行继续吗？',
+          okText: '强行继续',
+          okType: 'danger',
+          cancelText: '取消',
+          onOk() {
+            handleStartTask(true);
+          }
+        });
+      } else {
+        message.warning(errorMsg);
+      }
+    } else {
+      message.error(isResume ? '继续失败' : '启动失败');
+    }
   }
 };
 
