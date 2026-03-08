@@ -1,6 +1,7 @@
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramNetworkError
 from aiohttp_socks import ProxyConnector
 from app.core.config import settings
 from app.services.p115 import p115_service
@@ -32,6 +33,25 @@ class TGService:
                 proxy_url = f"{proxy_type}://{auth}{settings.PROXY_HOST}:{settings.PROXY_PORT}"
                 session = AiohttpSession(proxy=proxy_url)
                 logger.info(f"Telegram Bot using {settings.PROXY_TYPE} proxy: {settings.PROXY_HOST}:{settings.PROXY_PORT}")
+            else:
+                # Use default session
+                session = AiohttpSession()
+
+            # Add retry middleware to session
+            async def retry_middleware(make_request, bot, method):
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        return await make_request(bot, method)
+                    except (TelegramNetworkError, asyncio.TimeoutError) as e:
+                        if attempt == max_retries - 1:
+                            # logger.error(f"Bot API call failed after {max_retries} attempts: {e}")
+                            raise
+                        wait_time = 1.5 ** attempt # Exponential backoff
+                        logger.warning(f"Bot network error: {e}. Retrying ({attempt + 1}/{max_retries}) in {wait_time:.1f}s...")
+                        await asyncio.sleep(wait_time)
+            
+            session.middleware(retry_middleware)
                 
             self.bot = Bot(token=token, session=session)
             self.dp = Dispatcher()

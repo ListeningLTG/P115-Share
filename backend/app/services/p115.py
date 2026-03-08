@@ -506,6 +506,20 @@ class P115Service:
             
             logger.info(f"📊 分享状态: {share_state}, 标题: {share_title}, 违规标志: {have_vio_file}")
 
+            # 🚀 Early Skip Large Package (Check even if auditing)
+            if skip_large_package:
+                try:
+                    # 115 share info often has 'count' or 'file_count'
+                    share_count = int(share_info.get("count") or share_info.get("file_count") or 0)
+                    if share_count > 500:
+                        logger.info(f"⏭️ 预检发现大包 (项目数: {share_count})，且开启了跳过选项，直接跳过处理: {share_url}")
+                        return {
+                            "status": "skipped",
+                            "message": f"检测为大包 (项目数: {share_count})，跳过处理"
+                        }
+                except (ValueError, TypeError):
+                    pass
+
             # 即使包含违规内容标志，也尝试继续处理，因为很多时候文件列表依然可用
             if have_vio_file == 1:
                 logger.warning(f"⚠️ 分享链接包含违规内容标志 (have_vio_file=1): {share_url}")
@@ -880,7 +894,9 @@ class P115Service:
                 # 条件：已处理超过 10,000 文件，或者容量接近上限 (90%)
                 need_cleanup = files_saved_total >= 10000
                 if not need_cleanup and settings.P115_CLEANUP_CAPACITY_ENABLED:
-                    used, total = await self.get_storage_stats()
+                    stats = await self.get_storage_stats()
+                    used = stats.get("used", 0)
+                    total = stats.get("total", 0)
                     if total > 0 and (used / total) > 0.9:
                         need_cleanup = True
                         logger.warning(f"⚠️ 容量逼近上限 ({used/total:.1%})，触发中转清理")
