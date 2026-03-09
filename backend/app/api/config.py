@@ -81,8 +81,9 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
         await settings.save_setting("P115_COOKIE", cfg.p115_cookie)
         p115_service.init_client(cfg.p115_cookie)
         
-    if "p115_save_dir" in update_data:
+    if "p115_save_dir" in update_data and settings.P115_SAVE_DIR != cfg.p115_save_dir:
         await settings.save_setting("P115_SAVE_DIR", cfg.p115_save_dir)
+        p115_service.clear_save_dir_cache()
     if "p115_recycle_password" in update_data:
         await settings.save_setting("P115_RECYCLE_PASSWORD", cfg.p115_recycle_password)
     

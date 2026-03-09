@@ -219,6 +219,7 @@ class P115Service:
                 
             self.client = P115Client(cookie, check_for_relogin=True)
             self.fs = P115FileSystem(self.client)
+            self.clear_save_dir_cache()
             
             proxy_info = ""
             if settings.PROXY_ENABLED:

@@ -1016,12 +1016,33 @@ class TGService:
         return False
 
     async def start_polling(self):
-        if self.dp and self.bot:
-            self._current_polling_id += 1
+        if not self.dp or not self.bot:
+            return
+            
+        self._current_polling_id += 1
+        polling_id = self._current_polling_id
+        
+        logger.info(f"🚀 Telegram Bot 启动轮询 (Polling ID: {polling_id})")
+        
+        while polling_id == self._current_polling_id:
             try:
-                await self.dp.start_polling(self.bot, skip_updates=True, handle_signals=False)
+                # 每次重试前都尝试验证一次连接
+                await self.verify_connection()
+                
+                if self.is_connected:
+                    await self.dp.start_polling(self.bot, skip_updates=True, handle_signals=False)
+                    # 如果正常退出（例如 stop_polling 设为 None），则终止循环
+                    if polling_id != self._current_polling_id:
+                        break
+                else:
+                    logger.warning("Bot 未连接，将在 30 秒后重试轮询...")
             except Exception as e:
+                self.is_connected = False
                 logger.error(f"Polling error: {e}")
+                
+            # 异常退出或连接失败，等待后重试（除非已被 stop 或 restart 改变了 ID）
+            if polling_id == self._current_polling_id:
+                await asyncio.sleep(30)
 
     async def stop_polling(self):
         if self.dp:
@@ -1052,15 +1073,21 @@ class TGService:
         if not self.bot or not settings.TG_USER_ID: return False, "未配置"
         try:
             await self.bot.send_message(settings.TG_USER_ID, "🔔 测试成功")
+            self.is_connected = True
             return True, "成功"
-        except Exception as e: return False, str(e)
+        except Exception as e: 
+            self.is_connected = False
+            return False, str(e)
 
     async def test_send_to_channel(self, channel_id: str = None):
         target_id = channel_id or settings.TG_CHANNEL_ID
         if not self.bot or not target_id: return False, "未配置"
         try:
             await self.bot.send_message(target_id, "📢 测试成功")
+            self.is_connected = True
             return True, "成功"
-        except Exception as e: return False, str(e)
+        except Exception as e: 
+            self.is_connected = False
+            return False, str(e)
 
 tg_service = TGService()
