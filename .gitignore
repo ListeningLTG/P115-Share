@@ -6,6 +6,7 @@ __pycache__/
 venv/
 ENV/
 .env
+.claude
 
 # Node
 frontend/node_modules/

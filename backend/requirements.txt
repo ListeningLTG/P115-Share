@@ -5,7 +5,6 @@ aiogram
 pydantic-settings
 loguru
 python-multipart
-# p115client will be installed separately from local source
 aiohttp
 apscheduler==3.10.4
 aiofiles

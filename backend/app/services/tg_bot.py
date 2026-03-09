@@ -37,19 +37,24 @@ class TGService:
                 # Use default session
                 session = AiohttpSession()
 
-            # Add retry middleware to session
+            # Add retry middleware to session with improved backoff
             async def retry_middleware(make_request, bot, method):
-                max_retries = 3
+                max_retries = 5  # 增加到 5 次
+                base_delay = 2.0
                 for attempt in range(max_retries):
                     try:
                         return await make_request(bot, method)
                     except (TelegramNetworkError, asyncio.TimeoutError) as e:
                         if attempt == max_retries - 1:
-                            # logger.error(f"Bot API call failed after {max_retries} attempts: {e}")
                             raise
-                        wait_time = 1.5 ** attempt # Exponential backoff
+                        # 指数退避：2, 4, 8, 16 秒
+                        wait_time = base_delay * (2 ** attempt)
                         logger.warning(f"Bot network error: {e}. Retrying ({attempt + 1}/{max_retries}) in {wait_time:.1f}s...")
                         await asyncio.sleep(wait_time)
+                    except Exception as e:
+                        # 非网络错误直接抛出，不重试
+                        logger.error(f"Bot API non-network error: {e}")
+                        raise
             
             session.middleware(retry_middleware)
                 
@@ -1007,12 +1012,18 @@ class TGService:
             self.is_connected = False
             return False
         try:
-            me = await self.bot.get_me()
+            # 添加超时控制，避免长时间阻塞
+            me = await asyncio.wait_for(self.bot.get_me(), timeout=10.0)
             if me:
                 self.is_connected = True
                 logger.info(f"✅ Telegram Bot 连接验证成功: @{me.username}")
                 return True
+        except asyncio.TimeoutError:
+            logger.warning("⏱️ Telegram Bot 连接验证超时")
+            self.is_connected = False
+            return False
         except Exception as e:
+            logger.warning(f"❌ Telegram Bot 连接验证失败: {e}")
             self.is_connected = False
             return False
         self.is_connected = False
@@ -1021,31 +1032,46 @@ class TGService:
     async def start_polling(self):
         if not self.dp or not self.bot:
             return
-            
+
         self._current_polling_id += 1
         polling_id = self._current_polling_id
-        
+
         logger.info(f"🚀 Telegram Bot 启动轮询 (Polling ID: {polling_id})")
-        
+
+        retry_count = 0
+        max_retry_delay = 300  # 最大重试间隔 5 分钟
+
         while polling_id == self._current_polling_id:
             try:
-                # 每次重试前都尝试验证一次连接
-                await self.verify_connection()
-                
-                if self.is_connected:
+                # 验证连接
+                connection_ok = await self.verify_connection()
+
+                if connection_ok:
+                    retry_count = 0  # 重置重试计数
                     await self.dp.start_polling(self.bot, skip_updates=True, handle_signals=False)
-                    # 如果正常退出（例如 stop_polling 设为 None），则终止循环
+                    # 正常退出
                     if polling_id != self._current_polling_id:
                         break
                 else:
-                    logger.warning("Bot 未连接，将在 30 秒后重试轮询...")
+                    # 连接失败，使用指数退避
+                    retry_count += 1
+                    delay = min(10 * (2 ** min(retry_count - 1, 5)), max_retry_delay)
+                    logger.warning(f"Bot 未连接，将在 {delay} 秒后重试 (第 {retry_count} 次)...")
+                    await asyncio.sleep(delay)
+                    continue
+
             except Exception as e:
                 self.is_connected = False
-                logger.error(f"Polling error: {e}")
-                
-            # 异常退出或连接失败，等待后重试（除非已被 stop 或 restart 改变了 ID）
+                retry_count += 1
+                delay = min(10 * (2 ** min(retry_count - 1, 5)), max_retry_delay)
+                logger.error(f"Polling error: {e}，将在 {delay} 秒后重试 (第 {retry_count} 次)...")
+
+            # 异常退出，等待后重试
             if polling_id == self._current_polling_id:
-                await asyncio.sleep(30)
+                if retry_count == 0:
+                    retry_count = 1
+                delay = min(10 * (2 ** min(retry_count - 1, 5)), max_retry_delay)
+                await asyncio.sleep(delay)
 
     async def stop_polling(self):
         if self.dp:
