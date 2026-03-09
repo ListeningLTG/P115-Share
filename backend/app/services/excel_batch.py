@@ -412,30 +412,26 @@ class ExcelBatchService:
                                 await session.commit()
                         self.active_task_id = None
                 
-                # Rate limiting (Random interval)
-
                 # Rate limiting (Random interval) with capacity check
                 if is_processed:
                     interval = random.randint(interval_min, interval_max)
-                    
-                    # 利用等待时间检查容量 (不占用转存时间，且无锁冲突)
-                    start_check = datetime.now()
+
+                    # 先执行容量检查
                     try:
-                        # mode="batch" 包含 10% 兜底逻辑
+                        start_check = datetime.now()
                         await p115_service.check_capacity_and_cleanup(mode="batch")
+                        elapsed = (datetime.now() - start_check).total_seconds()
+                        logger.debug(f"容量检查完成，耗时 {elapsed:.2f}s")
                     except Exception as ce:
-                        logger.error(f"批量任务间隙容量检查失败: {ce}")
-                    
-                    # 计算剩余需要 sleep 的时间
-                    elapsed = (datetime.now() - start_check).total_seconds()
-                    remaining_sleep = interval - elapsed
-                    
+                        logger.error(f"批量任务容量检查失败: {ce}")
+                        elapsed = 0
+
+                    # 计算剩余等待时间并执行
+                    remaining_sleep = max(0, interval - elapsed)
                     if remaining_sleep > 0:
                         await asyncio.sleep(remaining_sleep)
-                    else:
-                        logger.debug(f"容量检查耗时 {elapsed:.2f}s > 间隔 {interval}s，跳过额外等待")
                 else:
-                    # 如果是被跳过的项目，不进入间隔，直接处理下一个
+                    # 跳过的项目不等待，直接处理下一个
                     pass
                 
             except Exception as e:
@@ -553,7 +549,8 @@ class ExcelBatchService:
                     url_to_save, 
                     metadata=metadata,
                     target_dir=settings.P115_SAVE_DIR,
-                    skip_large_package=skip_large_package
+                    skip_large_package=True,
+                    is_batch=True
                 )
                 
                 if save_res:

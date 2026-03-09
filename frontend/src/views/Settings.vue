@@ -65,12 +65,12 @@
             <a-input v-model:value="formState.tg_allow_chats" placeholder="允许使用机器人的 ID (多个用逗号分隔)" />
           </a-form-item>
 
-          <a-form-item label="跳过大包 (500文件限制)">
+          <!-- <a-form-item label="跳过大包 (500文件限制)">
             <template #extra>
               <div style="font-size: 12px; color: #999; margin-top: 4px">开启后，机器人收到的链接如果是大包将直接跳过并提醒，不进行分批转存</div>
             </template>
             <a-switch v-model:checked="formState.tg_skip_large_package" />
-          </a-form-item>
+          </a-form-item> -->
           
           <a-divider />
           <a-button type="primary" @click="onFinish('tg')" :loading="loading" block>保存 Telegram 配置</a-button>
@@ -131,6 +131,37 @@
               </div>
             </a-form-item>
           </div>
+
+          <a-divider orientation="left">转存频率控制</a-divider>
+          <a-row :gutter="16">
+            <a-col :span="12">
+              <a-form-item label="限制转存次数" name="p115_rate_limit_count">
+                <a-input-number v-model:value="formState.p115_rate_limit_count" :min="0" style="width: 100%" />
+                <div style="font-size: 12px; color: #999; margin-top: 4px">窗口期内允许的最大转存次数 (0 为不限制)</div>
+              </a-form-item>
+            </a-col>
+            <a-col :span="12">
+              <a-form-item label="窗口大小 (秒)" name="p115_rate_limit_window">
+                <a-input-number v-model:value="formState.p115_rate_limit_window" :min="1" style="width: 100%" />
+                <div style="font-size: 12px; color: #999; margin-top: 4px">计算转存次数的时间范围</div>
+              </a-form-item>
+            </a-col>
+          </a-row>
+
+          <a-row :gutter="16">
+            <a-col :span="12">
+              <a-form-item label="静默时长 (秒)" name="p115_rate_limit_silent_duration">
+                <a-input-number v-model:value="formState.p115_rate_limit_silent_duration" :min="0" style="width: 100%" />
+                <div style="font-size: 12px; color: #999; margin-top: 4px">触发限制后暂停转存的时长</div>
+              </a-form-item>
+            </a-col>
+            <a-col :span="12">
+              <a-form-item label="批量避让时长 (秒)" name="p115_batch_yield_duration">
+                <a-input-number v-model:value="formState.p115_batch_yield_duration" :min="0" style="width: 100%" />
+                <div style="font-size: 12px; color: #999; margin-top: 4px">TG 收到新任务后，批量任务暂停的时长</div>
+              </a-form-item>
+            </a-col>
+          </a-row>
           
           <a-divider />
           <a-button type="primary" @click="onFinish('p115')" :loading="loading" block>保存 115 配置</a-button>
@@ -240,7 +271,11 @@ const formState = reactive({
   p115_cleanup_capacity_enabled: false,
   p115_cleanup_capacity_limit: 0,
   p115_cleanup_capacity_unit: 'GB',
-  p115_cleanup_capacity_type: 'ENTIRE'
+  p115_cleanup_capacity_type: 'ENTIRE',
+  p115_rate_limit_count: 30,
+  p115_rate_limit_window: 300,
+  p115_rate_limit_silent_duration: 60,
+  p115_batch_yield_duration: 10
 });
 
 const addChannel = () => {
@@ -333,6 +368,10 @@ const loadConfig = async () => {
     formState.p115_cleanup_capacity_limit = res.data.p115_cleanup_capacity_limit || 0;
     formState.p115_cleanup_capacity_unit = res.data.p115_cleanup_capacity_unit || 'GB';
     formState.p115_cleanup_capacity_type = res.data.p115_cleanup_capacity_type || 'ENTIRE';
+    formState.p115_rate_limit_count = res.data.p115_rate_limit_count !== undefined ? res.data.p115_rate_limit_count : 30;
+    formState.p115_rate_limit_window = res.data.p115_rate_limit_window || 300;
+    formState.p115_rate_limit_silent_duration = res.data.p115_rate_limit_silent_duration !== undefined ? res.data.p115_rate_limit_silent_duration : 60;
+    formState.p115_batch_yield_duration = res.data.p115_batch_yield_duration !== undefined ? res.data.p115_batch_yield_duration : 10;
   } catch (e) {
     console.error(e);
   }
@@ -345,7 +384,8 @@ const onFinish = async (section: 'tg' | 'p115' | 'proxy' = 'tg') => {
       p115: [
         'p115_cookie', 'p115_save_dir', 'p115_cleanup_dir_cron', 
         'p115_cleanup_trash_cron', 'p115_recycle_password',
-        'p115_cleanup_capacity_enabled', 'p115_cleanup_capacity_limit', 'p115_cleanup_capacity_unit', 'p115_cleanup_capacity_type'
+        'p115_cleanup_capacity_enabled', 'p115_cleanup_capacity_limit', 'p115_cleanup_capacity_unit', 'p115_cleanup_capacity_type',
+        'p115_rate_limit_count', 'p115_rate_limit_window', 'p115_rate_limit_silent_duration', 'p115_batch_yield_duration'
       ],
       proxy: ['proxy_enabled', 'proxy_host', 'proxy_port', 'proxy_user', 'proxy_pass', 'proxy_type']
     };

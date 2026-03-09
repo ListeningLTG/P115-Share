@@ -6,6 +6,9 @@ from app.core.config import settings
 from loguru import logger
 import asyncio
 import time
+from collections import deque
+import json
+import re
 import random
 from contextlib import asynccontextmanager
 from typing import Literal, Optional, Tuple, Union
@@ -42,6 +45,11 @@ class P115Service:
         self._worker_lock = asyncio.Lock()
         self._current_task_info = None # 存储当前正在处理的任务信息
         self._restriction_until: float = 0 # 限制结束的时间戳
+        
+        # 动态频率限制和任务优先级让步
+        self._last_save_times = deque(maxlen=1000)  # 限制最大长度，防止无限增长
+        self._last_tg_link_time: float = 0.0 # 最近收到 TG 链接的时间
+        self._silent_until: float = 0.0      # 静默期截止时间
         
         if settings.P115_COOKIE:
             self.init_client(settings.P115_COOKIE)
@@ -144,10 +152,14 @@ class P115Service:
         """后台任务处理 Worker"""
         logger.info("🚀 P115 任务队列 Worker 已启动")
         while True:
-            # 获取任务：(task_func, args, kwargs, future, task_type)
-            task_func, args, kwargs, future, task_type = await self._task_queue.get()
+            # 获取任务：(task_func, args, kwargs, future, task_type, is_batch)
+            task_func, args, kwargs, future, task_type, is_batch = await self._task_queue.get()
             self._current_task_info = task_type
             try:
+                # 在执行任务前进行频率和优先级检查
+                if "save" in task_type: # 只对保存/转存任务实施频率检查
+                    await self._handle_dynamic_rate_limit(is_batch)
+
                 logger.info(f"⚡ 队列正在处理任务: {task_type}")
                 # 执行具体逻辑
                 result = await task_func(*args, **kwargs)
@@ -242,7 +254,7 @@ class P115Service:
         # 这里为了最小化变动，暂时仅针对 share 链接进行队列化
         yield
 
-    async def _enqueue_op(self, task_type: str, func, *args, **kwargs):
+    async def _enqueue_op(self, task_type: str, func, *args, is_batch: bool = False, **kwargs):
         """将操作放入队列并等待结果"""
         # 确保 Worker 正在运行
         if self._worker_task is None or self._worker_task.done():
@@ -256,8 +268,64 @@ class P115Service:
                     logger.info("🕵️ 延迟启动 P115 受限状态监测协程")
 
         future = asyncio.get_running_loop().create_future()
-        await self._task_queue.put((func, args, kwargs, future, task_type))
+        # 将任务作为元组放入：(task_func, args, kwargs, future, task_type, is_batch)
+        await self._task_queue.put((func, args, kwargs, future, task_type, is_batch))
         return await future
+
+    def update_tg_activity(self):
+        """更新最后一次收到 TG 链接的时间戳，用于批量任务让步"""
+        self._last_tg_link_time = time.time()
+
+    def _record_save_activity(self):
+        """记录一次成功的保存操作并存入频率窗口"""
+        self._last_save_times.append(time.time())
+
+    async def _handle_dynamic_rate_limit(self, is_batch: bool):
+        """实施动态频率限制和优先级让步逻辑"""
+        # 使用循环代替递归，避免栈溢出
+        while True:
+            now = time.time()
+
+            # 1. 检查是否需要为 TG 消息让步 (仅针对批量任务)
+            if is_batch and settings.P115_BATCH_YIELD_DURATION > 0:
+                elapsed_since_tg = now - self._last_tg_link_time
+                if elapsed_since_tg < settings.P115_BATCH_YIELD_DURATION:
+                    wait_time = settings.P115_BATCH_YIELD_DURATION - elapsed_since_tg
+                    logger.info(f"优先为 TG 消息链接让步，批量任务等待 {wait_time:.1f} 秒...")
+                    await asyncio.sleep(wait_time)
+                    continue  # 重新检查所有条件
+
+            # 2. 检查是否处于静默期
+            if now < self._silent_until:
+                wait_time = self._silent_until - now
+                logger.info(f"P115-Share 处于保存频次限制静默期，剩余 {wait_time:.1f} 秒...")
+                await asyncio.sleep(wait_time)
+                continue  # 重新检查所有条件
+
+            # 3. 检查窗口期内的保存次数
+            if settings.P115_RATE_LIMIT_COUNT > 0 and settings.P115_RATE_LIMIT_WINDOW > 0:
+                cutoff = now - settings.P115_RATE_LIMIT_WINDOW
+
+                # 只在队列较长时才清理，提高效率
+                if len(self._last_save_times) > settings.P115_RATE_LIMIT_COUNT * 2:
+                    while self._last_save_times and self._last_save_times[0] < cutoff:
+                        self._last_save_times.popleft()
+
+                # 统计窗口内的有效记录
+                recent_count = sum(1 for t in self._last_save_times if t >= cutoff)
+
+                if recent_count >= settings.P115_RATE_LIMIT_COUNT:
+                    # 触发静默期
+                    self._silent_until = now + settings.P115_RATE_LIMIT_SILENT_DURATION
+                    silent_end_time = time.strftime('%H:%M:%S', time.localtime(self._silent_until))
+                    logger.warning(
+                        f"⚠️ 警告: 检测到保存过于频繁！在 {settings.P115_RATE_LIMIT_WINDOW}s 内执行了 {recent_count} 次转存，"
+                        f"触发频率保护。系统将进入静默期 {settings.P115_RATE_LIMIT_SILENT_DURATION}s (至 {silent_end_time})。"
+                    )
+                    continue  # 重新进入循环处理静默期
+
+            # 所有检查通过，退出循环
+            break
 
     async def verify_connection(self) -> bool:
         """Verify the 115 cookie connection"""
@@ -437,11 +505,11 @@ class P115Service:
                 "message": f"保存失败，且重试转存报错: {str(check_e)}"
             }
 
-    async def save_share_link(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False):
+    async def save_share_link(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, is_batch: bool = False):
         """通过队列保存链接"""
-        return await self._enqueue_op("save_share", self._save_share_link_internal, share_url, metadata, target_dir, skip_large_package)
+        return await self._enqueue_op(f"save_share_link({share_url})", self._save_share_link_internal, share_url, metadata, target_dir, skip_large_package, is_batch=is_batch)
 
-    async def save_and_share(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, db_id: Optional[int] = None):
+    async def save_and_share(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, db_id: Optional[int] = None, is_batch: bool = False):
         """通过队列进行转存并分享"""
         async def _internal_flow():
             save_res = await self._save_share_link_internal(share_url, metadata, target_dir, skip_large_package, db_id=db_id)
@@ -463,7 +531,7 @@ class P115Service:
                 }
             return save_res
 
-        return await self._enqueue_op(f"save_and_share({share_url})", _internal_flow)
+        return await self._enqueue_op(f"save_and_share({share_url})", _internal_flow, is_batch=is_batch)
 
     async def _save_share_link_internal(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, db_id: Optional[int] = None):
         """Internal logic for saving a 115 share link (no locking)"""
@@ -677,6 +745,7 @@ class P115Service:
                 )
                 check_response(recv_resp)
                 logger.info(f"✅ 链接转存指令已发送: {share_url} -> CID {to_cid}")
+                self._record_save_activity()
                 recursive_links = []
             except Exception as recv_error:
                 # Check for 500-file limit error (errno 4200044)
@@ -693,6 +762,7 @@ class P115Service:
                     logger.warning(f"⚠️ 触发 115 非会员 500 文件保存限制，尝试递归分批保存: {share_url}")
                     recursive_links = await self._save_share_recursive(share_url, to_cid)
                     logger.info(f"✅ 递归分批保存指令已处理完毕: {share_url}")
+                    self._record_save_activity()
                 # Check if it's a "file already received" error (errno 4200045)
                 elif errno_val == 4200045 or "4200045" in str(recv_error) or "已经接收" in str(recv_error) or "已接收" in str(recv_error):
                     return await self._handle_already_received(to_cid, names, share_url, metadata, have_vio_file, receive_payload)
@@ -963,6 +1033,7 @@ class P115Service:
                     check_response(recv_resp)
                     files_saved_total += len(batch)
                     logger.info(f"✅ 递归分批转存成功: {len(batch)} 个文件 -> CID {current_target_pid} (本轮累计: {files_saved_total})")
+                    self._record_save_activity()
                     
                     await asyncio.sleep(random.randint(2, 3))
                 except Exception as e:

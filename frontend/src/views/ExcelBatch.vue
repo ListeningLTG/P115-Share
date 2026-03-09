@@ -227,12 +227,12 @@
                          :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)"
                       />
                   </div>
-                  <div class="form-item" style="margin-left: 24px; flex: none; width: 140px">
+                  <!-- <div class="form-item" style="margin-left: 24px; flex: none; width: 140px">
                      <label>跳过大包 (500文件限制)</label>
                      <div style="height: 32px; display: flex; align-items: center">
                         <a-switch v-model:checked="skipLargePackage" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
                      </div>
-                  </div>
+                  </div> -->
                 </div>
                 
                 <div class="form-row">

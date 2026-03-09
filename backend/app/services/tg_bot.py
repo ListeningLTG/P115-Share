@@ -207,6 +207,9 @@ class TGService:
         total_links = len(share_urls)
         logger.info(f"🎯 发现 {total_links} 个 115 链接，开始批量处理...")
         
+        # 通知 P115 服务有来自 TG 的实时活动，以便批量任务进行让步
+        p115_service.update_tg_activity()
+        
         status_msg = await message.answer(f"⌛️ 正在处理 {total_links} 个链接，请稍候...")
         
         # Prepare metadata entities common logic
@@ -265,7 +268,7 @@ class TGService:
                 save_res = await p115_service.save_and_share(
                     share_url, 
                     metadata=metadata,
-                    skip_large_package=settings.TG_SKIP_LARGE_PACKAGE,
+                    skip_large_package=True,
                     db_id=None # 初次入库时不带ID
                 )
                 

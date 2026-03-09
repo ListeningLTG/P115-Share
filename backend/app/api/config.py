@@ -35,6 +35,10 @@ class ConfigUpdate(BaseModel):
     p115_cleanup_capacity_limit: Optional[float] = None
     p115_cleanup_capacity_unit: Optional[str] = None
     p115_cleanup_capacity_type: Optional[str] = None
+    p115_rate_limit_count: Optional[int] = None
+    p115_rate_limit_window: Optional[int] = None
+    p115_rate_limit_silent_duration: Optional[int] = None
+    p115_batch_yield_duration: Optional[int] = None
 
     @field_validator('p115_cleanup_dir_cron', 'p115_cleanup_trash_cron')
     @classmethod
@@ -132,6 +136,12 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
                 await settings.save_setting(field.upper(), val)
                 capacity_changed = True
     
+    # 4.6 Update Rate Limiting & Yielding
+    limit_fields = ["p115_rate_limit_count", "p115_rate_limit_window", "p115_rate_limit_silent_duration", "p115_batch_yield_duration"]
+    for field in limit_fields:
+        if field in update_data:
+            await settings.save_setting(field.upper(), update_data[field])
+    
     if capacity_changed:
         from app.services.scheduler import cleanup_scheduler
         cleanup_scheduler.update_cleanup_capacity_job()
@@ -170,6 +180,10 @@ async def get_config(user=Depends(get_current_user)):
         "p115_cleanup_capacity_limit": settings.P115_CLEANUP_CAPACITY_LIMIT,
         "p115_cleanup_capacity_unit": settings.P115_CLEANUP_CAPACITY_UNIT,
         "p115_cleanup_capacity_type": settings.P115_CLEANUP_CAPACITY_TYPE,
+        "p115_rate_limit_count": settings.P115_RATE_LIMIT_COUNT,
+        "p115_rate_limit_window": settings.P115_RATE_LIMIT_WINDOW,
+        "p115_rate_limit_silent_duration": settings.P115_RATE_LIMIT_SILENT_DURATION,
+        "p115_batch_yield_duration": settings.P115_BATCH_YIELD_DURATION,
         "version": VERSION
     }
 

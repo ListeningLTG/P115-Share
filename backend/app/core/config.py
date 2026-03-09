@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     TG_USER_ID: str = ""
     TG_ALLOW_CHATS: str = "" # Comma separated list of IDs
     TG_CHANNELS: str = "[]"  # JSON list of {id, enabled, concise}
-    TG_SKIP_LARGE_PACKAGE: bool = False
+    TG_SKIP_LARGE_PACKAGE: bool = True
     
     # 115
     P115_COOKIE: str = ""
@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     P115_CLEANUP_CAPACITY_LIMIT: float = 0.0  # Threshold value
     P115_CLEANUP_CAPACITY_UNIT: str = "GB"    # GB or TB
     P115_CLEANUP_CAPACITY_TYPE: str = "ENTIRE" # ENTIRE or DIRECTORY
+
+    # Rate limiting & Task Prioritization
+    P115_RATE_LIMIT_COUNT: int = 30             # Window count
+    P115_RATE_LIMIT_WINDOW: int = 300           # Window size (s)
+    P115_RATE_LIMIT_SILENT_DURATION: int = 60   # Silence duration (s)
+    P115_BATCH_YIELD_DURATION: int = 10         # Yield to TG links (s)
     
     # Proxy settings
     PROXY_ENABLED: bool = False
@@ -146,6 +152,16 @@ class Settings(BaseSettings):
                         setattr(self, row.key, row.value)
                 except Exception as e:
                     logger.error(f"Failed to cast setting {row.key}: {e}")
+
+        # 验证频率控制参数
+        if self.P115_RATE_LIMIT_COUNT < 0:
+            self.P115_RATE_LIMIT_COUNT = 0
+        if self.P115_RATE_LIMIT_WINDOW <= 0:
+            self.P115_RATE_LIMIT_WINDOW = 300
+        if self.P115_RATE_LIMIT_SILENT_DURATION <= 0:
+            self.P115_RATE_LIMIT_SILENT_DURATION = 60
+        if self.P115_BATCH_YIELD_DURATION < 0:
+            self.P115_BATCH_YIELD_DURATION = 0
 
     async def save_setting(self, key: str, value: str):
         """Save a single setting to database (Create or Update)"""
