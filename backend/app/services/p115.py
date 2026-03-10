@@ -50,6 +50,8 @@ class P115Service:
         self._last_save_times = deque(maxlen=1000)  # 限制最大长度，防止无限增长
         self._last_tg_link_time: float = 0.0 # 最近收到 TG 链接的时间
         self._silent_until: float = 0.0      # 静默期截止时间
+        self._batch_yield_count: int = 0     # 批量任务避让次数统计
+        self._batch_yield_total_time: float = 0.0  # 批量任务避让累计时间
         
         if settings.P115_COOKIE:
             self.init_client(settings.P115_COOKIE)
@@ -290,8 +292,20 @@ class P115Service:
             if is_batch and settings.P115_BATCH_YIELD_DURATION > 0:
                 elapsed_since_tg = now - self._last_tg_link_time
                 if elapsed_since_tg < settings.P115_BATCH_YIELD_DURATION:
-                    wait_time = settings.P115_BATCH_YIELD_DURATION - elapsed_since_tg
-                    logger.info(f"优先为 TG 消息链接让步，批量任务等待 {wait_time:.1f} 秒...")
+                    # 动态计算等待时间：TG 链接越新，等待时间越长
+                    if elapsed_since_tg < 2:
+                        # TG 链接刚到达，等待较长时间
+                        wait_time = min(8, settings.P115_BATCH_YIELD_DURATION - elapsed_since_tg)
+                    elif elapsed_since_tg < 5:
+                        # TG 链接到达一段时间，等待中等时间
+                        wait_time = min(5, settings.P115_BATCH_YIELD_DURATION - elapsed_since_tg)
+                    else:
+                        # TG 链接已过去较长时间，等待较短时间
+                        wait_time = min(2, settings.P115_BATCH_YIELD_DURATION - elapsed_since_tg)
+
+                    self._batch_yield_count += 1
+                    self._batch_yield_total_time += wait_time
+                    logger.info(f"🔄 优先为 TG 消息链接让步，批量任务等待 {wait_time:.1f}s (TG链接距今 {elapsed_since_tg:.1f}s，累计避让 {self._batch_yield_count} 次，总计 {self._batch_yield_total_time:.1f}s)")
                     await asyncio.sleep(wait_time)
                     continue  # 重新检查所有条件
 
