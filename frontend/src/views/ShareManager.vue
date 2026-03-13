@@ -148,7 +148,7 @@ const loadAccounts = async () => {
     const res = await axios.get('/api/accounts/');
     accounts.value = res.data.accounts || [];
     if (accounts.value.length > 0 && !selectedAccountId.value) {
-      selectedAccountId.value = accounts.value[0].id;
+      selectedAccountId.value = accounts.value[0]!.id;
     }
   } catch (e) {
     // ignore

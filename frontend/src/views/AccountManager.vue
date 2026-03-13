@@ -72,7 +72,7 @@
 
     <!-- 定时任务 & 频率控制 -->
     <a-divider />
-    <a-form :model="p115Form" layout="vertical" ref="p115FormRef">
+    <a-form :model="p115Form" layout="vertical">
       <a-form-item label="清理保存目录 (Cron)" name="p115_cleanup_dir_cron">
         <a-input v-model:value="p115Form.p115_cleanup_dir_cron" placeholder="例如 */30 * * * *" />
         <div style="font-size: 12px; color: #999; margin-top: 4px">为空则不进行定时清理（全局生效，每个账号各自执行）</div>
@@ -253,7 +253,6 @@ const modalVisible = ref(false);
 const submitting = ref(false);
 const editingId = ref<number | null>(null);
 const savingP115 = ref(false);
-const p115FormRef = ref();
 
 const p115Form = reactive({
   p115_cleanup_dir_cron: '',
