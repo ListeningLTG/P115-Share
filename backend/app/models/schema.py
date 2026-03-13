@@ -51,6 +51,7 @@ class ExcelTask(Base):
     interval_min: Mapped[int] = mapped_column(Integer, default=5)
     interval_max: Mapped[int] = mapped_column(Integer, default=10)
     skip_count: Mapped[int] = mapped_column(Integer, default=0)
+    stop_row: Mapped[int] = mapped_column(Integer, default=0)  # 0 表示处理到最后一行
     current_row: Mapped[int] = mapped_column(Integer, default=0)
     is_waiting: Mapped[bool] = mapped_column(Boolean, default=False)
     target_channels: Mapped[dict] = mapped_column(JSON, nullable=True)  # List of channel IDs to push to

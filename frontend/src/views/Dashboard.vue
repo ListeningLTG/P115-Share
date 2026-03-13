@@ -91,6 +91,9 @@ const checkStatus = async () => {
     tgToken.value = configRes.data.tg_bot_token || '';
     version.value = configRes.data.version || '';
     accounts.value = accountsRes.data.accounts || [];
+    if (accounts.value.length > 0 && selectedAccountId.value === undefined) {
+      selectedAccountId.value = accounts.value[0].id;
+    }
     message.success('状态已刷新');
   } catch (e) {
     message.error('无法连接到后端服务器');

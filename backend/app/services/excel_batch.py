@@ -667,7 +667,7 @@ class ExcelBatchService:
             )
             await session.commit()
 
-    async def start_task(self, task_id: int, skip_count: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False):
+    async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False):
         async with async_session() as session:
             # Get currrent status
             result = await session.execute(select(ExcelTask).where(ExcelTask.id == task_id))
@@ -682,7 +682,8 @@ class ExcelBatchService:
             new_status = "queued" if other_running else "running"
             
             # If resume from paused, dont reset skip/pending
-            is_resume = task.status == "paused"
+            # BUT if skip_count or stop_row changed, treat as fresh start
+            is_resume = task.status == "paused" and task.skip_count == skip_count and task.stop_row == stop_row
             
             # Update intervals and status
             task.interval_min = interval_min
@@ -701,6 +702,7 @@ class ExcelBatchService:
             
             if not is_resume:
                 task.skip_count = skip_count
+                task.stop_row = stop_row
                 task.current_row = 0
                 # Mark first skip_count items as "跳过"
                 await session.execute(
@@ -709,13 +711,30 @@ class ExcelBatchService:
                         ExcelTaskItem.row_index <= skip_count
                     ).values(status="跳过", error_msg=None, new_share_url=None)
                 )
-                # Mark remaining items as "待处理"
-                await session.execute(
-                    update(ExcelTaskItem).where(
-                        ExcelTaskItem.task_id == task_id,
-                        ExcelTaskItem.row_index > skip_count
-                    ).values(status="待处理", error_msg=None, new_share_url=None)
-                )
+                if stop_row > 0:
+                    # Mark items within [skip_count+1, stop_row] as "待处理"
+                    await session.execute(
+                        update(ExcelTaskItem).where(
+                            ExcelTaskItem.task_id == task_id,
+                            ExcelTaskItem.row_index > skip_count,
+                            ExcelTaskItem.row_index <= stop_row
+                        ).values(status="待处理", error_msg=None, new_share_url=None)
+                    )
+                    # Mark items after stop_row as "跳过"
+                    await session.execute(
+                        update(ExcelTaskItem).where(
+                            ExcelTaskItem.task_id == task_id,
+                            ExcelTaskItem.row_index > stop_row
+                        ).values(status="跳过", error_msg=None, new_share_url=None)
+                    )
+                else:
+                    # Mark remaining items as "待处理"
+                    await session.execute(
+                        update(ExcelTaskItem).where(
+                            ExcelTaskItem.task_id == task_id,
+                            ExcelTaskItem.row_index > skip_count
+                        ).values(status="待处理", error_msg=None, new_share_url=None)
+                    )
             
             await session.commit()
             

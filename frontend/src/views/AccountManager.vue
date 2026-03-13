@@ -377,15 +377,23 @@ const submitModal = async () => {
     // 编辑时若 cookie 为空则不更新
     if (editingId.value && !payload.cookie) delete payload.cookie;
 
+    let savedId: number;
     if (editingId.value) {
       await axios.put(`/api/accounts/${editingId.value}`, payload);
       message.success('账号更新成功');
+      savedId = editingId.value;
     } else {
-      await axios.post('/api/accounts/', payload);
+      const res = await axios.post('/api/accounts/', payload);
       message.success('账号创建成功');
+      savedId = res.data.data?.id ?? res.data.id;
     }
     modalVisible.value = false;
     await loadAccounts();
+    // 保存后自动测试一次
+    const savedAccount = accounts.value.find(a => a.id === savedId);
+    if (savedAccount) {
+      await testConnection(savedAccount);
+    }
   } catch (e) {
     message.error('保存失败');
   } finally {

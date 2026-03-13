@@ -219,13 +219,26 @@
                   </div>
                   <div class="form-item" style="margin-left: 24px">
                      <label>跳过前几条</label>
-                     <a-input-number 
-                        v-model:value="skipCount" 
-                        :min="0" 
-                        :precision="0" 
+                     <a-input-number
+                        v-model:value="skipCount"
+                        :min="0"
+                        :precision="0"
                          style="width: 100px"
                          :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)"
                       />
+                  </div>
+                  <div class="form-item" style="margin-left: 24px">
+                     <label>第几行停止</label>
+                     <a-tooltip :title="(stopRow ?? 0) > 0 && (stopRow ?? 0) <= (skipCount ?? 0) ? '停止行必须大于跳过条数' : '0 表示处理到最后一行（为空时提交自动重置为 0）'">
+                       <a-input-number
+                          v-model:value="stopRow"
+                          :min="0"
+                          :precision="0"
+                          style="width: 100px"
+                          :status="(stopRow ?? 0) > 0 && (stopRow ?? 0) <= (skipCount ?? 0) ? 'error' : ''"
+                          :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)"
+                       />
+                     </a-tooltip>
                   </div>
                   <!-- <div class="form-item" style="margin-left: 24px; flex: none; width: 140px">
                      <label>跳过大包 (500文件限制)</label>
@@ -492,6 +505,7 @@ const creatingTask = ref(false);
 const pausing = ref(false);
 const cancelling = ref(false);
 const skipCount = ref(0);
+const stopRow = ref(0);
 const skipLargePackage = ref(false);
 const pendingFile = ref<File | null>(null);
 const parseResult = ref<any>(null);
@@ -617,6 +631,9 @@ const selectTask = (id: number) => {
   currentTaskId.value = id;
   const task = tasks.value.find(t => t.id === id);
   skipCount.value = task?.skip_count || 0;
+  stopRow.value = task?.stop_row || 0;
+  intervalMin.value = task?.interval_min || 5;
+  intervalMax.value = task?.interval_max || 10;
   
   if (task?.target_channels) {
       selectedChannels.value = task.target_channels;
@@ -696,9 +713,26 @@ const handleStartTask = async (forceParam?: any) => {
   const isResume = currentTask.value?.status === 'paused';
   const force = forceParam === true;
 
+  // 空值自动补默认值并提示
+  const defaults: string[] = [];
+  if (skipCount.value == null) { skipCount.value = 0; defaults.push('跳过前几条 → 0'); }
+  if (stopRow.value == null) { stopRow.value = 0; defaults.push('第几行停止 → 0'); }
+  if (intervalMin.value == null) { intervalMin.value = 5; defaults.push('转存间隔最小值 → 5'); }
+  if (intervalMax.value == null) { intervalMax.value = 10; defaults.push('转存间隔最大值 → 10'); }
+  if (defaults.length > 0) {
+    message.warning(`空值已重置为默认值：${defaults.join('，')}`);
+  }
+
+  // 校验：stop_row 有值时必须大于 skip_count
+  if (stopRow.value > 0 && stopRow.value <= skipCount.value) {
+    message.error('停止行必须大于跳过条数');
+    return;
+  }
+
   try {
     await axios.post(`/api/excel/tasks/${currentTaskId.value}/start`, {
       skip_count: skipCount.value,
+      stop_row: stopRow.value,
       interval_min: intervalMin.value,
       interval_max: intervalMax.value,
       target_channels: selectedChannels.value,

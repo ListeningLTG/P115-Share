@@ -13,6 +13,7 @@ router = APIRouter(prefix="/excel", tags=["excel"])
 
 class StartTaskRequest(BaseModel):
     skip_count: Optional[int] = 0
+    stop_row: Optional[int] = 0
     interval_min: Optional[int] = 5
     interval_max: Optional[int] = 10
     target_channels: Optional[List[str]] = None
@@ -151,10 +152,11 @@ async def start_task(task_id: int, req: StartTaskRequest, current_user: dict = D
         await p115_service.clear_restriction()
 
     await excel_batch_service.start_task(
-        task_id, 
-        req.skip_count, 
-        req.interval_min, 
-        req.interval_max, 
+        task_id,
+        req.skip_count,
+        req.stop_row,
+        req.interval_min,
+        req.interval_max,
         req.target_channels,
         req.white_list_keywords,
         req.black_list_keywords,
