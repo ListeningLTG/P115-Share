@@ -14,8 +14,9 @@ from app.core.config import settings
 from app.api.config import router as config_router
 from app.api.auth import router as auth_router
 from app.api.excel import router as excel_router
+from app.api.share import router as share_router
+from app.api.accounts import router as accounts_router
 from app.services.tg_bot import tg_service
-from app.services.p115 import p115_service
 from app.version import VERSION
 
 # Setup Loguru to capture standard logging
@@ -101,14 +102,14 @@ async def lifespan(app: FastAPI):
     
     # Init DB and migrate settings
     await settings.init_db()
-    
+
+    # 初始化多账号管理器（包含旧版配置迁移）
+    from app.services.account_manager import account_manager
+    await account_manager.initialize()
+
     # Re-initialize services with loaded settings
-    from app.services.p115 import p115_service
     from app.services.tg_bot import tg_service
-    
-    if settings.P115_COOKIE:
-        p115_service.init_client(settings.P115_COOKIE)
-    
+
     # Start telegram bot
     if settings.TG_BOT_TOKEN:
         if not tg_service.bot:
@@ -152,6 +153,8 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/api")
 app.include_router(config_router, prefix="/api")
 app.include_router(excel_router, prefix="/api")
+app.include_router(share_router, prefix="/api")
+app.include_router(accounts_router, prefix="/api")
 
 # Mount static files separately (highest priority for /static)
 app.mount("/static", StaticFiles(directory="static"), name="static")

@@ -31,7 +31,12 @@ IOS_UA = (
 
 
 class P115Service:
-    def __init__(self):
+    def __init__(self, account=None):
+        """
+        account: P115Account 模型实例（多账号模式）。
+                 为 None 时为兼容旧版单例模式，从 settings 读取配置。
+        """
+        self.account = account  # P115Account ORM 对象，多账号模式下非 None
         self.client = None
         self.fs = None
         self.is_connected = False
@@ -41,20 +46,47 @@ class P115Service:
         # 任务队列和监测机制
         self._task_queue = asyncio.Queue()
         self._worker_task = None
-        self._monitor_task = None
         self._worker_lock = asyncio.Lock()
         self._current_task_info = None # 存储当前正在处理的任务信息
         self._restriction_until: float = 0 # 限制结束的时间戳
-        
+
         # 动态频率限制和任务优先级让步
         self._last_save_times = deque(maxlen=1000)  # 限制最大长度，防止无限增长
         self._last_tg_link_time: float = 0.0 # 最近收到 TG 链接的时间
         self._silent_until: float = 0.0      # 静默期截止时间
         self._batch_yield_count: int = 0     # 批量任务避让次数统计
         self._batch_yield_total_time: float = 0.0  # 批量任务避让累计时间
-        
-        if settings.P115_COOKIE:
+
+        if account is None and settings.P115_COOKIE:
             self.init_client(settings.P115_COOKIE)
+
+    # ── 账号专属配置属性（多账号时读 account，否则读 settings）────────────
+
+    @property
+    def save_dir(self) -> str:
+        if self.account:
+            return self.account.save_dir or "115-Share"
+        return settings.P115_SAVE_DIR or "115-Share"
+
+    @property
+    def recycle_password(self) -> str:
+        if self.account:
+            return self.account.recycle_password or ""
+        return settings.P115_RECYCLE_PASSWORD or ""
+
+    @property
+    def save_file_limit(self) -> int:
+        """单次保存文件上限（默认 500）"""
+        if self.account:
+            return self.account.save_file_limit or 500
+        return 500
+
+    @property
+    def share_file_limit(self) -> int:
+        """分享文件总数上限（默认 10000）"""
+        if self.account:
+            return self.account.share_file_limit or 10000
+        return 10000
 
     @property
     def queue_size(self) -> int:
@@ -72,32 +104,32 @@ class P115Service:
         return time.time() < self._restriction_until
 
     async def set_restriction(self, hours: float = 1.0):
-        """设置全局限制状态"""
+        """设置全局限制状态并持久化到 DB"""
         self._restriction_until = time.time() + (hours * 3600)
         msg = f"🚫 115 服务已进入全局限制模式，预计持续 {hours} 小时 (直到 {time.strftime('%H:%M:%S', time.localtime(self._restriction_until))})。\n系统将自动暂停正在运行的批量任务，并转为后台轮询处理受限链接。"
         logger.warning(msg)
-        
-        # 1. Notify TG - Removed per user request
-        pass
 
-        # 2. Pause Batch Tasks
+        # 持久化风控截止时间到 DB
+        if self.account:
+            asyncio.create_task(self._persist_restriction(self._restriction_until))
+
+        # Pause Batch Tasks
         try:
             from app.services.excel_batch import excel_batch_service
             if excel_batch_service and excel_batch_service.active_task_id:
                 task_id = excel_batch_service.active_task_id
-                import asyncio
                 asyncio.create_task(excel_batch_service.pause_task(task_id))
-                # if tg_service:
-                #     await tg_service.send_admin_msg(f"⏸️ 检测到账号受限，批量转存任务 {task_id} 已自动暂停。")
         except Exception as e:
             logger.error(f"暂停批量任务失败: {e}")
 
     async def clear_restriction(self):
-        """清除全局限制状态"""
+        """清除全局限制状态并持久化到 DB"""
         if self._restriction_until > 0:
             self._restriction_until = 0
             msg = "🔓 115 全局限制模式已解除，队列中的任务将按顺序恢复处理。"
             logger.info(msg)
+            if self.account:
+                asyncio.create_task(self._persist_restriction(0.0))
             try:
                 from app.services.tg_bot import tg_service
                 if tg_service:
@@ -105,39 +137,22 @@ class P115Service:
             except Exception as e:
                 logger.warning(f"发送解除限制通知失败: {e}")
 
-    async def _restriction_monitor(self):
-        """后台监测受限状态，如果长时间无活动则主动探路"""
-        logger.info("🕵️ 115 受限状态监测协程已启动")
-        last_check_time = time.time()
-        while True:
-            try:
-                if self.is_restricted:
-                    now = time.time()
-                    # 如果受限且超过 1 小时未进行任何操作，尝试取队列第一个任务探路
-                    if now - last_check_time > 3600:
-                        logger.info("🔍 受限时长超过 1 小时，尝试主动探路检测状态...")
-                        # 逻辑：查找一个 pending 的链接或者队列中的任务进行尝试
-                        # 这里简化处理：由 tg_bot 的 handle_message 或是下次任务启动自动触发检测
-                        # 或者我们可以从数据库读一个 pending 的任务来试一下
-                        async with async_session() as session:
-                            from app.models.schema import PendingLink
-                            result = await session.execute(
-                                select(PendingLink).where(PendingLink.status == "restricted").limit(1)
-                            )
-                            pending = result.scalar_one_or_none()
-                            if pending:
-                                logger.info(f"🧪 正在使用待处理链接进行探路: {pending.share_url}")
-                                status = await self.get_share_status(pending.share_url)
-                                if status and not status.get("is_prohibited"):
-                                    # 如果状态正常，清除限制并让轮询任务接管
-                                    await self.clear_restriction()
-                        last_check_time = now
-                else:
-                    last_check_time = time.time()
-            except Exception as e:
-                logger.error(f"受限监测协程出错: {e}")
-            
-            await asyncio.sleep(300) # 每 5 分钟检查一次
+    async def _persist_restriction(self, until: float):
+        """将风控截止时间戳写入数据库"""
+        try:
+            from app.core.database import async_session
+            from app.models.schema import P115Account
+            from sqlalchemy import select
+            async with async_session() as session:
+                result = await session.execute(
+                    select(P115Account).where(P115Account.id == self.account.id)
+                )
+                acc = result.scalar_one_or_none()
+                if acc:
+                    acc.restriction_until = until
+                    await session.commit()
+        except Exception as e:
+            logger.warning(f"持久化风控状态失败: {e}")
 
     def _get_ios_ua_kwargs(self):
         """获取 iOS 用户代理相关的参数"""
@@ -264,10 +279,6 @@ class P115Service:
                 if self._worker_task is None or self._worker_task.done():
                     self._worker_task = asyncio.create_task(self._task_worker())
                     logger.info("⚡ 延迟启动 P115 任务队列 Worker")
-                
-                if self._monitor_task is None or self._monitor_task.done():
-                    self._monitor_task = asyncio.create_task(self._restriction_monitor())
-                    logger.info("🕵️ 延迟启动 P115 受限状态监测协程")
 
         future = asyncio.get_running_loop().create_future()
         # 将任务作为元组放入：(task_func, args, kwargs, future, task_type, is_batch)
@@ -378,7 +389,7 @@ class P115Service:
         If a custom path is provided, it will always verify/create it.
         """
         is_default = path is None
-        path = path or settings.P115_SAVE_DIR or "/分享保存"
+        path = path or self.save_dir or "/分享保存"
         
         # Return cached CID if available and using default path
         if is_default and self._save_dir_cid > 0:
@@ -594,7 +605,7 @@ class P115Service:
                 try:
                     # 115 share info often has 'count' or 'file_count'
                     share_count = int(share_info.get("count") or share_info.get("file_count") or 0)
-                    if share_count > 500:
+                    if share_count > self.save_file_limit:
                         logger.info(f"⏭️ 预检发现大包 (项目数: {share_count})，且开启了跳过选项，直接跳过处理: {share_url}")
                         return {
                             "status": "skipped",
@@ -977,7 +988,7 @@ class P115Service:
             for i in range(0, len(fids), 500):
                 # 🚦 检查是否需要中转清理
                 # 条件：已处理超过 10,000 文件，或者容量接近上限 (90%)
-                need_cleanup = files_saved_total >= 10000
+                need_cleanup = files_saved_total >= self.share_file_limit
                 if not need_cleanup and settings.P115_CLEANUP_CAPACITY_ENABLED:
                     stats = await self.get_storage_stats()
                     used = stats.get("used", 0)
@@ -990,7 +1001,7 @@ class P115Service:
                     logger.info("📦 触发中转流程：正在生成当前已保存内容的分享链接...")
                     # 这里的 CID 获取可能不准，因为我们是全量清理，所以直接分享保存目录根节点
                     save_dir_cid = await self._ensure_save_dir()
-                    save_name = settings.P115_SAVE_DIR
+                    save_name = self.save_dir
                     # 获取保存目录的父 CID 和 自己的名字，以便 create_share_link 能找到它
                     # 由于 _ensure_save_dir 只给出了 CID，我们假设它就在根目录下或者我们可以通过其它方式分享
                     # 简化逻辑：直接分享保存目录下的所有东西
@@ -1426,7 +1437,7 @@ class P115Service:
     async def _cleanup_save_directory_internal(self) -> bool:
         """Internal logic to clean up the save directory (no locking)."""
         try:
-            logger.info(f"🧹 开始清理保存目录: {settings.P115_SAVE_DIR}")
+            logger.info(f"🧹 开始清理保存目录: {self.save_dir}")
             cid = await self._ensure_save_dir()
             if not cid:
                 return False
@@ -1577,7 +1588,7 @@ class P115Service:
         limit_bytes = limit_val * (1024**4 if unit == "TB" else 1024**3)
         
         detection_type = getattr(settings, "P115_CLEANUP_CAPACITY_TYPE", "ENTIRE")
-        detection_name = "全网盘" if detection_type == "ENTIRE" else f"保存目录({settings.P115_SAVE_DIR})"
+        detection_name = "全网盘" if detection_type == "ENTIRE" else f"保存目录({self.save_dir})"
         
         if used_bytes < limit_bytes:
             logger.info(f"✅ {detection_name}容量充足: {used_bytes / (1024**3 if unit=='GB' else 1024**4):.2f}/{limit_val:.2f} {unit}")
@@ -1689,8 +1700,8 @@ class P115Service:
         try:
             logger.info("🗑️ 开始清空回收站...")
             payload = {}
-            if settings.P115_RECYCLE_PASSWORD:
-                payload["password"] = settings.P115_RECYCLE_PASSWORD
+            if self.recycle_password:
+                payload["password"] = self.recycle_password
                 logger.debug("使用回收站密码")
             
             resp = await self._api_call_with_timeout(

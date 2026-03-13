@@ -15,17 +15,40 @@
         </a-card>
       </a-col>
       <a-col :xs="24" :sm="12" :md="9">
-        <a-card title="115 网盘" :bordered="false" size="small">
-          <a-tag :color="p115Status ? 'blue' : (p115Cookie ? 'red' : 'default')">
-            {{ p115Status ? '已登录' : (p115Cookie ? '登录失效' : '未登录') }}
-          </a-tag>
+        <a-card title="115 网盘账号" :bordered="false" size="small">
+          <a-space wrap>
+            <template v-for="acc in accounts" :key="acc.id">
+              <a-tag :color="acc.is_restricted ? 'red' : (acc.is_connected ? 'blue' : 'default')">
+                P{{ acc.priority }} {{ acc.name }}: {{ acc.is_restricted ? '风控中' : (acc.is_connected ? '在线' : '离线') }}
+              </a-tag>
+            </template>
+            <a-tag v-if="accounts.length === 0" color="default">未配置</a-tag>
+          </a-space>
         </a-card>
       </a-col>
     </a-row>
-    
+
     <a-divider />
-    
+
     <a-typography-title :level="4">快速操作</a-typography-title>
+
+    <!-- 账号选择器 -->
+    <div style="margin-bottom: 12px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
+      <span style="font-size: 14px; color: #666">操作账号：</span>
+      <a-select
+        v-model:value="selectedAccountId"
+        style="width: 200px"
+        placeholder="选择账号（默认优先级最高）"
+        allow-clear
+      >
+        <a-select-option v-for="acc in accounts" :key="acc.id" :value="acc.id">
+          P{{ acc.priority }} {{ acc.name }}
+          <a-tag v-if="acc.is_restricted" color="red" size="small" style="margin-left: 4px">风控</a-tag>
+        </a-select-option>
+      </a-select>
+      <span style="font-size: 12px; color: #999">清空目录/回收站将针对所选账号执行</span>
+    </div>
+
     <div class="action-buttons">
       <a-space wrap>
         <a-button @click="handleTestBot" type="primary" ghost>测试机器人</a-button>
@@ -44,28 +67,35 @@ import { ref, onMounted } from 'vue';
 import axios from 'axios';
 import { message, Modal } from 'ant-design-vue';
 
+interface Account {
+  id: number;
+  name: string;
+  priority: number;
+  is_connected: boolean;
+  is_restricted: boolean;
+}
+
 const tgStatus = ref(false);
-const p115Status = ref(false);
 const tgToken = ref('');
-const p115Cookie = ref('');
 const version = ref('');
+const accounts = ref<Account[]>([]);
+const selectedAccountId = ref<number | undefined>(undefined);
 
 const checkStatus = async () => {
   try {
-    const res = await axios.get('/api/config/');
-    // Map to real connection status
-    tgStatus.value = !!res.data.tg_bot_connected;
-    p115Status.value = !!res.data.p115_logged_in;
-    tgToken.value = res.data.tg_bot_token || '';
-    p115Cookie.value = res.data.p115_cookie || '';
-    version.value = res.data.version || '';
+    const [configRes, accountsRes] = await Promise.all([
+      axios.get('/api/config/'),
+      axios.get('/api/accounts/'),
+    ]);
+    tgStatus.value = !!configRes.data.tg_bot_connected;
+    tgToken.value = configRes.data.tg_bot_token || '';
+    version.value = configRes.data.version || '';
+    accounts.value = accountsRes.data.accounts || [];
     message.success('状态已刷新');
   } catch (e) {
-    console.error(e);
     message.error('无法连接到后端服务器');
   }
 };
-
 
 const handleTestBot = async () => {
   try {
@@ -98,15 +128,19 @@ const handleTestChannel = async () => {
 };
 
 const handleCleanupSaveDir = () => {
+  const accName = selectedAccountId.value
+    ? (accounts.value.find(a => a.id === selectedAccountId.value)?.name || '所选账号')
+    : '优先级最高的账号';
   Modal.confirm({
     title: '确认清空保存目录？',
-    content: '此操作将删除保存目录中的所有文件和文件夹，是否继续？',
+    content: `将清空 [${accName}] 的保存目录中所有文件，是否继续？`,
     okText: '确认',
     okType: 'danger',
     cancelText: '取消',
     async onOk() {
       try {
-        const res = await axios.post('/api/config/cleanup-save-dir');
+        const params = selectedAccountId.value ? { account_id: selectedAccountId.value } : {};
+        const res = await axios.post('/api/config/cleanup-save-dir', null, { params });
         if (res.data.status === 'success') {
           message.success('保存目录已清空');
         } else {
@@ -120,15 +154,19 @@ const handleCleanupSaveDir = () => {
 };
 
 const handleCleanupRecycleBin = () => {
+  const accName = selectedAccountId.value
+    ? (accounts.value.find(a => a.id === selectedAccountId.value)?.name || '所选账号')
+    : '优先级最高的账号';
   Modal.confirm({
     title: '确认清空回收站？',
-    content: '此操作将清空115网盘回收站中的所有文件，是否继续？',
+    content: `将清空 [${accName}] 的115网盘回收站，是否继续？`,
     okText: '确认',
     okType: 'danger',
     cancelText: '取消',
     async onOk() {
       try {
-        const res = await axios.post('/api/config/cleanup-recycle-bin');
+        const params = selectedAccountId.value ? { account_id: selectedAccountId.value } : {};
+        const res = await axios.post('/api/config/cleanup-recycle-bin', null, { params });
         if (res.data.status === 'success') {
           message.success('回收站已清空');
         } else {

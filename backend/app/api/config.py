@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, field_validator
+from typing import Optional
 from app.core.config import settings
 from app.services.p115 import p115_service
 from app.services.tg_bot import tg_service
@@ -11,7 +12,6 @@ from apscheduler.triggers.cron import CronTrigger
 
 router = APIRouter(prefix="/config", tags=["config"])
 
-from typing import Optional
 
 class ConfigUpdate(BaseModel):
     tg_bot_token: Optional[str] = None
@@ -310,15 +310,27 @@ async def get_telegram_chat_name(req: GetChatNameRequest, user=Depends(get_curre
         return {"status": "error", "message": "无法获取频道信息，请检查 ID 是否正确或机器人是否在频道中"}
 
 @router.post("/cleanup-save-dir")
-async def cleanup_save_dir(user=Depends(get_current_user)):
-    logger.info("🛠 用户手动触发清理保存目录")
-    success = await p115_service.cleanup_save_directory()
+async def cleanup_save_dir(account_id: Optional[int] = None, user=Depends(get_current_user)):
+    """手动清理指定账号的保存目录（未指定时用优先级最高的账号）"""
+    from app.services.account_manager import account_manager
+    svc = account_manager.get_service(account_id) if account_id else account_manager.get_primary_service()
+    if not svc:
+        svc = p115_service  # 兼容旧版单账号
+    name = svc.account.name if svc.account else "默认账号"
+    logger.info(f"🛠 用户手动触发清理保存目录 [{name}]")
+    success = await svc.cleanup_save_directory()
     return {"status": "success" if success else "error", "message": "清理成功" if success else "清理失败"}
 
 @router.post("/cleanup-recycle-bin")
-async def cleanup_recycle_bin(user=Depends(get_current_user)):
-    logger.info("🛠 用户手动触发清空回收站")
-    success = await p115_service.cleanup_recycle_bin()
+async def cleanup_recycle_bin(account_id: Optional[int] = None, user=Depends(get_current_user)):
+    """手动清空指定账号的回收站（未指定时用优先级最高的账号）"""
+    from app.services.account_manager import account_manager
+    svc = account_manager.get_service(account_id) if account_id else account_manager.get_primary_service()
+    if not svc:
+        svc = p115_service  # 兼容旧版单账号
+    name = svc.account.name if svc.account else "默认账号"
+    logger.info(f"🛠 用户手动触发清空回收站 [{name}]")
+    success = await svc.cleanup_recycle_bin()
     return {"status": "success" if success else "error", "message": "清空成功" if success else "清空失败"}
 
 @router.post("/clear-history")

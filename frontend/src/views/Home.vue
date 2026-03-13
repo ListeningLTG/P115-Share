@@ -24,6 +24,14 @@
           <template #icon><FileExcelOutlined /></template>
           <span>批量转存分享</span>
         </a-menu-item>
+        <a-menu-item key="share" @click="currentView = 'share'">
+          <template #icon><ShareAltOutlined /></template>
+          <span>分享链接管理</span>
+        </a-menu-item>
+        <a-menu-item key="accounts" @click="currentView = 'accounts'">
+          <template #icon><CloudServerOutlined /></template>
+          <span>账号管理</span>
+        </a-menu-item>
         <a-menu-item key="settings" @click="currentView = 'settings'">
           <template #icon><SettingOutlined /></template>
           <span>系统配置</span>
@@ -56,6 +64,14 @@
         <a-menu-item key="excel" @click="currentView = 'excel'">
           <template #icon><FileExcelOutlined /></template>
           <span>批量转存分享</span>
+        </a-menu-item>
+        <a-menu-item key="share" @click="currentView = 'share'">
+          <template #icon><ShareAltOutlined /></template>
+          <span>分享链接管理</span>
+        </a-menu-item>
+        <a-menu-item key="accounts" @click="currentView = 'accounts'">
+          <template #icon><CloudServerOutlined /></template>
+          <span>账号管理</span>
         </a-menu-item>
         <a-menu-item key="settings" @click="currentView = 'settings'">
           <template #icon><SettingOutlined /></template>
@@ -124,7 +140,9 @@
         }">
           <Dashboard v-if="currentView === 'dashboard'" />
           <ExcelBatch v-if="currentView === 'excel'" />
+          <ShareManager v-if="currentView === 'share'" />
           <LogViewer v-if="currentView === 'logs'" />
+          <AccountManager v-if="currentView === 'accounts'" />
           <Settings v-if="currentView === 'settings'" />
         </div>
       </a-layout-content>
@@ -165,9 +183,9 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, reactive, onMounted } from 'vue';
-import { 
-  DashboardOutlined, 
-  SettingOutlined, 
+import {
+  DashboardOutlined,
+  SettingOutlined,
   ContainerOutlined,
   MenuOutlined,
   UserOutlined,
@@ -175,13 +193,17 @@ import {
   PlusOutlined,
   LoadingOutlined,
   BulbOutlined,
-  FileExcelOutlined
+  FileExcelOutlined,
+  ShareAltOutlined,
+  CloudServerOutlined
 } from '@ant-design/icons-vue';
 import { Grid, message, theme } from 'ant-design-vue';
 import Dashboard from './Dashboard.vue';
 import ExcelBatch from './ExcelBatch.vue';
+import ShareManager from './ShareManager.vue';
 import LogViewer from './LogViewer.vue';
 import Settings from './Settings.vue';
+import AccountManager from './AccountManager.vue';
 import { useAuthStore } from '../stores/auth';
 import { useThemeStore } from '../stores/theme';
 import { useRouter } from 'vue-router';

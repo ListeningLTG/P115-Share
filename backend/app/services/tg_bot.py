@@ -9,6 +9,17 @@ from loguru import logger
 import asyncio
 import re
 
+def _get_svc():
+    """获取当前最优 P115Service（负载均衡调度），降级到全局单例"""
+    try:
+        from app.services.account_manager import account_manager
+        svc = account_manager.get_primary_service()
+        if svc:
+            return svc, account_manager
+    except Exception:
+        pass
+    return p115_service, None
+
 class TGService:
     def __init__(self):
         self.bot = None
@@ -211,12 +222,18 @@ class TGService:
 
         total_links = len(share_urls)
         logger.info(f"🎯 发现 {total_links} 个 115 链接，开始批量处理...")
-        
+
+        # 通过负载均衡选择本次处理使用的账号（用列表包装，闭包内可重新赋值）
+        _svc_box, _acct_mgr_box = [None], [None]
+        _svc_box[0], _acct_mgr_box[0] = _get_svc()
+        if _acct_mgr_box[0] and _svc_box[0].account:
+            asyncio.create_task(_acct_mgr_box[0].update_last_used(_svc_box[0].account.id))
+
         # 通知 P115 服务有来自 TG 的实时活动，以便批量任务进行让步
-        p115_service.update_tg_activity()
-        
+        _svc_box[0].update_tg_activity()
+
         status_msg = await message.answer(f"⌛️ 正在处理 {total_links} 个链接，请稍候...")
-        
+
         # Prepare metadata entities common logic
         ser_entities = []
         if entities:
@@ -227,12 +244,24 @@ class TGService:
                     ser_entities.append(dict(e))
 
         processed_links = {} # {original_url: share_link}
-        
+
         async def process_single_link(share_url, index, segment_info=None):
+            nonlocal _svc_box, _acct_mgr_box
+            # 每次处理前检查当前 svc 是否被风控，被风控则立即切换账号
+            if _svc_box[0].is_restricted:
+                new_svc, new_acct_mgr = _get_svc()
+                if new_svc is not _svc_box[0]:
+                    logger.info(f"🔄 账号风控，批次内切换账号: [{getattr(_svc_box[0].account, 'id', '?')}] → [{getattr(new_svc.account, 'id', '?')}]")
+                    _svc_box[0] = new_svc
+                    _acct_mgr_box[0] = new_acct_mgr
+                    if new_acct_mgr and new_svc.account:
+                        asyncio.create_task(new_acct_mgr.update_last_used(new_svc.account.id))
+            svc = _svc_box[0]
+            acct_mgr = _acct_mgr_box[0]
             try:
                 # 0. Check history first
-                history_share_link = await p115_service.get_history_link(share_url)
-                
+                history_share_link = await svc.get_history_link(share_url)
+
                 if history_share_link:
                     logger.info(f"✨ [{index}/{total_links}] 发现历史记录: {share_url}")
                     processed_links[share_url] = history_share_link
@@ -241,24 +270,24 @@ class TGService:
                     return True, history_share_link
 
                 # 1. Check restriction & queue status
-                q_size = p115_service.queue_size
-                is_restricted = p115_service.is_restricted
-                
+                q_size = svc.queue_size
+                is_restricted = svc.is_restricted
+
                 # 探测恢复逻辑：如果处于限制中，仅检查链接合法性，但不直接清除全局标志
                 probing = False
                 if is_restricted:
                     logger.info(f"🕵️ 限制期间嗅探探测: {share_url}")
-                    status = await p115_service.get_share_status(share_url)
+                    status = await svc.get_share_status(share_url)
                     if status and not status.get("is_prohibited"):
-                        logger.info("📡 嗅探发现链接有效，由于当前处于受限状态，将该链接作为‘探路探测’执行...")
+                        logger.info("📡 嗅探发现链接有效，由于当前处于受限状态，将该链接作为’探路探测’执行...")
                         probing = True
                     else:
                         await message.reply(f"⏳ 115 账号当前处于接收限制中，系统将在解封后自动处理该链接。")
                         return # 链接无效或确认为持续受限（API不通）
-                
+
                 if not probing:
-                    if q_size > 0 or p115_service.is_busy:
-                        position = q_size + (1 if p115_service.is_busy else 0)
+                    if q_size > 0 or svc.is_busy:
+                        position = q_size + (1 if svc.is_busy else 0)
                         await message.reply(f"⏳ 系统繁忙，您的请求已加入队列（当前排在第 {position} 位），请稍候...")
 
                 # 2. Save link with metadata
@@ -270,18 +299,18 @@ class TGService:
                     "share_url": share_url,
                     "entities": segment_info["entities"] if segment_info else ser_entities
                 }
-                save_res = await p115_service.save_and_share(
-                    share_url, 
+                save_res = await svc.save_and_share(
+                    share_url,
                     metadata=metadata,
                     skip_large_package=True,
                     db_id=None # 初次入库时不带ID
                 )
-                
+
                 if save_res:
                     if save_res.get("status") == "success":
                         share_link = save_res.get("share_link")
                         if share_link:
-                            await p115_service.save_history_link(share_url, share_link)
+                            await svc.save_history_link(share_url, share_link)
                             processed_links[share_url] = share_link
                             
                             # 处理递归保存中间产生的链接
@@ -538,46 +567,49 @@ class TGService:
         share_url = pending_info["share_url"]
         metadata = pending_info.get("metadata", {})
         reason = pending_info.get("reason", "auditing")
-        
+
         # 正在生成快照或受限的链接轮询频率较低
         if reason == "snapshotting":
-            interval = 1800 
+            interval = 1800
         elif reason == "restricted":
             interval = 3600
             if not silent:
                 await message.reply(f"⚠️ 触发 115 账号限制（接收/分享），该链接已进入排队，将每小时尝试一次。或者您可以发来一个新的有效链接，系统将通过该链接嗅探限制是否解除。\n链接: {share_url}")
         else:
             interval = 300
-            
-        max_attempts = 36  
-        
+
+        max_attempts = 36
+
         logger.info(f"⏳ 开始为链接启动轮询任务 (原因: {reason}, 间隔: {interval}s): {share_url}")
-        
+
         for attempt in range(1, max_attempts + 1):
+            # 每次轮询重新选择最优账号
+            svc, acct_mgr = _get_svc()
+
             if reason == "restricted":
                 # 分布休眠以便能实时响应全局限制的消除
                 slept = 0
                 while slept < interval:
-                    if not p115_service.is_restricted:
+                    if not svc.is_restricted:
                         logger.info(f"🔓 检测到全局限制已解除，立即触发队列重试: {share_url}")
                         break
                     await asyncio.sleep(5)
                     slept += 5
             else:
                 await asyncio.sleep(interval)
-            
+
             logger.info(f"🔄 正在进行第 {attempt}/{max_attempts} 次审核状态检查: {share_url}")
-            status_info = await p115_service.get_share_status(share_url)
-            
+            status_info = await svc.get_share_status(share_url)
+
             if status_info is None:
                 logger.warning(f"⚠️ 无法获取检查状态，将在下次重试: {share_url}")
                 continue
-            
+
             if status_info["is_prohibited"]:
                 logger.warning(f"⚠️ 轮询检测到链接包含违规内容标志: {share_url}")
                 # 不再直接终止，允许在后续 is_auditing 为 false 时尝试转存
 
-                                
+
             if status_info["is_expired"]:
                 logger.warning(f"⏰ 轮询检测到链接已过期: {share_url}")
                 await message.reply(f"⏰ 链接已失效：在审核期间该分享已过期。\n链接: {share_url}")
@@ -587,17 +619,19 @@ class TGService:
             if not status_info["is_pending"]:  # Not pending anymore (Audit passed and Snapshot ready)
                 # 如果之前处于受限状态，尝试转存前先清理限制标志（如果还没过时间，但外部可能解除了）
                 if reason == "restricted":
-                    p115_service.clear_restriction()
+                    svc.clear_restriction()
 
                 logger.info(f"🎉 链接可以开始处理 (status: {status_info['share_state']}): {share_url}")
-                save_res = await p115_service.save_and_share(share_url, metadata=metadata, db_id=pending_info.get("db_id"))
+                if acct_mgr and svc.account:
+                    asyncio.create_task(acct_mgr.update_last_used(svc.account.id))
+                save_res = await svc.save_and_share(share_url, metadata=metadata, db_id=pending_info.get("db_id"))
                 
                 if save_res and save_res.get("status") == "success":
                     logger.info(f"✅ 审核通过后转存成功: {share_url}")
                     share_link = save_res.get("share_link")
                     
                     if share_link:
-                        await p115_service.save_history_link(share_url, share_link)
+                        await svc.save_history_link(share_url, share_link)
                         # Broadcast single successful link from poll
                         await self.broadcast_to_channels({share_url: share_link}, metadata)
                         
@@ -982,9 +1016,11 @@ class TGService:
             if tasks:
                 # 统计受限链接并发送汇总消息
                 restricted_tasks = [t for t in tasks if t.status == "restricted"]
-                if restricted_tasks and p115_service.is_restricted:
-                    summary_msg = f"目前 115 云盘账号已被限制接收分享文件，共有 {len(restricted_tasks)} 个链接已进入排队队列，将在检测到解除限制后，开始处理队列中的任务。"
-                    await self.send_admin_msg(summary_msg)
+                if restricted_tasks:
+                    svc, _ = _get_svc()
+                    if svc.is_restricted:
+                        summary_msg = f"目前 115 云盘账号已被限制接收分享文件，共有 {len(restricted_tasks)} 个链接已进入排队队列，将在检测到解除限制后，开始处理队列中的任务。"
+                        await self.send_admin_msg(summary_msg)
                 
                 for task in tasks:
                     pending_info = {

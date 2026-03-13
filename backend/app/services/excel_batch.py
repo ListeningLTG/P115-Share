@@ -11,6 +11,17 @@ from app.services.p115 import p115_service
 from app.services.tg_bot import tg_service
 from app.core.config import settings
 
+def _get_svc():
+    """获取当前最优 P115Service，降级到全局单例"""
+    try:
+        from app.services.account_manager import account_manager
+        svc = account_manager.get_primary_service()
+        if svc:
+            return svc, account_manager
+    except Exception:
+        pass
+    return p115_service, None
+
 class ExcelBatchService:
     def __init__(self):
         self.worker_task = None
@@ -345,23 +356,30 @@ class ExcelBatchService:
                                 continue
 
                         # Process the item
-                        if p115_service.is_restricted:
-                            logger.info(f"⏳ P115 服务当前处于受限状态，批量任务 {task.id} 自动暂停...")
-                            async with async_session() as session:
-                                await session.execute(
-                                    update(ExcelTask).where(ExcelTask.id == task.id).values(status="paused")
-                                )
-                                if item_id:
+                        svc, acct_mgr = _get_svc()
+                        if svc.is_restricted:
+                            # 尝试切换到未被风控的账号
+                            new_svc, new_acct_mgr = _get_svc()
+                            if new_svc is not svc and not new_svc.is_restricted:
+                                logger.info(f"🔄 账号风控，批量任务切换账号: [{getattr(svc.account, 'id', '?')}] → [{getattr(new_svc.account, 'id', '?')}]")
+                                svc, acct_mgr = new_svc, new_acct_mgr
+                            else:
+                                logger.info(f"⏳ P115 服务当前处于受限状态，批量任务 {task.id} 自动暂停...")
+                                async with async_session() as session:
                                     await session.execute(
-                                        update(ExcelTaskItem).where(ExcelTaskItem.id == item_id).values(status="待处理")
+                                        update(ExcelTask).where(ExcelTask.id == task.id).values(status="paused")
                                     )
-                                await session.commit()
-                            
-                            if tg_service:
-                                await tg_service.send_admin_msg(f"⏸️ 检测到账号受限，批量转存任务 '{task.name}' 已自动暂停。")
-                            
-                            self.active_task_id = None
-                            break # 停止当前任务的 worker
+                                    if item_id:
+                                        await session.execute(
+                                            update(ExcelTaskItem).where(ExcelTaskItem.id == item_id).values(status="待处理")
+                                        )
+                                    await session.commit()
+
+                                if tg_service:
+                                    await tg_service.send_admin_msg(f"⏸️ 检测到所有账号受限，批量转存任务 '{task.name}' 已自动暂停。")
+
+                                self.active_task_id = None
+                                break # 停止当前任务的 worker
 
                         task_config = {
                             "target_channels": task.target_channels,
@@ -370,10 +388,17 @@ class ExcelBatchService:
                             "skip_large_package": task.skip_large_package
                         }
 
-                        is_processed = await self._process_item(item_id, task_config)
+                        is_processed = await self._process_item(item_id, task_config, svc=svc, acct_mgr=acct_mgr)
                         
                         if getattr(is_processed, "__eq__", None) and is_processed == "RESTRICTED":
-                            logger.info(f"⏳ 任务 {task.id} 当前项遇到受限，立即暂停后续处理...")
+                            # 尝试切换到未风控账号重试一次
+                            retry_svc, retry_acct_mgr = _get_svc()
+                            if retry_svc is not svc and not retry_svc.is_restricted:
+                                logger.info(f"🔄 处理中途风控，切换账号重试: [{getattr(svc.account, 'id', '?')}] → [{getattr(retry_svc.account, 'id', '?')}]")
+                                is_processed = await self._process_item(item_id, task_config, svc=retry_svc, acct_mgr=retry_acct_mgr)
+
+                        if getattr(is_processed, "__eq__", None) and is_processed == "RESTRICTED":
+                            logger.info(f"⏳ 任务 {task.id} 当前项遇到受限且无可用账号，立即暂停后续处理...")
                             async with async_session() as session:
                                 await session.execute(
                                     update(ExcelTask).where(ExcelTask.id == task.id).values(status="paused")
@@ -416,10 +441,11 @@ class ExcelBatchService:
                 if is_processed:
                     interval = random.randint(interval_min, interval_max)
 
-                    # 先执行容量检查
+                    # 先执行容量检查（使用与当前任务相同的账号）
                     try:
                         start_check = datetime.now()
-                        await p115_service.check_capacity_and_cleanup(mode="batch")
+                        cap_svc, _ = _get_svc()
+                        await cap_svc.check_capacity_and_cleanup(mode="batch")
                         elapsed = (datetime.now() - start_check).total_seconds()
                         logger.debug(f"容量检查完成，耗时 {elapsed:.2f}s")
                     except Exception as ce:
@@ -438,7 +464,10 @@ class ExcelBatchService:
                 logger.error(f"Excel 工作线程出错: {e}")
                 await asyncio.sleep(5)
 
-    async def _process_item(self, item_id: int, task_config: dict = None):
+    async def _process_item(self, item_id: int, task_config: dict = None, svc=None, acct_mgr=None):
+        # 若未从外部传入，则在此处重新选择最优账号
+        if svc is None:
+            svc, acct_mgr = _get_svc()
         async with async_session() as session:
             result = await session.execute(
                 select(ExcelTaskItem).where(ExcelTaskItem.id == item_id)
@@ -513,7 +542,7 @@ class ExcelBatchService:
                 return True
 
             # 1. Check history first
-            history_url = await p115_service.get_history_link(original_url)
+            history_url = await svc.get_history_link(original_url)
             if history_url:
                 item.status = "成功"
                 item.error_msg = None
@@ -545,10 +574,9 @@ class ExcelBatchService:
                 if item.extraction_code and "?password=" not in url_to_save:
                     url_to_save = f"{url_to_save}?password={item.extraction_code}"
 
-                save_res = await p115_service.save_and_share(
-                    url_to_save, 
+                save_res = await svc.save_and_share(
+                    url_to_save,
                     metadata=metadata,
-                    target_dir=settings.P115_SAVE_DIR,
                     skip_large_package=True,
                     is_batch=True
                 )
@@ -565,8 +593,10 @@ class ExcelBatchService:
                             import json
                             # 如果只有一个链接存字符串，多个存 JSON
                             link_to_store = json.dumps(all_links) if len(all_links) > 1 else all_links[0]
-                            
-                            await p115_service.save_history_link(original_url, all_links)
+
+                            await svc.save_history_link(original_url, all_links)
+                            if acct_mgr and svc.account:
+                                asyncio.create_task(acct_mgr.update_last_used(svc.account.id))
                             item.new_share_url = link_to_store
                             item.status = "成功"
                             item.error_msg = None

@@ -76,97 +76,6 @@
           <a-button type="primary" @click="onFinish('tg')" :loading="loading" block>保存 Telegram 配置</a-button>
         </a-collapse-panel>
 
-        <a-collapse-panel key="p115" header="115 网盘配置">
-          <a-form-item label="Cookie" name="p115_cookie">
-            <a-textarea v-model:value="formState.p115_cookie" :rows="4" placeholder="请输入 115 Cookie" />
-          </a-form-item>
-          <a-form-item label="保存路径" name="p115_save_dir">
-            <a-input v-model:value="formState.p115_save_dir" placeholder="例如 /分享保存" />
-          </a-form-item>
-          <a-form-item label="清理保存目录 (Cron)" name="p115_cleanup_dir_cron">
-            <a-input v-model:value="formState.p115_cleanup_dir_cron" placeholder="例如 */30 * * * *" />
-            <div style="font-size: 12px; color: #999; margin-top: 4px">为空则不进行定时清理</div>
-          </a-form-item>
-          <a-form-item label="清空回收站 (Cron)" name="p115_cleanup_trash_cron">
-            <a-input v-model:value="formState.p115_cleanup_trash_cron" placeholder="例如 0 */2 * * *" />
-            <div style="font-size: 12px; color: #999; margin-top: 4px">为空则不进行定时清空</div>
-          </a-form-item>
-          <a-form-item label="回收站密码" name="p115_recycle_password">
-            <a-input-password v-model:value="formState.p115_recycle_password" placeholder="留空则无密码" />
-          </a-form-item>
-
-          <a-divider />
-          
-          <a-form-item label="容量自动清理">
-            <template #extra>
-              <div style="font-size: 12px; color: #999; margin-top: 4px">启用后，每半小时检测一次网盘容量，超过限制将自动清理保存目录</div>
-            </template>
-            <a-switch v-model:checked="formState.p115_cleanup_capacity_enabled" />
-          </a-form-item>
-
-          <div v-if="formState.p115_cleanup_capacity_enabled">
-            <a-form-item label="容量检测方式">
-              <a-radio-group v-model:value="formState.p115_cleanup_capacity_type">
-                <a-radio value="ENTIRE">全网盘容量</a-radio>
-                <a-radio value="DIRECTORY">保存目录容量</a-radio>
-              </a-radio-group>
-            </a-form-item>
-
-            <a-form-item :label="formState.p115_cleanup_capacity_type === 'ENTIRE' ? '网盘已用空间上限' : '目录占用空间上限'" name="p115_cleanup_capacity_limit">
-              <a-row :gutter="8">
-                <a-col :span="20">
-                  <a-input-number 
-                    v-model:value="formState.p115_cleanup_capacity_limit" 
-                    :min="0.1" 
-                    :precision="2"
-                    style="width: 100%" 
-                    placeholder="请输入容量值"
-                  >
-                    <template #addonAfter>{{ formState.p115_cleanup_capacity_unit }}</template>
-                  </a-input-number>
-                </a-col>
-              </a-row>
-              <div style="font-size: 12px; color: #999; margin-top: 4px">
-                {{ formState.p115_cleanup_capacity_type === 'ENTIRE' ? '当网盘已用空间超过此值时触发清理' : '当保存目录占用空间超过此值时触发清理' }}
-              </div>
-            </a-form-item>
-          </div>
-
-          <a-divider orientation="left">转存频率控制</a-divider>
-          <a-row :gutter="16">
-            <a-col :span="12">
-              <a-form-item label="限制转存次数" name="p115_rate_limit_count">
-                <a-input-number v-model:value="formState.p115_rate_limit_count" :min="0" style="width: 100%" />
-                <div style="font-size: 12px; color: #999; margin-top: 4px">窗口期内允许的最大转存次数 (0 为不限制)</div>
-              </a-form-item>
-            </a-col>
-            <a-col :span="12">
-              <a-form-item label="窗口大小 (秒)" name="p115_rate_limit_window">
-                <a-input-number v-model:value="formState.p115_rate_limit_window" :min="1" style="width: 100%" />
-                <div style="font-size: 12px; color: #999; margin-top: 4px">计算转存次数的时间范围</div>
-              </a-form-item>
-            </a-col>
-          </a-row>
-
-          <a-row :gutter="16">
-            <a-col :span="12">
-              <a-form-item label="静默时长 (秒)" name="p115_rate_limit_silent_duration">
-                <a-input-number v-model:value="formState.p115_rate_limit_silent_duration" :min="0" style="width: 100%" />
-                <div style="font-size: 12px; color: #999; margin-top: 4px">触发限制后暂停转存的时长</div>
-              </a-form-item>
-            </a-col>
-            <a-col :span="12">
-              <a-form-item label="批量避让时长 (秒)" name="p115_batch_yield_duration">
-                <a-input-number v-model:value="formState.p115_batch_yield_duration" :min="0" style="width: 100%" />
-                <div style="font-size: 12px; color: #999; margin-top: 4px">TG 收到新任务后，批量任务暂停的时长</div>
-              </a-form-item>
-            </a-col>
-          </a-row>
-          
-          <a-divider />
-          <a-button type="primary" @click="onFinish('p115')" :loading="loading" block>保存 115 配置</a-button>
-        </a-collapse-panel>
-
         <a-collapse-panel key="proxy" header="代理配置">
           <a-form-item label="启用代理" style="margin-bottom: 16px">
             <a-switch v-model:checked="formState.proxy_enabled" />
@@ -257,25 +166,12 @@ const formState = reactive({
   tg_user_id: '',
   tg_allow_chats: '',
   tg_skip_large_package: false,
-  p115_cookie: '',
-  p115_save_dir: '',
-  p115_cleanup_dir_cron: '',
-  p115_cleanup_trash_cron: '',
-  p115_recycle_password: '',
   proxy_enabled: false,
   proxy_host: '',
   proxy_port: '',
   proxy_user: '',
   proxy_pass: '',
   proxy_type: 'HTTP',
-  p115_cleanup_capacity_enabled: false,
-  p115_cleanup_capacity_limit: 0,
-  p115_cleanup_capacity_unit: 'GB',
-  p115_cleanup_capacity_type: 'ENTIRE',
-  p115_rate_limit_count: 30,
-  p115_rate_limit_window: 300,
-  p115_rate_limit_silent_duration: 60,
-  p115_batch_yield_duration: 10
 });
 
 const addChannel = () => {
@@ -284,15 +180,6 @@ const addChannel = () => {
 
 const removeChannel = (index: number) => {
   tgChannels.value.splice(index, 1);
-};
-
-const validateCron = (_rule: any, value: string) => {
-  if (!value) return Promise.resolve();
-  const cronRegex = /^(\*|[0-5]?\d)(?:\/[0-5]?\d)?\s+(\*|[01]?\d|2[0-3])(?:\/[01]?\d|2[0-3])?\s+(\*|0?[1-9]|[12]\d|3[01])(?:\/0?[1-9]|[12]\d|3[01])?\s+(\*|0?[1-9]|1[0-2])(?:\/0?[1-9]|1[0-2])?\s+(\*|[0-6])(?:\/[0-6])?$/;
-  if (cronRegex.test(value)) {
-    return Promise.resolve();
-  }
-  return Promise.reject('请输入有效的 Cron 表达式 (例如 */30 * * * *)');
 };
 
 const validateProxyHost = (_rule: any, value: string) => {
@@ -313,14 +200,6 @@ const rules = computed(() => ({
   tg_bot_token: [{ required: true, message: '请输入 Bot Token', trigger: 'blur' }],
   tg_user_id: [{ required: true, message: '请输入 User ID', trigger: 'blur' }],
   tg_allow_chats: [{ required: true, message: '请输入 Chat ID 白名单', trigger: 'blur' }],
-  p115_cookie: [{ required: true, message: '请输入 Cookie', trigger: 'blur' }],
-  p115_save_dir: [{ required: true, message: '请输入保存路径', trigger: 'blur' }],
-  p115_cleanup_dir_cron: [{ validator: validateCron, trigger: 'blur' }],
-  p115_cleanup_trash_cron: [{ validator: validateCron, trigger: 'blur' }],
-  p115_cleanup_capacity_limit: [
-    { required: true, message: '请输入清理容量', trigger: 'blur' },
-    { type: 'number', min: 0.1, message: '容量限制最小值不能为 0', trigger: 'blur' }
-  ],
   proxy_host: [{ validator: validateProxyHost, trigger: 'change' }],
   proxy_port: [{ validator: validateProxyPort, trigger: 'change' }]
 }));
@@ -353,40 +232,21 @@ const loadConfig = async () => {
       tgChannels.value = [{ id: res.data.tg_channel_id, enabled: true, concise: false, auto_forward: true }];
     }
     
-    formState.p115_cookie = res.data.p115_cookie || '';
-    formState.p115_save_dir = res.data.p115_save_dir || '';
-    formState.p115_cleanup_dir_cron = res.data.p115_cleanup_dir_cron || '';
-    formState.p115_cleanup_trash_cron = res.data.p115_cleanup_trash_cron || '';
-    formState.p115_recycle_password = res.data.p115_recycle_password || '';
     formState.proxy_enabled = res.data.proxy_enabled || false;
     formState.proxy_host = res.data.proxy_host || '';
     formState.proxy_port = res.data.proxy_port || '';
     formState.proxy_user = res.data.proxy_user || '';
     formState.proxy_pass = res.data.proxy_pass || '';
     formState.proxy_type = res.data.proxy_type || 'HTTP';
-    formState.p115_cleanup_capacity_enabled = res.data.p115_cleanup_capacity_enabled || false;
-    formState.p115_cleanup_capacity_limit = res.data.p115_cleanup_capacity_limit || 0;
-    formState.p115_cleanup_capacity_unit = res.data.p115_cleanup_capacity_unit || 'GB';
-    formState.p115_cleanup_capacity_type = res.data.p115_cleanup_capacity_type || 'ENTIRE';
-    formState.p115_rate_limit_count = res.data.p115_rate_limit_count !== undefined ? res.data.p115_rate_limit_count : 30;
-    formState.p115_rate_limit_window = res.data.p115_rate_limit_window || 300;
-    formState.p115_rate_limit_silent_duration = res.data.p115_rate_limit_silent_duration !== undefined ? res.data.p115_rate_limit_silent_duration : 60;
-    formState.p115_batch_yield_duration = res.data.p115_batch_yield_duration !== undefined ? res.data.p115_batch_yield_duration : 10;
   } catch (e) {
     console.error(e);
   }
 };
 
-const onFinish = async (section: 'tg' | 'p115' | 'proxy' = 'tg') => {
+const onFinish = async (section: 'tg' | 'proxy' = 'tg') => {
   try {
     const sectionFields: Record<string, string[]> = {
       tg: ['tg_bot_token', 'tg_user_id', 'tg_allow_chats', 'tg_skip_large_package'],
-      p115: [
-        'p115_cookie', 'p115_save_dir', 'p115_cleanup_dir_cron', 
-        'p115_cleanup_trash_cron', 'p115_recycle_password',
-        'p115_cleanup_capacity_enabled', 'p115_cleanup_capacity_limit', 'p115_cleanup_capacity_unit', 'p115_cleanup_capacity_type',
-        'p115_rate_limit_count', 'p115_rate_limit_window', 'p115_rate_limit_silent_duration', 'p115_batch_yield_duration'
-      ],
       proxy: ['proxy_enabled', 'proxy_host', 'proxy_port', 'proxy_user', 'proxy_pass', 'proxy_type']
     };
 
@@ -416,7 +276,7 @@ const onFinish = async (section: 'tg' | 'p115' | 'proxy' = 'tg') => {
     }
 
     const res = await axios.post('/api/config/update', payload);
-    message.success(section === 'tg' ? 'Telegram 配置已保存' : section === 'p115' ? '115 网盘配置已保存' : '代理配置已保存');
+    message.success(section === 'tg' ? 'Telegram 配置已保存' : '代理配置已保存');
     if (res.data.bot_restarted) {
       message.info('机器人已根据新配置安全重启');
     }
