@@ -18,3 +18,4 @@ pysocks
 pandas
 openpyxl
 xlrd
+p115client==0.0.8.3.3

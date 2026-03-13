@@ -15,8 +15,7 @@ RUN mkdir -p /app/data
 
 # Install dependencies
 COPY backend/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir p115client
+RUN pip install --no-cache-dir -r requirements.txt
 
 
 # Copy backend code
