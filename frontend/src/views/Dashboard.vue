@@ -92,7 +92,7 @@ const checkStatus = async () => {
     version.value = configRes.data.version || '';
     accounts.value = accountsRes.data.accounts || [];
     if (accounts.value.length > 0 && selectedAccountId.value === undefined) {
-      selectedAccountId.value = accounts.value[0].id;
+      selectedAccountId.value = accounts.value[0]!.id;
     }
     message.success('状态已刷新');
   } catch (e) {

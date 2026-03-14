@@ -198,8 +198,7 @@ import {
   BulbOutlined,
   FileExcelOutlined,
   ShareAltOutlined,
-  CloudServerOutlined,
-  WarningOutlined
+  CloudServerOutlined
 } from '@ant-design/icons-vue';
 import { Grid, message, theme } from 'ant-design-vue';
 import Dashboard from './Dashboard.vue';
