@@ -173,9 +173,12 @@ class AccountManager:
             # 只用优先级最高（数字最小）的可用账号
             for svc in sorted(self._services.values(), key=lambda s: s.account.priority):
                 if not svc.is_restricted and svc.is_connected:
+                    logger.info(f"👤 使用账号 [{svc.account.id}] {svc.account.name}")
                     return svc
             # 如果没有可用的，返回优先级最高的
-            return min(self._services.values(), key=lambda s: s.account.priority)
+            svc = min(self._services.values(), key=lambda s: s.account.priority)
+            logger.info(f"👤 使用账号 [{svc.account.id}] {svc.account.name}（无可用账号，降级使用）")
+            return svc
 
         # 负载均衡：选择最空闲的账号
         available = [
@@ -186,12 +189,16 @@ class AccountManager:
             # 降级：返回优先级最高的
             enabled = [s for s in self._services.values() if s.account.enabled]
             if enabled:
-                return min(enabled, key=lambda s: s.account.priority)
+                svc = min(enabled, key=lambda s: s.account.priority)
+                logger.info(f"👤 ⚖️ 负载均衡使用账号 [{svc.account.id}] {svc.account.name}（无可用账号，降级使用）")
+                return svc
             return None
 
         # 排序：队列大小升序 → 优先级升序（数字越小越优先）→ 最后使用时间升序
         available.sort(key=lambda s: (s.queue_size, s.account.priority, s.account.last_used_at or 0.0))
-        return available[0]
+        svc = available[0]
+        logger.info(f"👤 ⚖️ 负载均衡使用账号 [{svc.account.id}] {svc.account.name}（队列: {svc.queue_size}）")
+        return svc
 
     def get_all_services(self) -> List[object]:
         """返回所有账号的 P115Service 列表（按优先级排序）"""
