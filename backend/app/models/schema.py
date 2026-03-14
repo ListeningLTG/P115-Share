@@ -121,7 +121,7 @@ class ShareAnalysisState(Base):
 
 class ExcelTaskItem(Base):
     __tablename__ = "excel_task_items"
-    
+
     id: Mapped[int] = mapped_column(primary_key=True)
     task_id: Mapped[int] = mapped_column(Integer, index=True)
     row_index: Mapped[int] = mapped_column(Integer)
@@ -133,3 +133,37 @@ class ExcelTaskItem(Base):
     error_msg: Mapped[str] = mapped_column(Text, nullable=True)
     item_metadata: Mapped[dict] = mapped_column(JSON, nullable=True)  # Store original message text and entities
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class TMDBConfig(Base):
+    """TMDB API 配置表"""
+    __tablename__ = "tmdb_config"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    api_key: Mapped[str] = mapped_column(Text, default="")
+    country: Mapped[str] = mapped_column(String(10), default="US")
+    certifications: Mapped[dict] = mapped_column(JSON, default=list)  # ["R", "NC-17"]
+    keywords: Mapped[str] = mapped_column(Text, default="")  # 关键词过滤，逗号分隔
+    use_keyword_filter: Mapped[bool] = mapped_column(Boolean, default=False)  # 是否启用关键词过滤
+    last_sync_at: Mapped[str] = mapped_column(String(30), nullable=True)  # 上次全量爬取完成时间
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SensitiveMovie(Base):
+    """敏感电影信息表"""
+    __tablename__ = "sensitive_movies"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tmdb_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(255))
+    original_title: Mapped[str] = mapped_column(String(255), nullable=True)
+    chinese_title: Mapped[str] = mapped_column(String(255), nullable=True)  # 中文译名
+    alternative_titles: Mapped[dict] = mapped_column(JSON, default=list)  # 别名列表
+    release_date: Mapped[str] = mapped_column(String(20), nullable=True)
+    certification: Mapped[str] = mapped_column(String(20), nullable=True)
+    country: Mapped[str] = mapped_column(String(10), default="US")
+    overview: Mapped[str] = mapped_column(Text, nullable=True)
+    poster_path: Mapped[str] = mapped_column(String(255), nullable=True)
+    keywords: Mapped[dict] = mapped_column(JSON, default=list)  # 电影关键词列表
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

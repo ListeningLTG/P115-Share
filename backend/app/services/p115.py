@@ -761,7 +761,9 @@ class P115Service:
                 "file_id": ",".join(fids),
                 "cid": to_cid
             }
-            
+
+            # 保存前快照目录，用于保存后 diff 找到新增的文件/文件夹（避免同名重命名问题）
+            before_ids = await self._snapshot_dir_ids(to_cid)
             try:
                 recv_resp = await self._api_call_with_timeout(
                     self.client.share_receive_app, receive_payload, async_=True,
@@ -797,10 +799,11 @@ class P115Service:
             
             await self.clear_restriction()
             return {
-                "status": "success", 
-                "to_cid": to_cid, 
+                "status": "success",
+                "to_cid": to_cid,
                 "names": names,
                 "share_url": share_url,
+                "before_ids": before_ids if 'before_ids' in locals() else set(),
                 "recursive_links": recursive_links if 'recursive_links' in locals() else [],
                 "metadata": metadata or {},
                 "have_vio": have_vio_file == 1
@@ -1147,20 +1150,45 @@ class P115Service:
             logger.error(f"❌ 检查链接状态失败: {share_url}, 错误: {e}")
             return None
 
-    async def _find_files_in_dir(self, cid: int, target_names: list) -> list:
+    async def _snapshot_dir_ids(self, cid: int) -> set:
+        """快照目录中所有顶层文件/文件夹的 ID，用于保存前后 diff 找新增项"""
+        ids = set()
+        try:
+            resp = await self._api_call_with_timeout(
+                self.client.fs_files_app2,
+                {"cid": cid, "limit": 1000, "show_dir": 1},
+                async_=True,
+                timeout=30, max_retries=2, label="fs_files_snapshot",
+                **self._get_ios_ua_kwargs()
+            )
+            check_response(resp)
+            file_list = resp.get("data", [])
+            if isinstance(file_list, dict):
+                file_list = file_list.get("list", [])
+            for item in file_list:
+                item_id = item.get("fid") or item.get("cid") or item.get("file_id") or item.get("category_id") or item.get("id")
+                if item_id:
+                    ids.add(str(item_id))
+        except Exception as e:
+            logger.warning(f"⚠️ 快照目录 {cid} 失败: {e}")
+        return ids
+
+    async def _find_files_in_dir(self, cid: int, target_names: list, save_start_time: int = 0) -> list:
         """在指定目录中查找文件，使用多种方式确保找到
-        
+
         优先使用 fs_search（按文件名搜索），失败后回退到 fs_files（列目录）。
-        
+        当存在同名文件时，优先选取创建时间 >= save_start_time 的文件（即本次保存的）。
+
         Args:
             cid: 目录 ID
             target_names: 要查找的文件名列表
-            
+            save_start_time: 本次保存操作开始的时间戳（Unix 秒），用于区分同名文件
+
         Returns:
             匹配的文件列表 [{fid, name, size, time}, ...]
         """
         matched = []
-        
+
         # 方式 1: 使用 fs_search 按文件名搜索（更可靠，不依赖目录缓存）
         for name in target_names:
             try:
@@ -1173,28 +1201,35 @@ class P115Service:
                 )
                 check_response(search_resp)
                 search_data = search_resp.get("data", [])
-                
+
                 # fs_search 的结果可能在 data 数组或 data.list 中
                 if isinstance(search_data, dict):
                     search_items = search_data.get("list", [])
                 else:
                     search_items = search_data
-                
+
                 logger.debug(f"🔍 fs_search '{name}' 在 CID:{cid} 返回 {len(search_items)} 条结果")
-                
+
+                # 收集所有同名候选项，再按时间戳优先选最新的
+                candidates = []
                 for item in search_items:
                     item_name = item.get("n") or item.get("fn") or item.get("name") or item.get("file_name") or item.get("title") or item.get("category_name")
                     if item_name == name:
                         item_id = item.get("fid") or item.get("cid") or item.get("file_id") or item.get("category_id")
                         if item_id:
-                            matched.append({
+                            candidates.append({
                                 "fid": str(item_id),
                                 "name": item_name,
                                 "size": item.get("s", item.get("file_size", 0)),
                                 "time": item.get("te", 0),
                             })
-                            logger.info(f"📄 fs_search 找到: {item_name} (ID: {item_id})")
-                            break
+
+                if candidates:
+                    # 优先选 save_start_time 之后创建的文件；若无则取最新的
+                    new_candidates = [c for c in candidates if c["time"] >= save_start_time] if save_start_time else []
+                    best = max(new_candidates, key=lambda x: x["time"]) if new_candidates else max(candidates, key=lambda x: x["time"])
+                    matched.append(best)
+                    logger.info(f"📄 fs_search 找到: {best['name']} (ID: {best['fid']}, time: {best['time']})")
             except Exception as e:
                 logger.warning(f"⚠️ fs_search 搜索 '{name}' 失败: {e}")
         
@@ -1245,13 +1280,17 @@ class P115Service:
                 if item_name in remaining_names:
                     item_id = item.get("fid") or item.get("cid") or item.get("file_id") or item.get("category_id") or item.get("id")
                     if item_id:
-                        matched.append({
-                            "fid": str(item_id),
-                            "name": item_name,
-                            "size": item.get("s", 0),
-                            "time": item.get("te", 0),
-                        })
-                        logger.info(f"📄 fs_files 找到: {item_name} (ID: {item_id})")
+                        item_time = item.get("te", 0)
+                        # 若已有同名结果，优先保留时间更新的（本次保存的）
+                        existing = next((m for m in matched if m["name"] == item_name), None)
+                        if existing:
+                            if item_time > existing["time"]:
+                                matched.remove(existing)
+                                matched.append({"fid": str(item_id), "name": item_name, "size": item.get("s", 0), "time": item_time})
+                                logger.info(f"📄 fs_files 更新为更新的同名文件: {item_name} (ID: {item_id})")
+                        else:
+                            matched.append({"fid": str(item_id), "name": item_name, "size": item.get("s", 0), "time": item_time})
+                            logger.info(f"📄 fs_files 找到: {item_name} (ID: {item_id})")
                         
         except Exception as e:
             logger.warning(f"⚠️ fs_files 列目录失败: {e}")
@@ -1261,66 +1300,59 @@ class P115Service:
     async def create_share_link(self, save_result: dict):
         if not self.client or not save_result:
             return None
-            
+
         to_cid = save_result.get("to_cid")
         names = save_result.get("names", [])
-        
+        before_ids: set = save_result.get("before_ids", set())
+
         try:
             # 5. Wait for a short time to allow 115 to start processing
             logger.info(f"⏳ 等待 2 秒以确保文件保存开始...")
             await asyncio.sleep(2)
-            
-            # 6. Find files with polling (using search + list as fallback)
+
+            # 6. 通过 diff 找到本次新增的文件/文件夹 ID（不依赖文件名，避免同名重命名问题）
             new_fids = []
-            matched_files = []
-            
-            max_poll_attempts = 10  # 增加尝试次数，但由于间隔缩短，总时间其实减少了
+            prev_new_ids: set = set()
+
+            max_poll_attempts = 10
             for poll_attempt in range(1, max_poll_attempts + 1):
                 try:
-                    logger.info(f"🔍 正在查找文件 (第 {poll_attempt}/{max_poll_attempts} 次), 目标目录 CID: {to_cid}")
-                    current_matched = await self._find_files_in_dir(to_cid, names)
-                    
-                    if current_matched:
-                        # 优化：如果找到的所有文件名和预期一致且数量相等，立即认为完成
-                        if len(current_matched) == len(names):
-                            logger.info(f"✅ 文件已全部到达，共 {len(current_matched)} 个，立即继续")
-                            new_fids = [f["fid"] for f in current_matched]
-                            break
-                        
-                        # 如果还没凑齐，再对比下状态是否稳定（旧逻辑作为保底）
-                        if matched_files:
-                            stable = len(current_matched) == len(matched_files)
-                            if stable:
-                                for curr, prev in zip(sorted(current_matched, key=lambda x: x["fid"]), 
-                                                     sorted(matched_files, key=lambda x: x["fid"])):
-                                    if curr["fid"] != prev["fid"] or curr["size"] != prev["size"]:
-                                        stable = False
-                                        break
-                            
-                            if stable:
-                                logger.info(f"✅ 文件状态已稳定，检测到 {len(current_matched)} 个文件")
-                                new_fids = [f["fid"] for f in current_matched]
-                                break
-                            else:
-                                logger.debug(f"🔄 文件状态变化中 (第 {poll_attempt}/{max_poll_attempts} 次轮询)")
-                        
-                        matched_files = current_matched
-                        
-                        if poll_attempt < max_poll_attempts:
-                            await asyncio.sleep(2)
+                    logger.info(f"🔍 正在查找新增文件 (第 {poll_attempt}/{max_poll_attempts} 次), 目标目录 CID: {to_cid}")
+                    after_ids = await self._snapshot_dir_ids(to_cid)
+                    current_new_ids = after_ids - before_ids
+
+                    if len(current_new_ids) >= len(names):
+                        logger.info(f"✅ 检测到 {len(current_new_ids)} 个新增项，立即继续")
+                        new_fids = list(current_new_ids)
+                        break
+
+                    # 数量不够但稳定了（连续两次相同），也继续
+                    if current_new_ids and current_new_ids == prev_new_ids:
+                        logger.info(f"✅ 新增项已稳定，共 {len(current_new_ids)} 个（预期 {len(names)} 个）")
+                        new_fids = list(current_new_ids)
+                        break
+
+                    if current_new_ids:
+                        logger.debug(f"🔄 已找到 {len(current_new_ids)}/{len(names)} 个新增项，继续等待...")
                     else:
-                        logger.warning(f"⚠️ 轮询未找到文件 (第 {poll_attempt}/{max_poll_attempts} 次)")
-                        if poll_attempt < max_poll_attempts:
-                            await asyncio.sleep(2)
-                            
+                        logger.warning(f"⚠️ 暂未检测到新增文件 (第 {poll_attempt}/{max_poll_attempts} 次)")
+
+                    prev_new_ids = current_new_ids
+                    if poll_attempt < max_poll_attempts:
+                        await asyncio.sleep(2)
+
                 except Exception as e:
                     logger.warning(f"⚠️ 查找文件失败 (轮询 {poll_attempt}/{max_poll_attempts}): {e}")
                     if poll_attempt < max_poll_attempts:
                         await asyncio.sleep(5)
-            
-            # If polling didn't find stable files, use the last matched files
-            if not new_fids and matched_files:
-                logger.info(f"⚠️ 文件未完全稳定，但使用 {len(matched_files)} 个已匹配的文件尝试创建分享")
+
+            # 如果 diff 没找到（before_ids 为空或快照失败），回退到按名字查找
+            if not new_fids:
+                if before_ids:
+                    logger.warning(f"⚠️ diff 未找到新增项，回退到按名字查找: {names}")
+                else:
+                    logger.info(f"🔍 无快照数据，使用按名字查找: {names}")
+                matched_files = await self._find_files_in_dir(to_cid, names)
                 new_fids = [f["fid"] for f in matched_files]
             
             if not new_fids:

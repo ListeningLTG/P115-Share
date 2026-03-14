@@ -16,6 +16,7 @@ from app.api.auth import router as auth_router
 from app.api.excel import router as excel_router
 from app.api.share import router as share_router
 from app.api.accounts import router as accounts_router
+from app.api.sensitive import router as sensitive_router
 from app.services.tg_bot import tg_service
 from app.version import VERSION
 
@@ -155,6 +156,7 @@ app.include_router(config_router, prefix="/api")
 app.include_router(excel_router, prefix="/api")
 app.include_router(share_router, prefix="/api")
 app.include_router(accounts_router, prefix="/api")
+app.include_router(sensitive_router, prefix="/api")
 
 # Mount static files separately (highest priority for /static)
 app.mount("/static", StaticFiles(directory="static"), name="static")

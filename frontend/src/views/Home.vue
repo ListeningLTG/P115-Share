@@ -32,6 +32,7 @@
           <template #icon><CloudServerOutlined /></template>
           <span>账号管理</span>
         </a-menu-item>
+        <!-- 敏感词库功能开发中，暂时隐藏 -->
         <a-menu-item key="settings" @click="currentView = 'settings'">
           <template #icon><SettingOutlined /></template>
           <span>系统配置</span>
@@ -73,6 +74,7 @@
           <template #icon><CloudServerOutlined /></template>
           <span>账号管理</span>
         </a-menu-item>
+        <!-- 敏感词库功能开发中，暂时隐藏 -->
         <a-menu-item key="settings" @click="currentView = 'settings'">
           <template #icon><SettingOutlined /></template>
           <span>系统配置</span>
@@ -143,6 +145,7 @@
           <ShareManager v-if="currentView === 'share'" />
           <LogViewer v-if="currentView === 'logs'" />
           <AccountManager v-if="currentView === 'accounts'" />
+          <Sensitive v-if="currentView === 'sensitive'" />
           <Settings v-if="currentView === 'settings'" />
         </div>
       </a-layout-content>
@@ -195,7 +198,8 @@ import {
   BulbOutlined,
   FileExcelOutlined,
   ShareAltOutlined,
-  CloudServerOutlined
+  CloudServerOutlined,
+  WarningOutlined
 } from '@ant-design/icons-vue';
 import { Grid, message, theme } from 'ant-design-vue';
 import Dashboard from './Dashboard.vue';
@@ -204,6 +208,7 @@ import ShareManager from './ShareManager.vue';
 import LogViewer from './LogViewer.vue';
 import Settings from './Settings.vue';
 import AccountManager from './AccountManager.vue';
+import Sensitive from './Sensitive.vue';
 import { useAuthStore } from '../stores/auth';
 import { useThemeStore } from '../stores/theme';
 import { useRouter } from 'vue-router';
