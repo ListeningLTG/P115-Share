@@ -583,20 +583,31 @@ class TGService:
         logger.info(f"⏳ 开始为链接启动轮询任务 (原因: {reason}, 间隔: {interval}s): {share_url}")
 
         for attempt in range(1, max_attempts + 1):
+            # 动态计算本次循环的等待时间 (针对审核中链接增加 1min, 2min 前置尝试)
+            if reason == "auditing":
+                if attempt == 1:
+                    current_interval = 60
+                elif attempt == 2:
+                    current_interval = 120
+                else:
+                    current_interval = 300
+            else:
+                current_interval = interval
+
             # 每次轮询重新选择最优账号
             svc, acct_mgr = _get_svc()
 
             if reason == "restricted":
                 # 分布休眠以便能实时响应全局限制的消除
                 slept = 0
-                while slept < interval:
+                while slept < current_interval:
                     if not svc.is_restricted:
                         logger.info(f"🔓 检测到全局限制已解除，立即触发队列重试: {share_url}")
                         break
                     await asyncio.sleep(5)
                     slept += 5
             else:
-                await asyncio.sleep(interval)
+                await asyncio.sleep(current_interval)
 
             logger.info(f"🔄 正在进行第 {attempt}/{max_attempts} 次审核状态检查: {share_url}")
             status_info = await svc.get_share_status(share_url)
