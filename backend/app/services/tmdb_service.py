@@ -48,7 +48,7 @@ class TMDBService:
 
     async def _update_last_sync_at(self):
         """更新上次全量同步时间为当前 UTC 时间"""
-        from datetime import timezone
+        from datetime import datetime, timezone
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         try:
             async for db in get_db():
@@ -98,20 +98,46 @@ class TMDBService:
     async def test_connection(self, api_key: str) -> tuple[bool, str]:
         """测试 TMDB API 连接"""
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.BASE_URL}/configuration"
-                params = {"api_key": api_key}
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        return True, "连接成功"
-                    elif resp.status == 401:
-                        return False, "API Key 无效"
-                    else:
-                        return False, f"连接失败: HTTP {resp.status}"
-        except asyncio.TimeoutError:
-            return False, "连接超时"
+            url = f"{self.BASE_URL}/configuration"
+            params = {"api_key": api_key}
+            data, status = await self._request_with_retry(url, params, timeout=10)
+            if status == 200:
+                return True, "连接成功"
+            elif status == 401:
+                return False, "API Key 无效"
+            else:
+                return False, f"连接失败: HTTP {status}"
         except Exception as e:
             return False, f"连接失败: {str(e)}"
+
+    async def _request_with_retry(self, url: str, params: Dict[str, Any] = None, 
+                             method: str = "GET", timeout: int = 15, 
+                             max_retries: int = 3) -> tuple[Optional[Dict], int]:
+        """通用的带重试机制的请求方法"""
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    timeout_obj = aiohttp.ClientTimeout(total=timeout)
+                    async with session.request(method, url, params=params, timeout=timeout_obj) as resp:
+                        if resp.status == 200:
+                            return await resp.json(), 200
+                        elif resp.status in [429, 500, 502, 503, 504]:
+                            # 触发限速或服务器错误，稍后重试
+                            wait = (attempt + 1) * 2
+                            logger.warning(f"⚠️ TMDB 请求返回 {resp.status}, 正在进行第 {attempt+1} 次重试 (等待 {wait}s)...")
+                            await asyncio.sleep(wait)
+                            continue
+                        else:
+                            return None, resp.status
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_error = e
+                wait = (attempt + 1) * 2
+                logger.warning(f"⚠️ TMDB 请求异常 ({type(e).__name__}), 正在进行第 {attempt+1} 次重试 (等待 {wait}s)...")
+                await asyncio.sleep(wait)
+        
+        logger.error(f"❌ TMDB 请求多次重试失败: {last_error}")
+        raise last_error if last_error else Exception("Request failed after retries")
 
     # ------------------------------------------------------------------ #
     #  爬取入口（智能路由）
@@ -267,58 +293,57 @@ class TMDBService:
 
         while page <= total_pages and not self._stop_flag:
             try:
-                async with aiohttp.ClientSession() as session:
-                    params = {
-                        "api_key": self.api_key,
-                        "with_keywords": with_keywords,
-                        "sort_by": "primary_release_date.desc",
-                        "page": page
-                    }
-                    async with session.get(f"{self.BASE_URL}/discover/movie", params=params) as resp:
-                        if resp.status != 200:
-                            logger.error(f"❌ 增量请求失败: HTTP {resp.status}")
-                            break
+                url = f"{self.BASE_URL}/discover/movie"
+                params = {
+                    "api_key": self.api_key,
+                    "with_keywords": with_keywords,
+                    "sort_by": "primary_release_date.desc",
+                    "page": page
+                }
+                data, status = await self._request_with_retry(url, params)
+                if status != 200:
+                    logger.error(f"❌ 增量请求失败: HTTP {status}")
+                    break
 
-                        data = await resp.json()
-                        total_pages = min(data.get("total_pages", 1), 500)
-                        movies = data.get("results", [])
+                total_pages = min(data.get("total_pages", 1), 500)
+                movies = data.get("results", [])
 
-                        if page == 1:
-                            total = data.get("total_results", 0)
-                            self.fetch_progress["total"] = total
-                            logger.info(f"🔄 增量模式共 {total} 条结果，按日期倒序检查新增...")
+                if page == 1:
+                    total = data.get("total_results", 0)
+                    self.fetch_progress["total"] = total
+                    logger.info(f"🔄 增量模式共 {total} 条结果，按日期倒序检查新增...")
 
-                        self.fetch_progress["message"] = (
-                            f"增量同步第 {page}/{total_pages} 页"
-                            f"（新增 {new_count} 部）"
-                        )
+                self.fetch_progress["message"] = (
+                    f"增量同步第 {page}/{total_pages} 页"
+                    f"（新增 {new_count} 部）"
+                )
 
-                        stop_early = False
-                        for movie in movies:
-                            if self._stop_flag:
-                                return new_count
+                stop_early = False
+                for movie in movies:
+                    if self._stop_flag:
+                        return new_count
 
-                            tmdb_id = movie.get("id")
-                            if not tmdb_id:
-                                continue
+                    tmdb_id = movie.get("id")
+                    if not tmdb_id:
+                        continue
 
-                            # 检查是否已存在
-                            already_exists = await self._movie_exists(tmdb_id)
-                            if already_exists:
-                                # 按日期倒序，遇到已有的就说明后面都是旧数据
-                                logger.info(f"📌 遇到已存在记录 tmdb_id={tmdb_id}，增量同步结束")
-                                stop_early = True
-                                break
+                    # 检查是否已存在
+                    already_exists = await self._movie_exists(tmdb_id)
+                    if already_exists:
+                        # 按日期倒序，遇到已有的就说明后面都是旧数据
+                        logger.info(f"📌 遇到已存在记录 tmdb_id={tmdb_id}，增量同步结束")
+                        stop_early = True
+                        break
 
-                            await self._save_movie_keyword_mode(movie, country)
-                            new_count += 1
-                            self.fetch_progress["current"] = new_count
+                    await self._save_movie_keyword_mode(movie, country)
+                    new_count += 1
+                    self.fetch_progress["current"] = new_count
 
-                        if stop_early:
-                            return new_count
+                if stop_early:
+                    return new_count
 
-                        page += 1
-                        await asyncio.sleep(self.RATE_LIMIT_DELAY)
+                page += 1
+                await asyncio.sleep(self.RATE_LIMIT_DELAY)
 
             except Exception as e:
                 logger.error(f"❌ 增量爬取第 {page} 页失败: {e}")
@@ -366,6 +391,7 @@ class TMDBService:
                 resolved.append(kw)
             else:
                 failed.append(kw)
+            # 解析关键词 ID 本身频率限制较低，稍微等待即可
             await asyncio.sleep(self.RATE_LIMIT_DELAY)
 
         if failed:
@@ -392,23 +418,21 @@ class TMDBService:
     async def _resolve_keyword_id(self, keyword: str) -> Optional[int]:
         """将关键词名称解析为 TMDB keyword ID"""
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.BASE_URL}/search/keyword"
-                params = {"api_key": self.api_key, "query": keyword}
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        results = data.get("results", [])
-                        # 精确匹配（忽略大小写）
-                        for r in results:
-                            if r.get("name", "").lower() == keyword.lower():
-                                logger.debug(f"🔑 关键词 '{keyword}' → ID {r['id']}")
-                                return r["id"]
-                        # 若无精确匹配，取第一个近似结果
-                        if results:
-                            first = results[0]
-                            logger.debug(f"🔑 关键词 '{keyword}' 近似匹配 '{first['name']}' → ID {first['id']}")
-                            return first["id"]
+            url = f"{self.BASE_URL}/search/keyword"
+            params = {"api_key": self.api_key, "query": keyword}
+            data, status = await self._request_with_retry(url, params)
+            if status == 200:
+                results = data.get("results", [])
+                # 精确匹配（忽略大小写）
+                for r in results:
+                    if r.get("name", "").lower() == keyword.lower():
+                        logger.debug(f"🔑 关键词 '{keyword}' → ID {r['id']}")
+                        return r["id"]
+                # 若无精确匹配，取第一个近似结果
+                if results:
+                    first = results[0]
+                    logger.debug(f"🔑 关键词 '{keyword}' 近似匹配 '{first['name']}' → ID {first['id']}")
+                    return first["id"]
             return None
         except Exception as e:
             logger.error(f"❌ 解析关键词 '{keyword}' 失败: {e}")
@@ -417,12 +441,11 @@ class TMDBService:
     async def _get_keyword_total(self, with_keywords: str, country: str, certifications: List[str]) -> int:
         """获取关键词模式下的电影总数"""
         try:
-            async with aiohttp.ClientSession() as session:
-                params = self._build_discover_params(with_keywords, country, certifications, page=1)
-                async with session.get(f"{self.BASE_URL}/discover/movie", params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("total_results", 0)
+            url = f"{self.BASE_URL}/discover/movie"
+            params = self._build_discover_params(with_keywords, country, certifications, page=1)
+            data, status = await self._request_with_retry(url, params)
+            if status == 200:
+                return data.get("total_results", 0)
             return 0
         except Exception as e:
             logger.error(f"❌ 获取总数失败: {e}")
@@ -450,29 +473,28 @@ class TMDBService:
 
         while page <= total_pages and not self._stop_flag:
             try:
-                async with aiohttp.ClientSession() as session:
-                    params = self._build_discover_params(with_keywords, country, certifications, page)
-                    async with session.get(f"{self.BASE_URL}/discover/movie", params=params) as resp:
-                        if resp.status != 200:
-                            logger.error(f"❌ Discover 请求失败: HTTP {resp.status}")
-                            break
+                url = f"{self.BASE_URL}/discover/movie"
+                params = self._build_discover_params(with_keywords, country, certifications, page)
+                data, status = await self._request_with_retry(url, params)
+                if status != 200:
+                    logger.error(f"❌ Discover 请求失败: HTTP {status}")
+                    break
 
-                        data = await resp.json()
-                        total_pages = min(data.get("total_pages", 1), 500)  # TMDB 最多返回 500 页
-                        movies = data.get("results", [])
+                total_pages = min(data.get("total_pages", 1), 500)  # TMDB 最多返回 500 页
+                movies = data.get("results", [])
 
-                        self.fetch_progress["message"] = (
-                            f"正在爬取第 {page}/{total_pages} 页"
-                            f"（已保存 {self.fetch_progress['current']} 部）"
-                        )
+                self.fetch_progress["message"] = (
+                    f"正在爬取第 {page}/{total_pages} 页"
+                    f"（已保存 {self.fetch_progress['current']} 部）"
+                )
 
-                        for movie in movies:
-                            if self._stop_flag:
-                                return
-                            await self._save_movie_keyword_mode(movie, country)
+                for movie in movies:
+                    if self._stop_flag:
+                        return
+                    await self._save_movie_keyword_mode(movie, country)
 
-                        page += 1
-                        await asyncio.sleep(self.RATE_LIMIT_DELAY)
+                page += 1
+                await asyncio.sleep(self.RATE_LIMIT_DELAY)
 
             except Exception as e:
                 logger.error(f"❌ 爬取第 {page} 页失败: {e}")
@@ -563,17 +585,17 @@ class TMDBService:
 
     async def _get_cert_total(self, country: str, certification: str) -> int:
         try:
-            async with aiohttp.ClientSession() as session:
-                params = {
-                    "api_key": self.api_key,
-                    "certification_country": country,
-                    "certification": certification,
-                    "sort_by": "popularity.desc",
-                    "page": 1
-                }
-                async with session.get(f"{self.BASE_URL}/discover/movie", params=params) as resp:
-                    if resp.status == 200:
-                        return (await resp.json()).get("total_results", 0)
+            url = f"{self.BASE_URL}/discover/movie"
+            params = {
+                "api_key": self.api_key,
+                "certification_country": country,
+                "certification": certification,
+                "sort_by": "popularity.desc",
+                "page": 1
+            }
+            data, status = await self._request_with_retry(url, params)
+            if status == 200:
+                return data.get("total_results", 0)
             return 0
         except Exception as e:
             logger.error(f"❌ 获取分级总数失败: {e}")
@@ -584,34 +606,33 @@ class TMDBService:
         total_pages = 1
         while page <= total_pages and not self._stop_flag:
             try:
-                async with aiohttp.ClientSession() as session:
-                    params = {
-                        "api_key": self.api_key,
-                        "certification_country": country,
-                        "certification": certification,
-                        "sort_by": "popularity.desc",
-                        "page": page
-                    }
-                    async with session.get(f"{self.BASE_URL}/discover/movie", params=params) as resp:
-                        if resp.status != 200:
-                            logger.error(f"❌ 请求失败: HTTP {resp.status}")
-                            break
-                        data = await resp.json()
-                        total_pages = data.get("total_pages", 1)
-                        movies = data.get("results", [])
+                url = f"{self.BASE_URL}/discover/movie"
+                params = {
+                    "api_key": self.api_key,
+                    "certification_country": country,
+                    "certification": certification,
+                    "sort_by": "popularity.desc",
+                    "page": page
+                }
+                data, status = await self._request_with_retry(url, params)
+                if status != 200:
+                    logger.error(f"❌ 请求失败: HTTP {status}")
+                    break
+                total_pages = data.get("total_pages", 1)
+                movies = data.get("results", [])
 
-                        self.fetch_progress["message"] = (
-                            f"分级 {certification}：第 {page}/{total_pages} 页"
-                            f"（已保存 {self.fetch_progress['current']} 部）"
-                        )
+                self.fetch_progress["message"] = (
+                    f"分级 {certification}：第 {page}/{total_pages} 页"
+                    f"（已保存 {self.fetch_progress['current']} 部）"
+                )
 
-                        for movie in movies:
-                            if self._stop_flag:
-                                return
-                            await self._save_movie_cert_mode(movie, country, certification)
+                for movie in movies:
+                    if self._stop_flag:
+                        return
+                    await self._save_movie_cert_mode(movie, country, certification)
 
-                        page += 1
-                        await asyncio.sleep(self.RATE_LIMIT_DELAY)
+                page += 1
+                await asyncio.sleep(self.RATE_LIMIT_DELAY)
             except Exception as e:
                 logger.error(f"❌ 分级爬取第 {page} 页失败: {e}")
                 break
@@ -679,19 +700,16 @@ class TMDBService:
         返回 (alt_titles, chinese_title)
         """
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.BASE_URL}/movie/{tmdb_id}/alternative_titles"
-                async with session.get(url, params={"api_key": self.api_key},
-                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        titles = data.get("titles", [])
-                        alt_titles = [t["title"] for t in titles if t.get("title")]
-                        chinese_title = next(
-                            (t["title"] for t in titles if t.get("iso_3166_1") in ["CN", "TW", "HK"]),
-                            None
-                        )
-                        return alt_titles, chinese_title
+            url = f"{self.BASE_URL}/movie/{tmdb_id}/alternative_titles"
+            data, status = await self._request_with_retry(url, params={"api_key": self.api_key})
+            if status == 200:
+                titles = data.get("titles", [])
+                alt_titles = [t["title"] for t in titles if t.get("title")]
+                chinese_title = next(
+                    (t["title"] for t in titles if t.get("iso_3166_1") in ["CN", "TW", "HK"]),
+                    None
+                )
+                return alt_titles, chinese_title
             return [], None
         except Exception as e:
             logger.error(f"❌ 获取别名失败: {e}")
@@ -700,13 +718,10 @@ class TMDBService:
     async def _get_movie_keywords(self, tmdb_id: int) -> List[str]:
         """获取电影关键词"""
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.BASE_URL}/movie/{tmdb_id}/keywords"
-                async with session.get(url, params={"api_key": self.api_key},
-                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return [k["name"] for k in data.get("keywords", []) if k.get("name")]
+            url = f"{self.BASE_URL}/movie/{tmdb_id}/keywords"
+            data, status = await self._request_with_retry(url, params={"api_key": self.api_key})
+            if status == 200:
+                return [k["name"] for k in data.get("keywords", []) if k.get("name")]
             return []
         except Exception as e:
             logger.error(f"❌ 获取关键词失败: {e}")
@@ -715,19 +730,16 @@ class TMDBService:
     async def _get_us_certification(self, tmdb_id: int) -> Optional[str]:
         """获取美国分级"""
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.BASE_URL}/movie/{tmdb_id}/release_dates"
-                async with session.get(url, params={"api_key": self.api_key},
-                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        results = data.get("results", [])
-                        for r in results:
-                            if r.get("iso_3166_1") == "US":
-                                for rd in r.get("release_dates", []):
-                                    cert = rd.get("certification", "").strip()
-                                    if cert:
-                                        return cert
+            url = f"{self.BASE_URL}/movie/{tmdb_id}/release_dates"
+            data, status = await self._request_with_retry(url, params={"api_key": self.api_key})
+            if status == 200:
+                results = data.get("results", [])
+                for r in results:
+                    if r.get("iso_3166_1") == "US":
+                        for rd in r.get("release_dates", []):
+                            cert = rd.get("certification", "").strip()
+                            if cert:
+                                return cert
             return None
         except Exception as e:
             logger.error(f"❌ 获取美国分级失败: {e}")

@@ -1151,24 +1151,31 @@ class P115Service:
             return None
 
     async def _snapshot_dir_ids(self, cid: int) -> set:
-        """快照目录中所有顶层文件/文件夹的 ID，用于保存前后 diff 找新增项"""
+        """快照目录中所有顶层文件/文件夹的 ID，用于保存前后 diff 找新增项（自动翻页，避免 >1000 条时漏记）"""
         ids = set()
+        offset = 0
+        limit = 1000
         try:
-            resp = await self._api_call_with_timeout(
-                self.client.fs_files_app2,
-                {"cid": cid, "limit": 1000, "show_dir": 1},
-                async_=True,
-                timeout=30, max_retries=2, label="fs_files_snapshot",
-                **self._get_ios_ua_kwargs()
-            )
-            check_response(resp)
-            file_list = resp.get("data", [])
-            if isinstance(file_list, dict):
-                file_list = file_list.get("list", [])
-            for item in file_list:
-                item_id = item.get("fid") or item.get("cid") or item.get("file_id") or item.get("category_id") or item.get("id")
-                if item_id:
-                    ids.add(str(item_id))
+            while True:
+                resp = await self._api_call_with_timeout(
+                    self.client.fs_files_app2,
+                    {"cid": cid, "limit": limit, "offset": offset, "show_dir": 1},
+                    async_=True,
+                    timeout=30, max_retries=2, label="fs_files_snapshot",
+                    **self._get_ios_ua_kwargs()
+                )
+                check_response(resp)
+                file_list = resp.get("data", [])
+                if isinstance(file_list, dict):
+                    file_list = file_list.get("list", [])
+                for item in file_list:
+                    item_id = item.get("fid") or item.get("cid") or item.get("file_id") or item.get("category_id") or item.get("id")
+                    if item_id:
+                        ids.add(str(item_id))
+                if len(file_list) < limit:
+                    break  # 已是最后一页
+                offset += limit
+                logger.debug(f"📄 快照目录 {cid} 翻页: offset={offset}, 已收集 {len(ids)} 个 ID")
         except Exception as e:
             logger.warning(f"⚠️ 快照目录 {cid} 失败: {e}")
         return ids

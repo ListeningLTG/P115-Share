@@ -32,7 +32,10 @@
           <template #icon><CloudServerOutlined /></template>
           <span>账号管理</span>
         </a-menu-item>
-        <!-- 敏感词库功能开发中，暂时隐藏 -->
+        <!-- <a-menu-item key="sensitive" @click="currentView = 'sensitive'">
+          <template #icon><WarningOutlined /></template>
+          <span>敏感词库</span>
+        </a-menu-item> -->
         <a-menu-item key="settings" @click="currentView = 'settings'">
           <template #icon><SettingOutlined /></template>
           <span>系统配置</span>
@@ -74,7 +77,10 @@
           <template #icon><CloudServerOutlined /></template>
           <span>账号管理</span>
         </a-menu-item>
-        <!-- 敏感词库功能开发中，暂时隐藏 -->
+        <!-- <a-menu-item key="sensitive" @click="currentView = 'sensitive'">
+          <template #icon><WarningOutlined /></template>
+          <span>敏感词库</span>
+        </a-menu-item> -->
         <a-menu-item key="settings" @click="currentView = 'settings'">
           <template #icon><SettingOutlined /></template>
           <span>系统配置</span>
