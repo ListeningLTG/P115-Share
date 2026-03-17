@@ -913,7 +913,10 @@ class P115Service:
         cid_map = {0: target_pid}
         share_links = []
         files_saved_total = 0
-        
+
+        # 方案B：在递归开始前快照保存目录的顶层 ID，用于中转分享时精确 diff
+        initial_top_ids: set = await self._snapshot_dir_ids(target_pid)
+
         # 路径重建追踪：share_cid -> (parent_share_cid, name)
         share_structure = {0: (None, "")}
         
@@ -1002,37 +1005,19 @@ class P115Service:
 
                 if need_cleanup:
                     logger.info("📦 触发中转流程：正在生成当前已保存内容的分享链接...")
-                    # 这里的 CID 获取可能不准，因为我们是全量清理，所以直接分享保存目录根节点
                     save_dir_cid = await self._ensure_save_dir()
-                    save_name = self.save_dir
-                    # 获取保存目录的父 CID 和 自己的名字，以便 create_share_link 能找到它
-                    # 由于 _ensure_save_dir 只给出了 CID，我们假设它就在根目录下或者我们可以通过其它方式分享
-                    # 简化逻辑：直接分享保存目录下的所有东西
-                    # 重新构造一个 save_result 来调用 create_share_link
-                    # 注意：我们要找的是保存目录里的东西
                     try:
-                        # 列出保存目录下的顶级文件/文件夹名
-                        ls_resp = await self._api_call_with_timeout(
-                            self.client.fs_files_app2, save_dir_cid, async_=True,
-                            **self._get_ios_ua_kwargs()
-                        )
-                        check_response(ls_resp)
-                        ls_data = ls_resp.get("data", [])
-                        ls_items = ls_data.get("list", []) if isinstance(ls_data, dict) else ls_data
-                        
-                        ls_names = []
-                        for it in ls_items:
-                            # 尝试多种可能的键名提取文件名
-                            item_name = it.get("n") or it.get("fn") or it.get("name") or it.get("file_name") or it.get("title")
-                            if item_name:
-                                ls_names.append(item_name)
-                        
-                        if ls_names:
-                            intermediate_link = await self.create_share_link({"to_cid": save_dir_cid, "names": ls_names})
+                        # 方案B：snapshot diff，精确找出本轮新增的顶层项目，直接分享，不经过 create_share_link
+                        after_top_ids = await self._snapshot_dir_ids(save_dir_cid)
+                        new_top_ids = list(after_top_ids - initial_top_ids)
+                        if new_top_ids:
+                            logger.info(f"📦 中转分享: 找到 {len(new_top_ids)} 个新增顶级项，直接创建分享...")
+                            intermediate_link = await self._share_fids_direct(new_top_ids)
                             if intermediate_link:
                                 logger.info(f"📤 中转链接已生成: {intermediate_link}")
                                 share_links.append(intermediate_link)
-                                # TODO: 这里如果能通过机器人发送即时消息更好
+                        else:
+                            logger.warning("⚠️ 中转分享: 未找到新增顶级项，跳过中转分享")
                     except Exception as share_e:
                         logger.error(f"❌ 中转分享生成失败: {share_e}")
 
@@ -1043,6 +1028,7 @@ class P115Service:
                     
                     # 重置计数器并重建当前路径映射
                     files_saved_total = 0
+                    initial_top_ids = set()  # 清理后目录已清空，重置快照基线
                     current_target_pid = await reconstruct_path(pid, cid_map)
                 
                 batch = fids[i:i+500]
@@ -1149,6 +1135,67 @@ class P115Service:
                 }
             logger.error(f"❌ 检查链接状态失败: {share_url}, 错误: {e}")
             return None
+
+    async def _share_fids_direct(self, fids: list) -> str | None:
+        """将指定 file_id 列表直接创建为分享链接（含批次拆分、重试、长期转换）。
+        绕开 create_share_link 的 diff 机制，精确分享已知 ID 列表。"""
+        if not fids:
+            return None
+        result_links = []
+        fids_str_list = [str(fid) for fid in fids]
+        max_share_retries = 3
+
+        for batch_idx, i in enumerate(range(0, len(fids_str_list), 10000), 1):
+            batch_fids = fids_str_list[i:i+10000]
+            batch_share_code = None
+            batch_receive_code = None
+
+            for retry_attempt in range(1, max_share_retries + 1):
+                try:
+                    logger.info(f"📤 直接创建分享 (分卷 {batch_idx}, 尝试 {retry_attempt}/{max_share_retries})...")
+                    send_resp = await self._api_call_with_timeout(
+                        self.client.share_send_app, ",".join(batch_fids), async_=True,
+                        timeout=API_TIMEOUT, max_retries=1, label=f"share_send_direct_{batch_idx}",
+                        **self._get_ios_ua_kwargs()
+                    )
+                    check_response(send_resp)
+                    data = send_resp["data"]
+                    batch_share_code = data.get("share_code")
+                    batch_receive_code = data.get("receive_code") or data.get("recv_code")
+                    logger.info(f"✅ 直接分享分卷 {batch_idx} 创建成功: {batch_share_code}")
+                    break
+                except Exception as share_error:
+                    error_str = str(share_error)
+                    if ("4100005" in error_str or "已被移动或删除" in error_str) and retry_attempt < max_share_retries:
+                        logger.warning(f"⚠️ 文件尚未就绪，等待 5 秒后重试 (分卷 {batch_idx})...")
+                        await asyncio.sleep(5)
+                    else:
+                        logger.error(f"❌ 直接分享分卷 {batch_idx} 失败: {share_error}")
+                        if batch_idx == 1:
+                            raise
+                        break
+
+            if batch_share_code:
+                try:
+                    await self._api_call_with_timeout(
+                        self.client.share_update_app,
+                        {"share_code": batch_share_code, "share_duration": -1},
+                        async_=True, timeout=API_TIMEOUT, max_retries=2,
+                        label=f"share_update_direct_{batch_idx}",
+                        **self._get_ios_ua_kwargs()
+                    )
+                except Exception as e:
+                    logger.warning(f"⚠️ 转换长期分享失败 (分卷 {batch_idx}): {e}")
+                full_link = f"https://115.com/s/{batch_share_code}"
+                if batch_receive_code:
+                    full_link += f"?password={batch_receive_code}"
+                result_links.append(full_link)
+
+        if not result_links:
+            return None
+        if len(result_links) > 1:
+            return "\n".join(f"链接 {idx}: {link}" for idx, link in enumerate(result_links, 1))
+        return result_links[0]
 
     async def _snapshot_dir_ids(self, cid: int) -> set:
         """快照目录中所有顶层文件/文件夹的 ID，用于保存前后 diff 找新增项（自动翻页，避免 >1000 条时漏记）"""
