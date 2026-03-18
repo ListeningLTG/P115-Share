@@ -804,12 +804,12 @@ class P115Service:
                             "message": "检测为大包，跳过处理"
                         }
                     logger.warning(f"⚠️ 触发 115 非会员 500 文件保存限制，尝试递归分批保存: {share_url}")
-                    recursive_links = await self._save_share_recursive(share_url, to_cid)
+                    recursive_links = await self._save_share_recursive(share_url, task_cid)
                     logger.info(f"✅ 递归分批保存指令已处理完毕: {share_url}")
                     self._record_save_activity()
                 # Check if it's a "file already received" error (errno 4200045)
                 elif errno_val == 4200045 or "4200045" in str(recv_error) or "已经接收" in str(recv_error) or "已接收" in str(recv_error):
-                    return await self._handle_already_received(to_cid, names, share_url, metadata, have_vio_file, receive_payload)
+                    return await self._handle_already_received(task_cid, names, share_url, metadata, have_vio_file, receive_payload)
                 else:
                     # Other errors, re-raise
                     raise
@@ -904,13 +904,14 @@ class P115Service:
             # 在某些情况下外层抛出的异常是纯文本，不包含在 errno 里
             if errno_val == 4200045 or "4200045" in error_msg or "已经接收" in error_msg or "已接收" in error_msg:
                 # 重新构建 payload，这里可能外层没有 receive_payload，按现有信息构建
+                _cid = task_cid if 'task_cid' in locals() and task_cid else to_cid
                 retry_payload = {
                     "share_code": payload["share_code"],
                     "receive_code": payload["receive_code"] or "",
                     "file_id": ",".join(fids) if 'fids' in locals() else "",
-                    "cid": to_cid
+                    "cid": _cid
                 }
-                return await self._handle_already_received(to_cid, names, share_url, metadata, have_vio_file, retry_payload)
+                return await self._handle_already_received(_cid, names, share_url, metadata, have_vio_file, retry_payload)
 
             logger.error("❌ 保存分享链接发生程序异常: {}", error_msg)
             return {
@@ -1021,10 +1022,10 @@ class P115Service:
 
                 if need_cleanup:
                     logger.info("📦 触发中转流程：正在生成当前已保存内容的分享链接...")
-                    save_dir_cid = await self._ensure_save_dir()
                     try:
                         # 方案B：snapshot diff，精确找出本轮新增的顶层项目，直接分享，不经过 create_share_link
-                        after_top_ids = await self._snapshot_dir_ids(save_dir_cid)
+                        # 使用 target_pid（即 task_cid）而非根目录，避免误纳入其他任务子目录
+                        after_top_ids = await self._snapshot_dir_ids(target_pid)
                         new_top_ids = list(after_top_ids - initial_top_ids)
                         if new_top_ids:
                             logger.info(f"📦 中转分享: 找到 {len(new_top_ids)} 个新增顶级项，直接创建分享...")
