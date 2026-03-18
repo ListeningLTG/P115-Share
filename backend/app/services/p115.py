@@ -755,15 +755,32 @@ class P115Service:
             # 重新获取最新的 CID，以防清理逻辑删除了目录并重建了它
             to_cid = await self._ensure_save_dir(target_dir)
 
+            # 为本次任务创建独立子目录，完全隔离不同任务的文件，避免分享时误纳入其他文件
+            task_folder_name = f"{int(time.time())}"
+            logger.info(f"📁 为本次任务创建独立子目录: {task_folder_name} (父目录 CID: {to_cid})")
+            sub_dir_resp = await self._api_call_with_timeout(
+                self.client.fs_makedirs_app, task_folder_name, pid=to_cid, async_=True,
+                label="fs_makedirs_task_subdir",
+                **self._get_ios_ua_kwargs()
+            )
+            check_response(sub_dir_resp)
+            task_cid = int(
+                sub_dir_resp.get("cid")
+                or sub_dir_resp.get("id")
+                or (sub_dir_resp.get("data") or {}).get("cid")
+                or 0
+            )
+            if not task_cid:
+                raise RuntimeError(f"创建任务子目录失败，未获取到有效 CID: {sub_dir_resp}")
+            logger.info(f"✅ 任务子目录已创建: {task_folder_name} (CID: {task_cid})")
+
             receive_payload = {
                 "share_code": payload["share_code"],
                 "receive_code": payload["receive_code"] or "",
                 "file_id": ",".join(fids),
-                "cid": to_cid
+                "cid": task_cid
             }
 
-            # 保存前快照目录，用于保存后 diff 找到新增的文件/文件夹（避免同名重命名问题）
-            before_ids = await self._snapshot_dir_ids(to_cid)
             try:
                 recv_resp = await self._api_call_with_timeout(
                     self.client.share_receive_app, receive_payload, async_=True,
@@ -771,7 +788,7 @@ class P115Service:
                     **self._get_ios_ua_kwargs()
                 )
                 check_response(recv_resp)
-                logger.info(f"✅ 链接转存指令已发送: {share_url} -> CID {to_cid}")
+                logger.info(f"✅ 链接转存指令已发送: {share_url} -> CID {task_cid}")
                 self._record_save_activity()
                 recursive_links = []
             except Exception as recv_error:
@@ -800,10 +817,9 @@ class P115Service:
             await self.clear_restriction()
             return {
                 "status": "success",
-                "to_cid": to_cid,
+                "to_cid": task_cid if 'task_cid' in locals() and task_cid else to_cid,
                 "names": names,
                 "share_url": share_url,
-                "before_ids": before_ids if 'before_ids' in locals() else set(),
                 "recursive_links": recursive_links if 'recursive_links' in locals() else [],
                 "metadata": metadata or {},
                 "have_vio": have_vio_file == 1
@@ -1357,60 +1373,47 @@ class P115Service:
 
         to_cid = save_result.get("to_cid")
         names = save_result.get("names", [])
-        before_ids: set = save_result.get("before_ids", set())
 
         try:
-            # 5. Wait for a short time to allow 115 to start processing
-            logger.info(f"⏳ 等待 2 秒以确保文件保存开始...")
-            await asyncio.sleep(2)
+            # 等待 115 异步处理转存，轮询子目录直到文件出现或稳定
+            logger.info(f"⏳ 等待文件写入子目录 (CID: {to_cid})...")
 
-            # 6. 通过 diff 找到本次新增的文件/文件夹 ID（不依赖文件名，避免同名重命名问题）
             new_fids = []
-            prev_new_ids: set = set()
-
+            prev_ids: set = set()
             max_poll_attempts = 10
+
             for poll_attempt in range(1, max_poll_attempts + 1):
                 try:
-                    logger.info(f"🔍 正在查找新增文件 (第 {poll_attempt}/{max_poll_attempts} 次), 目标目录 CID: {to_cid}")
-                    after_ids = await self._snapshot_dir_ids(to_cid)
-                    current_new_ids = after_ids - before_ids
+                    logger.info(f"🔍 快照子目录 (第 {poll_attempt}/{max_poll_attempts} 次), CID: {to_cid}")
+                    current_ids = await self._snapshot_dir_ids(to_cid)
 
-                    if len(current_new_ids) >= len(names):
-                        logger.info(f"✅ 检测到 {len(current_new_ids)} 个新增项，立即继续")
-                        new_fids = list(current_new_ids)
+                    if len(current_ids) >= len(names):
+                        logger.info(f"✅ 子目录已有 {len(current_ids)} 个文件/文件夹，继续创建分享")
+                        new_fids = list(current_ids)
                         break
 
-                    # 数量不够但稳定了（连续两次相同），也继续
-                    if current_new_ids and current_new_ids == prev_new_ids:
-                        logger.info(f"✅ 新增项已稳定，共 {len(current_new_ids)} 个（预期 {len(names)} 个）")
-                        new_fids = list(current_new_ids)
+                    # 数量不足但已稳定（连续两次相同），也继续
+                    if current_ids and current_ids == prev_ids:
+                        logger.info(f"✅ 子目录文件已稳定，共 {len(current_ids)} 个（预期 {len(names)} 个）")
+                        new_fids = list(current_ids)
                         break
 
-                    if current_new_ids:
-                        logger.debug(f"🔄 已找到 {len(current_new_ids)}/{len(names)} 个新增项，继续等待...")
+                    if current_ids:
+                        logger.debug(f"🔄 子目录已有 {len(current_ids)}/{len(names)} 个，继续等待...")
                     else:
-                        logger.warning(f"⚠️ 暂未检测到新增文件 (第 {poll_attempt}/{max_poll_attempts} 次)")
+                        logger.warning(f"⚠️ 子目录暂无文件 (第 {poll_attempt}/{max_poll_attempts} 次)")
 
-                    prev_new_ids = current_new_ids
+                    prev_ids = current_ids
                     if poll_attempt < max_poll_attempts:
                         await asyncio.sleep(2)
 
                 except Exception as e:
-                    logger.warning(f"⚠️ 查找文件失败 (轮询 {poll_attempt}/{max_poll_attempts}): {e}")
+                    logger.warning(f"⚠️ 快照子目录失败 (第 {poll_attempt}/{max_poll_attempts} 次): {e}")
                     if poll_attempt < max_poll_attempts:
                         await asyncio.sleep(5)
 
-            # 如果 diff 没找到（before_ids 为空或快照失败），回退到按名字查找
             if not new_fids:
-                if before_ids:
-                    logger.warning(f"⚠️ diff 未找到新增项，回退到按名字查找: {names}")
-                else:
-                    logger.info(f"🔍 无快照数据，使用按名字查找: {names}")
-                matched_files = await self._find_files_in_dir(to_cid, names)
-                new_fids = [f["fid"] for f in matched_files]
-            
-            if not new_fids:
-                logger.warning(f"⚠️ 在保存目录 {to_cid} 中未找到对应的文件 {names}，可能 115 处理延迟或保存失败")
+                logger.warning(f"⚠️ 子目录 {to_cid} 中未检测到任何文件，可能 115 处理延迟或转存失败")
                 return None
             
             # 7. Create new share with retry mechanism and split if > 10,000 files
