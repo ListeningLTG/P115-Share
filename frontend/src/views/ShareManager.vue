@@ -36,6 +36,17 @@
             </a-menu>
           </template>
         </a-dropdown>
+        <a-button
+          :disabled="isAnalyzing || statsNormal === 0"
+          @click="showPushModal = true"
+        >
+          <template #icon><SendOutlined /></template>
+          推送到频道
+        </a-button>
+        <a-button @click="showPushTasksModal = true; loadPushTasks()">
+          <template #icon><UnorderedListOutlined /></template>
+          推送任务
+        </a-button>
         <div v-if="isAnalyzing" style="font-size: 12px; color: #999">
           扫描中: {{ scannedCount }} / {{ statsTotal }} ({{ statsTotal > 0 ? Math.round(scannedCount / statsTotal * 100) : 0 }}%)
         </div>
@@ -85,6 +96,7 @@
       @change="handleTableChange"
       row-key="id"
       size="middle"
+      :row-selection="rowSelection"
     >
       <template #title v-if="lastUpdated">
         <div style="font-size: 12px; color: #999">
@@ -105,14 +117,148 @@
         </template>
       </template>
     </a-table>
+
+    <!-- 推送到频道弹窗 -->
+    <a-modal
+      v-model:open="showPushModal"
+      title="推送分享链接到频道"
+      @ok="handlePushToChannel"
+      :confirm-loading="pushLoading"
+      width="600px"
+    >
+      <a-form layout="vertical">
+        <a-form-item label="选择频道">
+          <a-select
+            v-model:value="pushChannelId"
+            placeholder="请选择目标频道"
+            style="width: 100%"
+          >
+            <a-select-option v-for="ch in channelList" :key="ch.id" :value="ch.id">
+              {{ ch.name }}
+            </a-select-option>
+          </a-select>
+          <div v-if="channelList.length === 0" style="margin-top: 8px; color: #999; font-size: 12px">
+            暂无可用频道，请先在设置中配置 Telegram 频道
+          </div>
+        </a-form-item>
+
+        <a-form-item label="推送范围">
+          <a-radio-group v-model:value="pushMode">
+            <a-radio value="selected">已选中的 ({{ selectedRowKeys.length }} 条)</a-radio>
+            <a-radio value="all">所有正常状态的分享</a-radio>
+          </a-radio-group>
+        </a-form-item>
+
+        <a-form-item label="分享时间范围（可选）">
+          <a-range-picker
+            v-model:value="pushDateRange"
+            style="width: 100%"
+            format="YYYY-MM-DD"
+          />
+        </a-form-item>
+
+        <a-alert
+          v-if="pushMode === 'all'"
+          message="将推送所有正常状态的分享链接，请谨慎操作"
+          type="warning"
+          show-icon
+          style="margin-top: 12px"
+        />
+      </a-form>
+    </a-modal>
+
+    <!-- 推送任务管理弹窗 -->
+    <a-modal
+      v-model:open="showPushTasksModal"
+      title="推送任务管理"
+      :footer="null"
+      width="800px"
+    >
+      <a-table
+        :columns="[
+          { title: '频道', dataIndex: 'channel_name', key: 'channel_name' },
+          { title: '状态', dataIndex: 'status', key: 'status' },
+          { title: '进度', key: 'progress' },
+          { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 160 },
+          { title: '操作', key: 'actions', width: 200 }
+        ]"
+        :data-source="pushTasks"
+        :pagination="false"
+        row-key="id"
+        size="small"
+      >
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'status'">
+            <a-tag :color="getPushStatusColor(record.status)">
+              {{ getPushStatusText(record.status) }}
+            </a-tag>
+          </template>
+          <template v-if="column.key === 'progress'">
+            <div style="display: flex; align-items: center; gap: 8px">
+              <a-progress
+                :percent="Math.round((record.current_index / record.total_count) * 100)"
+                :status="record.status === 'completed' ? 'success' : record.status === 'cancelled' ? 'exception' : 'active'"
+                size="small"
+                style="flex: 1; margin: 0"
+              />
+              <span style="font-size: 12px; white-space: nowrap">
+                {{ record.current_index }}/{{ record.total_count }}
+              </span>
+            </div>
+            <div style="font-size: 12px; color: #999; margin-top: 4px">
+              成功: {{ record.success_count }} | 失败: {{ record.fail_count }}
+            </div>
+          </template>
+          <template v-if="column.key === 'actions'">
+            <a-space size="small">
+              <a-button
+                v-if="record.status === 'running'"
+                type="link"
+                size="small"
+                @click="pausePushTask(record.id)"
+              >
+                暂停
+              </a-button>
+              <a-button
+                v-if="record.status === 'paused'"
+                type="link"
+                size="small"
+                @click="resumePushTask(record.id)"
+              >
+                恢复
+              </a-button>
+              <a-button
+                v-if="record.status === 'running' || record.status === 'paused'"
+                type="link"
+                danger
+                size="small"
+                @click="cancelPushTask(record.id)"
+              >
+                取消
+              </a-button>
+              <a-button
+                v-if="record.status === 'completed' || record.status === 'cancelled'"
+                type="link"
+                danger
+                size="small"
+                @click="deletePushTask(record.id)"
+              >
+                删除
+              </a-button>
+            </a-space>
+          </template>
+        </template>
+      </a-table>
+    </a-modal>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
-import { ReloadOutlined, DeleteOutlined, DownloadOutlined } from '@ant-design/icons-vue';
+import { ref, onMounted, computed, onUnmounted } from 'vue';
+import { ReloadOutlined, DeleteOutlined, DownloadOutlined, SendOutlined, UnorderedListOutlined } from '@ant-design/icons-vue';
 import { message, Modal } from 'ant-design-vue';
 import axios from 'axios';
+import type { Dayjs } from 'dayjs';
 
 interface Account {
   id: number;
@@ -142,6 +288,18 @@ const accounts = ref<Account[]>([]);
 const accountsLoading = ref(false);
 const selectedAccountId = ref<number | undefined>(undefined);
 
+// 推送相关
+const showPushModal = ref(false);
+const pushChannelId = ref<string>('');
+const pushMode = ref<'selected' | 'all'>('selected');
+const pushDateRange = ref<[Dayjs, Dayjs] | null>(null);
+const pushLoading = ref(false);
+const selectedRowKeys = ref<number[]>([]);
+const channelList = ref<Array<{ id: string; name: string }>>([]);
+const pushTasks = ref<any[]>([]);
+const showPushTasksModal = ref(false);
+let pushTaskPollTimer: any = null;
+
 const loadAccounts = async () => {
   accountsLoading.value = true;
   try {
@@ -154,6 +312,33 @@ const loadAccounts = async () => {
     // ignore
   } finally {
     accountsLoading.value = false;
+  }
+};
+
+const loadChannels = async () => {
+  try {
+    const res = await axios.get('/api/config/');
+    if (res.data.tg_channels) {
+      try {
+        const channels = JSON.parse(res.data.tg_channels);
+        channelList.value = channels
+          .filter((c: any) => c.enabled)
+          .map((c: any) => ({ id: c.id, name: c.name || c.id }));
+
+        // 添加默认频道（如果有）
+        const legacyId = res.data.tg_channel_id;
+        if (legacyId && !channelList.value.find((c: any) => c.id === legacyId)) {
+          channelList.value.unshift({ id: legacyId, name: '默认频道' });
+        }
+      } catch (e) {
+        console.error('解析频道列表失败:', e);
+      }
+    } else if (res.data.tg_channel_id) {
+      // 只有旧版单频道配置
+      channelList.value = [{ id: res.data.tg_channel_id, name: '默认频道' }];
+    }
+  } catch (e) {
+    console.error('加载频道列表失败:', e);
   }
 };
 
@@ -333,12 +518,185 @@ const handleExport = async ({ key }: { key: string }) => {
   }
 };
 
+const handlePushToChannel = async () => {
+  if (!pushChannelId.value) {
+    message.error('请选择目标频道');
+    return;
+  }
+
+  if (pushMode.value === 'selected' && selectedRowKeys.value.length === 0) {
+    message.error('请至少选择一条分享链接');
+    return;
+  }
+
+  pushLoading.value = true;
+  try {
+    const selectedChannel = channelList.value.find(c => c.id === pushChannelId.value);
+    const params: any = {
+      channel_id: pushChannelId.value,
+      channel_name: selectedChannel?.name || pushChannelId.value,
+      push_all: pushMode.value === 'all',
+      account_id: selectedAccountId.value,
+    };
+
+    if (pushMode.value === 'selected') {
+      params.share_ids = selectedRowKeys.value.join(',');
+    }
+
+    if (pushDateRange.value && pushDateRange.value.length === 2) {
+      params.start_date = pushDateRange.value[0].format('YYYY-MM-DD');
+      params.end_date = pushDateRange.value[1].format('YYYY-MM-DD');
+    }
+
+    const response = await axios.post('/api/share/push-to-channel', null, { params });
+
+    if (response.data.state) {
+      message.success(`推送任务已创建，共 ${response.data.total} 条`);
+      showPushModal.value = false;
+      selectedRowKeys.value = [];
+      showPushTasksModal.value = true;
+      loadPushTasks();
+      startPushTaskPolling();
+    } else {
+      message.error(response.data.error || '推送失败');
+    }
+  } catch (error) {
+    message.error('推送请求失败');
+  } finally {
+    pushLoading.value = false;
+  }
+};
+
+const loadPushTasks = async () => {
+  try {
+    const response = await axios.get('/api/share/push-tasks', {
+      params: { account_id: selectedAccountId.value }
+    });
+    if (response.data.state) {
+      pushTasks.value = response.data.tasks;
+    }
+  } catch (error) {
+    console.error('加载推送任务失败:', error);
+  }
+};
+
+const startPushTaskPolling = () => {
+  if (pushTaskPollTimer) clearInterval(pushTaskPollTimer);
+  pushTaskPollTimer = setInterval(async () => {
+    await loadPushTasks();
+    const hasRunning = pushTasks.value.some(t => t.status === 'running' || t.status === 'paused');
+    if (!hasRunning && pushTaskPollTimer) {
+      clearInterval(pushTaskPollTimer);
+      pushTaskPollTimer = null;
+    }
+  }, 2000);
+};
+
+const pausePushTask = async (taskId: number) => {
+  try {
+    const response = await axios.post(`/api/share/push-task/${taskId}/pause`);
+    if (response.data.state) {
+      message.success('任务已暂停');
+      loadPushTasks();
+    } else {
+      message.error(response.data.error);
+    }
+  } catch (error) {
+    message.error('操作失败');
+  }
+};
+
+const resumePushTask = async (taskId: number) => {
+  try {
+    const response = await axios.post(`/api/share/push-task/${taskId}/resume`);
+    if (response.data.state) {
+      message.success('任务已恢复');
+      loadPushTasks();
+      startPushTaskPolling();
+    } else {
+      message.error(response.data.error);
+    }
+  } catch (error) {
+    message.error('操作失败');
+  }
+};
+
+const cancelPushTask = async (taskId: number) => {
+  try {
+    const response = await axios.post(`/api/share/push-task/${taskId}/cancel`);
+    if (response.data.state) {
+      message.success('任务已取消');
+      loadPushTasks();
+    } else {
+      message.error(response.data.error);
+    }
+  } catch (error) {
+    message.error('操作失败');
+  }
+};
+
+const deletePushTask = async (taskId: number) => {
+  Modal.confirm({
+    title: '确认删除',
+    content: '确定要删除这个推送任务吗？',
+    onOk: async () => {
+      try {
+        const response = await axios.delete(`/api/share/push-task/${taskId}`);
+        if (response.data.state) {
+          message.success('任务已删除');
+          loadPushTasks();
+        } else {
+          message.error(response.data.error);
+        }
+      } catch (error) {
+        message.error('删除失败');
+      }
+    }
+  });
+};
+
+const getPushStatusText = (status: string) => {
+  const map: any = {
+    running: '推送中',
+    paused: '已暂停',
+    completed: '已完成',
+    cancelled: '已取消'
+  };
+  return map[status] || status;
+};
+
+const getPushStatusColor = (status: string) => {
+  const map: any = {
+    running: 'processing',
+    paused: 'warning',
+    completed: 'success',
+    cancelled: 'default'
+  };
+  return map[status] || 'default';
+};
+
+const rowSelection = computed(() => ({
+  selectedRowKeys: selectedRowKeys.value,
+  onChange: (keys: number[]) => {
+    selectedRowKeys.value = keys;
+  },
+  getCheckboxProps: (record: any) => ({
+    disabled: record.is_violated || record.is_expired || record.is_reviewing,
+  }),
+}));
+
 onMounted(async () => {
   await loadAccounts();
+  await loadChannels();
   await pollAnalysisStatus();
   if (isAnalyzing.value) {
     pollTimer = setInterval(pollAnalysisStatus, 2000);
   }
+});
+
+onUnmounted(() => {
+  if (pollTimer) clearInterval(pollTimer);
+  if (pushTaskPollTimer) clearInterval(pushTaskPollTimer);
 });
 </script>
 

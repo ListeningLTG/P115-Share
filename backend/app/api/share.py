@@ -6,7 +6,7 @@ from typing import Optional
 from app.services.account_manager import account_manager
 from app.core.config import settings
 from app.core.database import async_session
-from app.models.schema import ShareAnalysisResult, ShareAnalysisState, P115Account
+from app.models.schema import ShareAnalysisResult, ShareAnalysisState, P115Account, SharePushTask
 from sqlalchemy import select, delete
 from loguru import logger
 import asyncio
@@ -529,3 +529,258 @@ async def export_excel(
             "Content-Disposition": f"attachment; filename=share_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         }
     )
+
+
+@router.post("/push-to-channel")
+async def push_to_channel(
+    background_tasks: BackgroundTasks,
+    channel_id: str = Query(..., description="目标频道ID"),
+    channel_name: Optional[str] = Query(None, description="频道名称"),
+    share_ids: Optional[str] = Query(None, description="分享ID列表，逗号分隔"),
+    push_all: bool = Query(False, description="是否推送全部"),
+    account_id: Optional[int] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    """创建推送任务"""
+    from app.services.tg_bot import tg_service
+
+    if not tg_service.bot or not tg_service.is_connected:
+        return {"state": False, "error": "Telegram Bot 未连接"}
+
+    if account_id is None:
+        account_id = await _get_default_account_id()
+    if account_id is None:
+        return {"state": False, "error": "未配置任何账号"}
+
+    # 解析分享ID列表
+    id_list = []
+    if share_ids:
+        try:
+            id_list = [int(x.strip()) for x in share_ids.split(',') if x.strip()]
+        except:
+            return {"state": False, "error": "分享ID格式错误"}
+
+    # 获取要推送的分享链接
+    async with async_session() as session:
+        stmt = select(ShareAnalysisResult).where(
+            ShareAnalysisResult.account_id == account_id,
+            ShareAnalysisResult.is_violated == False,
+            ShareAnalysisResult.is_expired == False,
+            ShareAnalysisResult.is_reviewing == False,
+        )
+
+        # 时间范围过滤
+        if start_date:
+            try:
+                start_ts = int(datetime.strptime(start_date, '%Y-%m-%d').timestamp())
+                stmt = stmt.where(ShareAnalysisResult.create_timestamp >= start_ts)
+            except:
+                pass
+
+        if end_date:
+            try:
+                end_ts = int(datetime.strptime(end_date, '%Y-%m-%d').timestamp())
+                stmt = stmt.where(ShareAnalysisResult.create_timestamp <= end_ts)
+            except:
+                pass
+
+        # 选择特定ID或全部
+        if not push_all and id_list:
+            stmt = stmt.where(ShareAnalysisResult.id.in_(id_list))
+
+        rows = (await session.execute(stmt)).scalars().all()
+
+        if not rows:
+            return {"state": False, "error": "没有符合条件的分享链接"}
+
+        # 创建推送任务
+        task = SharePushTask(
+            account_id=account_id,
+            channel_id=channel_id,
+            channel_name=channel_name or channel_id,
+            status="running",
+            total_count=len(rows),
+            share_ids=[r.id for r in rows],
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        task_id = task.id
+
+    # 启动后台推送
+    background_tasks.add_task(perform_push_task, task_id)
+
+    return {
+        "state": True,
+        "message": f"推送任务已创建，共 {len(rows)} 条分享链接",
+        "task_id": task_id,
+        "total": len(rows)
+    }
+
+
+async def perform_push_task(task_id: int):
+    """执行推送任务"""
+    from app.services.tg_bot import tg_service
+
+    async with async_session() as session:
+        result = await session.execute(select(SharePushTask).where(SharePushTask.id == task_id))
+        task = result.scalar_one_or_none()
+        if not task:
+            return
+
+        share_ids = task.share_ids
+        channel_id = task.channel_id
+
+        for idx, share_id in enumerate(share_ids):
+            # 检查任务状态
+            await session.refresh(task)
+            if task.status == "cancelled":
+                logger.info(f"推送任务 {task_id} 已取消")
+                break
+            elif task.status == "paused":
+                logger.info(f"推送任务 {task_id} 已暂停")
+                while task.status == "paused":
+                    await asyncio.sleep(2)
+                    await session.refresh(task)
+                    if task.status == "cancelled":
+                        break
+
+            if task.status == "cancelled":
+                break
+
+            # 获取分享信息
+            result = await session.execute(
+                select(ShareAnalysisResult).where(ShareAnalysisResult.id == share_id)
+            )
+            row = result.scalar_one_or_none()
+            if not row:
+                task.fail_count += 1
+                continue
+
+            try:
+                # 构建消息
+                msg_text = f"📦 {row.share_title}\n\n"
+
+                # 链接：如果有提取码，直接拼接到URL
+                share_url = row.share_url
+                if row.receive_code:
+                    share_url = f"{row.share_url}?password={row.receive_code}"
+                msg_text += f"🔗 链接: {share_url}\n"
+
+                msg_text += f"📊 大小: {row.size_text}\n"
+                msg_text += f"📅 分享时间: {row.create_time}\n"
+                msg_text += f"👥 接收次数: {row.receive_count}"
+
+                await tg_service.bot.send_message(
+                    chat_id=channel_id,
+                    text=msg_text,
+                )
+                task.success_count += 1
+                logger.info(f"推送成功: {row.share_title}")
+            except Exception as e:
+                logger.error(f"推送失败 {share_id}: {e}")
+                task.fail_count += 1
+
+            task.current_index = idx + 1
+            await session.commit()
+            await asyncio.sleep(1.5)  # 避免频率限制
+
+        # 任务完成
+        if task.status != "cancelled":
+            task.status = "completed"
+        await session.commit()
+        logger.info(f"推送任务 {task_id} 完成: 成功 {task.success_count}, 失败 {task.fail_count}")
+
+
+@router.get("/push-tasks")
+async def get_push_tasks(account_id: Optional[int] = None):
+    """获取推送任务列表"""
+    if account_id is None:
+        account_id = await _get_default_account_id()
+
+    async with async_session() as session:
+        stmt = select(SharePushTask).where(SharePushTask.account_id == account_id).order_by(SharePushTask.created_at.desc())
+        rows = (await session.execute(stmt)).scalars().all()
+
+    return {
+        "state": True,
+        "tasks": [
+            {
+                "id": t.id,
+                "channel_id": t.channel_id,
+                "channel_name": t.channel_name,
+                "status": t.status,
+                "total_count": t.total_count,
+                "success_count": t.success_count,
+                "fail_count": t.fail_count,
+                "current_index": t.current_index,
+                "created_at": t.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            for t in rows
+        ]
+    }
+
+
+@router.post("/push-task/{task_id}/pause")
+async def pause_push_task(task_id: int):
+    """暂停推送任务"""
+    async with async_session() as session:
+        result = await session.execute(select(SharePushTask).where(SharePushTask.id == task_id))
+        task = result.scalar_one_or_none()
+        if not task:
+            return {"state": False, "error": "任务不存在"}
+
+        if task.status != "running":
+            return {"state": False, "error": "任务未在运行中"}
+
+        task.status = "paused"
+        await session.commit()
+
+    return {"state": True, "message": "任务已暂停"}
+
+
+@router.post("/push-task/{task_id}/resume")
+async def resume_push_task(task_id: int):
+    """恢复推送任务"""
+    async with async_session() as session:
+        result = await session.execute(select(SharePushTask).where(SharePushTask.id == task_id))
+        task = result.scalar_one_or_none()
+        if not task:
+            return {"state": False, "error": "任务不存在"}
+
+        if task.status != "paused":
+            return {"state": False, "error": "任务未暂停"}
+
+        task.status = "running"
+        await session.commit()
+
+    return {"state": True, "message": "任务已恢复"}
+
+
+@router.post("/push-task/{task_id}/cancel")
+async def cancel_push_task(task_id: int):
+    """取消推送任务"""
+    async with async_session() as session:
+        result = await session.execute(select(SharePushTask).where(SharePushTask.id == task_id))
+        task = result.scalar_one_or_none()
+        if not task:
+            return {"state": False, "error": "任务不存在"}
+
+        if task.status in ["completed", "cancelled"]:
+            return {"state": False, "error": "任务已结束"}
+
+        task.status = "cancelled"
+        await session.commit()
+
+    return {"state": True, "message": "任务已取消"}
+
+
+@router.delete("/push-task/{task_id}")
+async def delete_push_task(task_id: int):
+    """删除推送任务"""
+    async with async_session() as session:
+        await session.execute(delete(SharePushTask).where(SharePushTask.id == task_id))
+        await session.commit()
+
+    return {"state": True, "message": "任务已删除"}
