@@ -602,6 +602,7 @@ async def push_to_channel(
             status="running",
             total_count=len(rows),
             share_ids=[r.id for r in rows],
+            failed_ids=[],
         )
         session.add(task)
         await session.commit()
@@ -645,7 +646,7 @@ async def perform_push_task(task_id: int):
                     await session.refresh(task)
                     if task.status == "cancelled":
                         break
-
+            
             if task.status == "cancelled":
                 break
 
@@ -681,10 +682,16 @@ async def perform_push_task(task_id: int):
             except Exception as e:
                 logger.error(f"推送失败 {share_id}: {e}")
                 task.fail_count += 1
+                # 记录失败的 ID
+                if task.failed_ids is None:
+                    task.failed_ids = []
+                # 避免重复记录
+                if share_id not in task.failed_ids:
+                    task.failed_ids = task.failed_ids + [share_id] # SQLAlchemy JSON mutation check
 
             task.current_index = idx + 1
             await session.commit()
-            await asyncio.sleep(1.5)  # 避免频率限制
+            await asyncio.sleep(3.5)  # 增加延迟以符合 Telegram 限制 (每分钟最多推送20条)
 
         # 任务完成
         if task.status != "cancelled":
@@ -774,6 +781,45 @@ async def cancel_push_task(task_id: int):
         await session.commit()
 
     return {"state": True, "message": "任务已取消"}
+
+
+@router.post("/push-task/{task_id}/retry")
+async def retry_push_task(background_tasks: BackgroundTasks, task_id: int):
+    """重试推送任务中的失败项"""
+    async with async_session() as session:
+        result = await session.execute(select(SharePushTask).where(SharePushTask.id == task_id))
+        old_task = result.scalar_one_or_none()
+        if not old_task:
+            return {"state": False, "error": "原任务不存在"}
+
+        if not old_task.failed_ids:
+            return {"state": False, "error": "没有失败的项目可以重试"}
+
+        failed_ids = old_task.failed_ids
+        
+        # 创建新任务
+        new_task = SharePushTask(
+            account_id=old_task.account_id,
+            channel_id=old_task.channel_id,
+            channel_name=f"{old_task.channel_name} (重试)",
+            status="running",
+            total_count=len(failed_ids),
+            share_ids=failed_ids,
+            failed_ids=[],
+        )
+        session.add(new_task)
+        await session.commit()
+        await session.refresh(new_task)
+        new_task_id = new_task.id
+
+    # 启动后台推送
+    background_tasks.add_task(perform_push_task, new_task_id)
+
+    return {
+        "state": True,
+        "message": f"已创建重试任务，共 {len(failed_ids)} 条",
+        "task_id": new_task_id
+    }
 
 
 @router.delete("/push-task/{task_id}")

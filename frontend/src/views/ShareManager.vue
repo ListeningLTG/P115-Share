@@ -48,7 +48,7 @@
           推送任务
         </a-button>
         <div v-if="isAnalyzing" style="font-size: 12px; color: #999">
-          扫描中: {{ scannedCount }} / {{ statsTotal }} ({{ statsTotal > 0 ? Math.round(scannedCount / statsTotal * 100) : 0 }}%)
+          扫描中: {{ scannedCount }} / {{ statsTotal }} ({{ statsTotal > 0 ? (scannedCount / statsTotal * 100).toFixed(2) : 0 }}%)
         </div>
 
         <!-- 搜索和筛选：仅在有分析结果时显示 -->
@@ -196,7 +196,7 @@
           <template v-if="column.key === 'progress'">
             <div style="display: flex; align-items: center; gap: 8px">
               <a-progress
-                :percent="Math.round((record.current_index / record.total_count) * 100)"
+                :percent="Number(((record.current_index / record.total_count) * 100).toFixed(2))"
                 :status="record.status === 'completed' ? 'success' : record.status === 'cancelled' ? 'exception' : 'active'"
                 size="small"
                 style="flex: 1; margin: 0"
@@ -244,6 +244,14 @@
                 @click="deletePushTask(record.id)"
               >
                 删除
+              </a-button>
+              <a-button
+                v-if="(record.status === 'completed' || record.status === 'cancelled') && record.fail_count > 0"
+                type="link"
+                size="small"
+                @click="retryPushTask(record.id)"
+              >
+                重试失败项
               </a-button>
             </a-space>
           </template>
@@ -653,6 +661,21 @@ const deletePushTask = async (taskId: number) => {
       }
     }
   });
+};
+
+const retryPushTask = async (taskId: number) => {
+  try {
+    const response = await axios.post(`/api/share/push-task/${taskId}/retry`);
+    if (response.data.state) {
+      message.success(response.data.message);
+      loadPushTasks();
+      startPushTaskPolling();
+    } else {
+      message.error(response.data.error || '重试失败');
+    }
+  } catch (error) {
+    message.error('重试请求失败');
+  }
 };
 
 const getPushStatusText = (status: string) => {

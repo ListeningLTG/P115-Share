@@ -1,7 +1,7 @@
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiohttp_socks import ProxyConnector
 from app.core.config import settings
 from app.services.p115 import p115_service
@@ -62,6 +62,10 @@ class TGService:
                         wait_time = base_delay * (2 ** attempt)
                         logger.warning(f"Bot network error: {e}. Retrying ({attempt + 1}/{max_retries}) in {wait_time:.1f}s...")
                         await asyncio.sleep(wait_time)
+                    except TelegramRetryAfter as e:
+                        logger.warning(f"Flood control exceeded. Waiting for {e.retry_after} seconds before retrying...")
+                        await asyncio.sleep(e.retry_after)
+                        continue
                     except Exception as e:
                         # 非网络错误直接抛出，不重试
                         logger.error(f"Bot API non-network error: {e}")
