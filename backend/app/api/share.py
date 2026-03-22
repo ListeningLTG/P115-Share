@@ -541,6 +541,8 @@ async def push_to_channel(
     account_id: Optional[int] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    interval_min: int = Query(3, description="推送间隔(秒)下限"),
+    interval_max: int = Query(5, description="推送间隔(秒)上限"),
 ):
     """创建推送任务"""
     from app.services.tg_bot import tg_service
@@ -603,6 +605,8 @@ async def push_to_channel(
             total_count=len(rows),
             share_ids=[r.id for r in rows],
             failed_ids=[],
+            interval_min=interval_min,
+            interval_max=interval_max,
         )
         session.add(task)
         await session.commit()
@@ -691,7 +695,9 @@ async def perform_push_task(task_id: int):
 
             task.current_index = idx + 1
             await session.commit()
-            await asyncio.sleep(3.5)  # 增加延迟以符合 Telegram 限制 (每分钟最多推送20条)
+            import random
+            delay = random.uniform(task.interval_min, task.interval_max)
+            await asyncio.sleep(delay)  # 增加延迟以符合 Telegram 限制 (每分钟最多推送20条)
 
         # 任务完成
         if task.status != "cancelled":

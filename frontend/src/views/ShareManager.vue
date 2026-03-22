@@ -157,6 +157,17 @@
           />
         </a-form-item>
 
+        <a-form-item label="推送间隔（秒）">
+          <div style="display: flex; align-items: center">
+            <a-input-number v-model:value="pushIntervalMin" :min="1" :max="300" style="width: 100px; text-align: center" />
+            <span style="margin: 0 8px">-</span>
+            <a-input-number v-model:value="pushIntervalMax" :min="1" :max="300" style="width: 100px; text-align: center" />
+          </div>
+          <div style="margin-top: 8px; color: #999; font-size: 12px">
+            每次推送之间的间隔时间，将在这两个值之间随机（默认 3-5 秒）
+          </div>
+        </a-form-item>
+
         <a-alert
           v-if="pushMode === 'all'"
           message="将推送所有正常状态的分享链接，请谨慎操作"
@@ -301,6 +312,8 @@ const showPushModal = ref(false);
 const pushChannelId = ref<string>('');
 const pushMode = ref<'selected' | 'all'>('selected');
 const pushDateRange = ref<[Dayjs, Dayjs] | null>(null);
+const pushIntervalMin = ref<number>(3);
+const pushIntervalMax = ref<number>(5);
 const pushLoading = ref(false);
 const selectedRowKeys = ref<number[]>([]);
 const channelList = ref<Array<{ id: string; name: string }>>([]);
@@ -545,6 +558,8 @@ const handlePushToChannel = async () => {
       channel_name: selectedChannel?.name || pushChannelId.value,
       push_all: pushMode.value === 'all',
       account_id: selectedAccountId.value,
+      interval_min: pushIntervalMin.value,
+      interval_max: pushIntervalMax.value,
     };
 
     if (pushMode.value === 'selected') {

@@ -181,6 +181,8 @@ class SharePushTask(Base):
     total_count: Mapped[int] = mapped_column(Integer, default=0)
     success_count: Mapped[int] = mapped_column(Integer, default=0)
     fail_count: Mapped[int] = mapped_column(Integer, default=0)
+    interval_min: Mapped[int] = mapped_column(Integer, default=3)
+    interval_max: Mapped[int] = mapped_column(Integer, default=5)
     current_index: Mapped[int] = mapped_column(Integer, default=0)
     share_ids: Mapped[dict] = mapped_column(JSON, default=list)  # 要推送的分享ID列表
     failed_ids: Mapped[dict] = mapped_column(JSON, default=list)  # 推送失败的分享ID列表
