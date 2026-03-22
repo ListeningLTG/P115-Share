@@ -822,7 +822,10 @@ class P115Service:
                 "share_url": share_url,
                 "recursive_links": recursive_links if 'recursive_links' in locals() else [],
                 "metadata": metadata or {},
-                "have_vio": have_vio_file == 1
+                "have_vio": have_vio_file == 1,
+                "original_total_size": total_size,
+                "original_file_count": int(share_info.get("count", 0) or share_info.get("file_count", 0)),
+                "original_folder_count": int(share_info.get("folder_count", 0))
             }
         except Exception as e:
             # 彻底避免 loguru 格式化异常时可能触发的 KeyError
@@ -1374,48 +1377,91 @@ class P115Service:
 
         to_cid = save_result.get("to_cid")
         names = save_result.get("names", [])
+        original_total_size = save_result.get("original_total_size", 0)
+        original_file_count = save_result.get("original_file_count", 0)
+        original_folder_count = save_result.get("original_folder_count", 0)
+
+        # 有时候外层分享根节点如果算数的话，可能有轻微误差（原分享有1个文件夹A包含了3个子文件夹，新转存的到C中只有这一棵树）
+        # 所以我们重点打印它，并允许极小误差
+        logger.info(f"📊 [基准比对数据] 转存源分享规模: 大小 = {original_total_size} 字节, 文件数 = {original_file_count}, 文件夹数 = {original_folder_count}")
 
         try:
-            # 等待 115 异步处理转存，轮询子目录直到文件出现或稳定
-            logger.info(f"⏳ 等待文件写入子目录 (CID: {to_cid})...")
+            logger.info(f"⏳ 等待文件深度属性写入子孙目录 (CID: {to_cid})...")
 
             new_fids = []
-            prev_ids: set = set()
-            max_poll_attempts = 10
+            prev_total_count = -1
+            prev_size_str = ""
+            stable_times = 0
+            max_poll_attempts = 45 # 最多等待约 90s
+            min_stable_required = 3 # 稳定不变的次数要求
 
             for poll_attempt in range(1, max_poll_attempts + 1):
                 try:
-                    logger.info(f"🔍 快照子目录 (第 {poll_attempt}/{max_poll_attempts} 次), CID: {to_cid}")
+                    logger.debug(f"🔍 探测子目录属性详情 (第 {poll_attempt}/{max_poll_attempts} 次), CID: {to_cid}")
+                    
+                    # 1. 尝试用你想要的方案：调用类 `fs_category_get` 获取实时深度体积
+                    resp = await self._api_call_with_timeout(
+                        self.client.fs_category_get_app, to_cid,
+                        async_=True, timeout=10, max_retries=1, label="fs_category_get_poll",
+                        **self._get_ios_ua_kwargs()
+                    )
+                    logger.info(f"📋 [深度属性 RAW API 完整响应] {resp}")
+                    
+                    # 2. 从原生响应中直接读取（而不是从 data 中读）
+                    current_file_count = int(resp.get("count", 0) or resp.get("file_count", 0))
+                    current_folder_count = int(resp.get("folder_count", 0))
+                    current_total = current_file_count + current_folder_count
+                    current_size_str = str(resp.get("size", "0"))
+
+                    logger.info(f"⚖️ [比对进程] 当前挂载层级统计: 大小={current_size_str} (基准: {original_total_size} 字节), 文件数={current_file_count}, 文件夹数={current_folder_count}")
+
+                    # 3. 结合原先的顶部结构验证，确保外层骨架确实建好了
                     current_ids = await self._snapshot_dir_ids(to_cid)
 
-                    if len(current_ids) >= len(names):
-                        logger.info(f"✅ 子目录已有 {len(current_ids)} 个文件/文件夹，继续创建分享")
-                        new_fids = list(current_ids)
-                        break
-
-                    # 数量不足但已稳定（连续两次相同），也继续
-                    if current_ids and current_ids == prev_ids:
-                        logger.info(f"✅ 子目录文件已稳定，共 {len(current_ids)} 个（预期 {len(names)} 个）")
-                        new_fids = list(current_ids)
-                        break
-
-                    if current_ids:
-                        logger.debug(f"🔄 子目录已有 {len(current_ids)}/{len(names)} 个，继续等待...")
+                    # 判断规则：只要检测到当前有合并节点（current_total > 0）
+                    if current_total > 0:
+                        if current_total == prev_total_count and current_size_str == prev_size_str:
+                            stable_times += 1
+                            logger.info(f"🔄 目标目录总项数 ({current_total}) 和大小 ({current_size_str}) 保持不变... (连续稳固 {stable_times}/{min_stable_required} 次)")
+                            if stable_times >= min_stable_required:
+                                logger.info(f"✅ 录像稳定！后台大目录深层挂载确认已彻底完成！最终合集项数: {current_total}")
+                                final_ids = await self._snapshot_dir_ids(to_cid)
+                                new_fids = list(final_ids)
+                                break
+                        else:
+                            # 数量或层级大小有变化，表示还在激烈复制挂载
+                            logger.info(f"📈 目录树深度挂载中... （项数变化 {prev_total_count} -> {current_total}, 尺寸 {prev_size_str} -> {current_size_str}）")
+                            stable_times = 0
                     else:
-                        logger.warning(f"⚠️ 子目录暂无文件 (第 {poll_attempt}/{max_poll_attempts} 次)")
+                        # Fallback：深度属性接口失效（被115缓存卡在 0 了），这时候靠最外层的 fallback 检测机制！
+                        if current_ids and len(current_ids) >= len(names):
+                            if current_total == prev_total_count: # (即 0 == 0)
+                                stable_times += 1
+                                logger.info(f"⚠️ 深度属性(大小)因 115 缓存一直为 0。但顶层目录已就绪，当前进入强制平稳期等待... ({stable_times}/{min_stable_required})")
+                                if stable_times >= min_stable_required:
+                                    logger.info(f"✅ 录稳期结束。为防止深层未挂载，安全追加 10 秒死等...")
+                                    await asyncio.sleep(10)
+                                    new_fids = list(current_ids)
+                                    break
+                        else:
+                            logger.warning(f"⚠️ 顶层子目录仍为空...")
+                            stable_times = 0
 
-                    prev_ids = current_ids
+                    prev_total_count = current_total
+                    prev_size_str = current_size_str
+                    
                     if poll_attempt < max_poll_attempts:
                         await asyncio.sleep(2)
 
                 except Exception as e:
-                    logger.warning(f"⚠️ 快照子目录失败 (第 {poll_attempt}/{max_poll_attempts} 次): {e}")
+                    logger.error(f"⚠️ 检索目录内容或属性失败 (第 {poll_attempt} 次): {e}", exc_info=True)
                     if poll_attempt < max_poll_attempts:
                         await asyncio.sleep(5)
 
             if not new_fids:
-                logger.warning(f"⚠️ 子目录 {to_cid} 中未检测到任何文件，可能 115 处理延迟或转存失败")
+                logger.warning(f"⚠️ 子目录 {to_cid} 中最终未检测到任何文件，可能 115 处理延迟或转存失败")
                 return None
+
             
             # 7. Create new share with retry mechanism and split if > 10,000 files
             share_links = []
