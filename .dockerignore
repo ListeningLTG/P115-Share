@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.github
+data
+backend/data
+backend/logs
+**/__pycache__
+*.pyc
+.env
+.idea
+.vscode
+*.log
