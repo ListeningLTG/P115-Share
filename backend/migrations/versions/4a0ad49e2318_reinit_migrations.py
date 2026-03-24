@@ -29,9 +29,12 @@ def upgrade() -> None:
     # 检查字段是否已存在，避免重复添加
     conn = op.get_bind()
     inspector = sa.inspect(conn)
-    columns = [col['name'] for col in inspector.get_columns('excel_tasks')]
-    if 'target_channels' not in columns:
-        op.add_column('excel_tasks', sa.Column('target_channels', sa.JSON(), nullable=True))
+    
+    # 检查表是否存在，避免在全新安装时报错
+    if inspector.has_table('excel_tasks'):
+        columns = [col['name'] for col in inspector.get_columns('excel_tasks')]
+        if 'target_channels' not in columns:
+            op.add_column('excel_tasks', sa.Column('target_channels', sa.JSON(), nullable=True))
 
     # op.alter_column('link_history', 'share_link',
     #            existing_type=sa.VARCHAR(length=255),
