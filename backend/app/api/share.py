@@ -7,7 +7,7 @@ from app.services.account_manager import account_manager
 from app.core.config import settings
 from app.core.database import async_session
 from app.models.schema import ShareAnalysisResult, ShareAnalysisState, P115Account, SharePushTask
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, desc
 from loguru import logger
 import asyncio
 import time
@@ -543,6 +543,8 @@ async def push_to_channel(
     end_date: Optional[str] = None,
     interval_min: int = Query(3, description="推送间隔(秒)下限"),
     interval_max: int = Query(5, description="推送间隔(秒)上限"),
+    skip_count: int = Query(0, ge=0, description="跳过前N条"),
+    stop_at: int = Query(0, ge=0, description="到第M条停止，0表示不限制"),
 ):
     """创建推送任务"""
     from app.services.tg_bot import tg_service
@@ -554,6 +556,9 @@ async def push_to_channel(
         account_id = await _get_default_account_id()
     if account_id is None:
         return {"state": False, "error": "未配置任何账号"}
+
+    if stop_at > 0 and stop_at <= skip_count:
+        return {"state": False, "error": "第几条停止必须大于跳过前几条（0 表示不限制）"}
 
     # 解析分享ID列表
     id_list = []
@@ -591,7 +596,14 @@ async def push_to_channel(
         if not push_all and id_list:
             stmt = stmt.where(ShareAnalysisResult.id.in_(id_list))
 
+        # 固定排序，确保 skip/stop 语义稳定
+        stmt = stmt.order_by(desc(ShareAnalysisResult.create_timestamp), desc(ShareAnalysisResult.id))
+
         rows = (await session.execute(stmt)).scalars().all()
+
+        # 对过滤结果执行范围内跳过/停止
+        end_index = stop_at if stop_at > 0 else None
+        rows = rows[skip_count:end_index]
 
         if not rows:
             return {"state": False, "error": "没有符合条件的分享链接"}

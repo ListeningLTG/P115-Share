@@ -123,6 +123,7 @@
       v-model:open="showPushModal"
       title="推送分享链接到频道"
       @ok="handlePushToChannel"
+      @cancel="resetPushRangeOptions"
       :confirm-loading="pushLoading"
       width="600px"
     >
@@ -155,6 +156,20 @@
             style="width: 100%"
             format="YYYY-MM-DD"
           />
+        </a-form-item>
+
+        <a-form-item label="范围内序号控制（可选）">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
+            <span>跳过前</span>
+            <a-input-number v-model:value="pushSkipCount" :min="0" :precision="0" style="width: 100px; text-align: center" />
+            <span>条</span>
+            <span style="margin-left: 8px">第</span>
+            <a-input-number v-model:value="pushStopAt" :min="0" :precision="0" style="width: 100px; text-align: center" />
+            <span>条停止</span>
+          </div>
+          <div style="margin-top: 8px; color: #999; font-size: 12px">
+            默认 0 表示不生效；启用分享时间范围时，将在范围内结果中执行跳过与停止
+          </div>
         </a-form-item>
 
         <a-form-item label="推送间隔（秒）">
@@ -312,6 +327,8 @@ const showPushModal = ref(false);
 const pushChannelId = ref<string>('');
 const pushMode = ref<'selected' | 'all'>('selected');
 const pushDateRange = ref<[Dayjs, Dayjs] | null>(null);
+const pushSkipCount = ref<number>(0);
+const pushStopAt = ref<number>(0);
 const pushIntervalMin = ref<number>(3);
 const pushIntervalMax = ref<number>(5);
 const pushLoading = ref(false);
@@ -539,6 +556,11 @@ const handleExport = async ({ key }: { key: string }) => {
   }
 };
 
+const resetPushRangeOptions = () => {
+  pushSkipCount.value = 0;
+  pushStopAt.value = 0;
+};
+
 const handlePushToChannel = async () => {
   if (!pushChannelId.value) {
     message.error('请选择目标频道');
@@ -547,6 +569,11 @@ const handlePushToChannel = async () => {
 
   if (pushMode.value === 'selected' && selectedRowKeys.value.length === 0) {
     message.error('请至少选择一条分享链接');
+    return;
+  }
+
+  if (pushStopAt.value > 0 && pushStopAt.value <= pushSkipCount.value) {
+    message.error('“第几条停止”必须大于“跳过前几条”（0 表示不生效）');
     return;
   }
 
@@ -560,6 +587,8 @@ const handlePushToChannel = async () => {
       account_id: selectedAccountId.value,
       interval_min: pushIntervalMin.value,
       interval_max: pushIntervalMax.value,
+      skip_count: pushSkipCount.value,
+      stop_at: pushStopAt.value,
     };
 
     if (pushMode.value === 'selected') {
@@ -577,6 +606,7 @@ const handlePushToChannel = async () => {
       message.success(`推送任务已创建，共 ${response.data.total} 条`);
       showPushModal.value = false;
       selectedRowKeys.value = [];
+      resetPushRangeOptions();
       showPushTasksModal.value = true;
       loadPushTasks();
       startPushTaskPolling();
