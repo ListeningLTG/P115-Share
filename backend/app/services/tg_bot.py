@@ -750,12 +750,18 @@ class TGService:
         """Post to a single channel with multiple link replacements"""
         channel_id = channel_config.get("id")
         is_concise = channel_config.get("concise", False)
+        remove_image = channel_config.get("remove_image", False)
         
         if not channel_id:
             return
             
         full_text = metadata.get("full_text", "")
         photo_id = metadata.get("photo_id")
+
+        # Handle remove_image setting: if enabled and not in concise mode, 
+        # force sending as text-only message by stripping the photo_id.
+        if remove_image and not is_concise:
+            photo_id = None
         entities_raw = metadata.get("entities", [])
         
         from aiogram.types import MessageEntity

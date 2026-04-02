@@ -43,6 +43,10 @@
                     <span class="switch-label">自动转发</span>
                     <a-switch v-model:checked="channel.auto_forward" size="small" />
                   </span>
+                  <span class="switch-item">
+                    <span class="switch-label">移除图片</span>
+                    <a-switch v-model:checked="channel.remove_image" :disabled="channel.concise" size="small" />
+                  </span>
                 </a-space>
               </a-col>
               <a-col :flex="'60px'" style="text-align: right">
@@ -155,6 +159,7 @@ interface ChannelConfig {
   enabled: boolean;
   concise: boolean;
   auto_forward: boolean;
+  remove_image: boolean;
   name?: string;
   loading?: boolean;
 }
@@ -175,7 +180,7 @@ const formState = reactive({
 });
 
 const addChannel = () => {
-  tgChannels.value.push({ id: '', enabled: true, concise: false, auto_forward: true, name: '' });
+  tgChannels.value.push({ id: '', enabled: true, concise: false, auto_forward: true, remove_image: false, name: '' });
 };
 
 const removeChannel = (index: number) => {
@@ -221,7 +226,8 @@ const loadConfig = async () => {
           ...c,
           enabled: c.enabled !== undefined ? c.enabled : true,
           concise: c.concise !== undefined ? c.concise : false,
-          auto_forward: c.auto_forward !== undefined ? c.auto_forward : true
+          auto_forward: c.auto_forward !== undefined ? c.auto_forward : true,
+          remove_image: c.remove_image !== undefined ? c.remove_image : false
         }));
       } catch (e) {
         console.error("Failed to parse tg_channels:", e);
@@ -229,7 +235,7 @@ const loadConfig = async () => {
       }
     } else if (res.data.tg_channel_id) {
       // Compatibility for old single channel
-      tgChannels.value = [{ id: res.data.tg_channel_id, enabled: true, concise: false, auto_forward: true }];
+      tgChannels.value = [{ id: res.data.tg_channel_id, enabled: true, concise: false, auto_forward: true, remove_image: false }];
     }
     
     formState.proxy_enabled = res.data.proxy_enabled || false;
