@@ -751,6 +751,7 @@ class TGService:
         channel_id = channel_config.get("id")
         is_concise = channel_config.get("concise", False)
         remove_image = channel_config.get("remove_image", False)
+        flatten_link = channel_config.get("flatten_link", False)
         
         if not channel_id:
             return
@@ -806,6 +807,34 @@ class TGService:
                 new_text, new_entities = self._replace_text_and_adjust_entities(
                     new_text, new_entities, old_url, new_url
                 )
+                
+                # If flattening is enabled, also find any text_link entities pointing to this old_url
+                # and replace their label with the new URL.
+                if flatten_link:
+                    # We iterate on a copy because _replace_text_and_adjust_entities modifies the list
+                    # and we need to find entities that MAY NOT have been modified yet or were modified.
+                    # Actually, the most robust way is to scan current new_entities.
+                    i = 0
+                    while i < len(new_entities):
+                        e = new_entities[i]
+                        # Check both the updated URL and potentially the old URL if not yet updated
+                        if e.type == "text_link" and (e.url == new_url or e.url == old_url):
+                            # Get the text covered by this entity
+                            u16_text = new_text.encode('utf-16-le')
+                            label_u16 = u16_text[e.offset*2 : (e.offset + e.length)*2]
+                            label_text = label_u16.decode('utf-16-le', errors='ignore')
+                            
+                            if label_text != new_url:
+                                # Replace this specific label with the URL
+                                # We need a version of replace that only replaces at a specific offset
+                                # but for simplicity, if label_text is distinct enough, we can use the helper
+                                # or better, implement a positional replace.
+                                new_text, new_entities = self._replace_text_at_offset(
+                                    new_text, new_entities, e.offset, e.length, new_url
+                                )
+                                # Re-check entities from start because indices/offsets changed
+                                i = -1 
+                        i += 1
             
             # 2. Update all access codes
             new_text, new_entities = self._update_access_codes(new_text, new_entities, share_links_map)
@@ -950,6 +979,54 @@ class TGService:
                 if e_url == old_str:
                     e_url = new_str
 
+                new_entities.append(MessageEntity(
+                    type=e_type,
+                    offset=e_offset,
+                    length=e_length,
+                    url=e_url,
+                    user=entity.get("user") if is_dict else getattr(entity, "user", None),
+                    language=entity.get("language") if is_dict else getattr(entity, "language", None),
+                    custom_emoji_id=entity.get("custom_emoji_id") if is_dict else getattr(entity, "custom_emoji_id", None)
+                ))
+        return new_text, new_entities
+
+    def _replace_text_at_offset(self, text: str, entities: list, offset_u16: int, length_u16: int, new_str: str):
+        """Helper to replace text at a specific UTF-16 position and shift entities"""
+        u16_text = text.encode('utf-16-le')
+        prefix_u16 = u16_text[:offset_u16*2]
+        suffix_u16 = u16_text[(offset_u16 + length_u16)*2:]
+        
+        new_text_prefix = prefix_u16.decode('utf-16-le', errors='ignore')
+        new_text_suffix = suffix_u16.decode('utf-16-le', errors='ignore')
+        new_text = new_text_prefix + new_str + new_text_suffix
+        
+        new_len_u16 = self._get_utf16_len(new_str)
+        diff_u16 = new_len_u16 - length_u16
+        
+        new_entities = []
+        if entities:
+            from aiogram.types import MessageEntity
+            for entity in entities:
+                is_dict = isinstance(entity, dict)
+                e_offset = entity.get("offset") if is_dict else entity.offset
+                e_length = entity.get("length") if is_dict else entity.length
+                e_url = (entity.get("url") if is_dict else getattr(entity, "url", None))
+                e_type = entity.get("type") if is_dict else entity.type
+                
+                # If entity is after the replacement
+                if e_offset >= (offset_u16 + length_u16):
+                    e_offset += diff_u16
+                # If entity IS the one we're replacing (or covers it)
+                elif e_offset == offset_u16 and e_length == length_u16:
+                    e_length = new_len_u16
+                    # If it was a text_link, we change it to url so it's treated as a plain URL
+                    if e_type == "text_link":
+                        e_type = "url"
+                        e_url = None
+                # If entity overlaps or wraps the replacement
+                elif e_offset <= offset_u16 and (e_offset + e_length) >= (offset_u16 + length_u16):
+                    e_length += diff_u16
+                
                 new_entities.append(MessageEntity(
                     type=e_type,
                     offset=e_offset,
