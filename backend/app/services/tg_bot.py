@@ -472,6 +472,8 @@ class TGService:
                         error_msg = "链接已过期"
                     elif err_type == "violated":
                         error_msg = "包含违规内容"
+                    elif err_type == "auth_required":
+                        error_msg = "账号登录已失效，请重新登录"
                     elif res.get("message"):
                         error_msg = res.get("message")
                 failed_details.append((url, error_msg))
@@ -507,6 +509,8 @@ class TGService:
                         error_text = "⚠️ 分享链接已过期"
                     elif err_type == "violated":
                         error_text = f"🚫 {last_res.get('message') or '分享链接包含违规内容'}"
+                    elif err_type == "auth_required":
+                        error_text = "🔐 账号登录已失效，请先在账号管理里重新登录后再试"
                     elif last_res.get("message"):
                         error_text = f"❌ {last_res.get('message')}"
                 

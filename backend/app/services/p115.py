@@ -24,9 +24,11 @@ API_MAX_RETRIES = 3
 API_RETRY_DELAY = 5
 
 # iOS 用户代理
+# app="ios" 对应 ssoent=D1，即「115生活_苹果端」，UA 必须使用 115Life iOS 客户端 UA
+# 注意：「115_苹果端（网盘）」的 app="115ios"，ssoent=D3，两者不能混用
 IOS_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 115wangpan_ios/36.2.20"
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 115Life/8.7.0"
 )
 
 
@@ -563,6 +565,17 @@ class P115Service:
         if not self.client:
             logger.warning("P115Client not initialized, cannot save link")
             return None
+
+        # 预检登录态，避免在后续流程中以泛化异常形式暴露“请重新登录”
+        if not self.is_connected:
+            ok = await self.verify_connection()
+            if not ok:
+                logger.warning("⚠️ 登录态预检失败，需重新登录后再处理分享链接")
+                return {
+                    "status": "error",
+                    "error_type": "auth_required",
+                    "message": "账号登录已失效，请重新登录"
+                }
         
         logger.info(f"📥 开始处理分享链接: {share_url}")
         try:
@@ -901,6 +914,16 @@ class P115Service:
                     "share_url": share_url,
                     "metadata": metadata or {},
                     "db_id": db_id
+                }
+
+            # 检查是否登录失效（常见错误: 请重新登录, errno=99）
+            if errno_val == 99 or "请重新登录" in error_msg:
+                self.is_connected = False
+                logger.warning(f"🔐 检测到账号登录失效: {share_url}")
+                return {
+                    "status": "error",
+                    "error_type": "auth_required",
+                    "message": "账号登录已失效，请重新登录"
                 }
 
             # 检查是否为"已经接收"异常 (errno 4200045)
@@ -1493,11 +1516,18 @@ class P115Service:
                         
                     except Exception as share_error:
                         error_str = str(share_error)
-                        if ("4100005" in error_str or "已被移动或删除" in error_str) and retry_attempt < max_share_retries:
-                            logger.warning(f"⚠️ 文件尚未就绪，等待 5 秒后重试...")
-                            await asyncio.sleep(5)
+                        # margin 字段：115 非标限速响应（仅含 {"margin": N} 无 data），触发重试
+                        is_rate_limited = isinstance(share_error, KeyError) and share_error.args and share_error.args[0] == "margin"
+                        if ("4100005" in error_str or "已被移动或删除" in error_str or is_rate_limited) and retry_attempt < max_share_retries:
+                            wait = 10 if is_rate_limited else 5
+                            logger.warning(f"⚠️ {'115 分享接口触发限速 (margin)' if is_rate_limited else '文件尚未就绪'}，等待 {wait} 秒后重试...")
+                            await asyncio.sleep(wait)
                         else:
-                            logger.error(f"❌ 创建分享分卷 {batch_idx} 失败: {share_error}")
+                            logger.error(
+                                f"❌ 创建分享分卷 {batch_idx} 失败: type={type(share_error).__name__}, "
+                                f"args={getattr(share_error, 'args', ())}, detail={share_error}",
+                                exc_info=True,
+                            )
                             if batch_idx == 1: raise # If even the first batch fails, raise
                             break # Otherwise skip this batch
                 
@@ -1520,7 +1550,11 @@ class P115Service:
             
             if not share_links:
                 logger.error("❌ 未能生成任何分享链接")
-                return None
+                return {
+                    "status": "error",
+                    "error_type": "share_failed",
+                    "message": "未能生成任何分享链接"
+                }
             
             # Format multi-link response if split occurred
             if len(share_links) > 1:
@@ -1536,7 +1570,10 @@ class P115Service:
             return result_share
             
         except Exception as e:
-            logger.error(f"❌ 创建新分享链接失败: {e}")
+            logger.error(
+                f"❌ 创建新分享链接失败: type={type(e).__name__}, args={getattr(e, 'args', ())}, detail={e}",
+                exc_info=True,
+            )
             # 检查是否是由于违规导致的空文件夹分享失败 (errno 4100016)
             error_info = getattr(e, "args", [None, {}])[1] if hasattr(e, "args") and len(e.args) >= 2 else {}
             errno_val = error_info.get("errno") if isinstance(error_info, dict) else None
@@ -1560,7 +1597,28 @@ class P115Service:
                     "metadata": save_result.get("metadata", {})
                 }
 
-            return None
+            # 115 接口偶发返回结构变动时，底层解析可能抛出 KeyError（如 {'margin'}）
+            if isinstance(e, KeyError):
+                missing_key = e.args[0] if e.args else "unknown"
+                return {
+                    "status": "error",
+                    "error_type": "share_response_parse_error",
+                    "message": f"创建分享接口响应缺少关键字段: {missing_key}"
+                }
+
+            if isinstance(error_info, dict) and error_info:
+                api_msg = error_info.get("error") or error_info.get("msg") or error_info.get("message") or str(e)
+                return {
+                    "status": "error",
+                    "error_type": "share_api_error",
+                    "message": f"创建分享接口失败: {api_msg}"
+                }
+
+            return {
+                "status": "error",
+                "error_type": "share_failed",
+                "message": f"创建分享失败: {error_msg}"
+            }
 
     async def cleanup_save_directory(self, wait: bool = True):
         """Clean up the save directory by deleting the entire folder (with locking)."""
