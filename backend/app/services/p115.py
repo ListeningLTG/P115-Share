@@ -1201,17 +1201,41 @@ class P115Service:
                         timeout=API_TIMEOUT, max_retries=1, label=f"share_send_direct_{batch_idx}",
                         **self._get_ios_ua_kwargs()
                     )
+                    
+                    # 主动检测 115 非标限速响应（仅含 {"margin": N}，无 state/data）
+                    if isinstance(send_resp, dict) and "margin" in send_resp and "data" not in send_resp:
+                        margin_val = send_resp.get("margin", 10)
+                        wait = max(int(margin_val), 5)
+                        logger.warning(f"⚠️ 115 分享接口触发限速 (margin={margin_val})，等待 {wait} 秒后重试... (尝试 {retry_attempt}/{max_share_retries})")
+                        if retry_attempt < max_share_retries:
+                            await asyncio.sleep(wait)
+                            continue
+                        else:
+                            raise KeyError("margin")
+                    
                     check_response(send_resp)
-                    data = send_resp["data"]
+                    logger.debug(f"📋 share_send_direct 响应: {send_resp}")
+                    
+                    data = send_resp.get("data")
+                    if not data or not isinstance(data, dict):
+                        logger.warning(f"⚠️ share_send_direct 响应缺少 data 字段: {send_resp}")
+                        if retry_attempt < max_share_retries:
+                            await asyncio.sleep(5)
+                            continue
+                        else:
+                            raise KeyError("data")
+                    
                     batch_share_code = data.get("share_code")
                     batch_receive_code = data.get("receive_code") or data.get("recv_code")
                     logger.info(f"✅ 直接分享分卷 {batch_idx} 创建成功: {batch_share_code}")
                     break
                 except Exception as share_error:
                     error_str = str(share_error)
-                    if ("4100005" in error_str or "已被移动或删除" in error_str) and retry_attempt < max_share_retries:
-                        logger.warning(f"⚠️ 文件尚未就绪，等待 5 秒后重试 (分卷 {batch_idx})...")
-                        await asyncio.sleep(5)
+                    is_rate_limited = isinstance(share_error, KeyError) and share_error.args and share_error.args[0] in ("margin", "data")
+                    if ("4100005" in error_str or "已被移动或删除" in error_str or is_rate_limited) and retry_attempt < max_share_retries:
+                        wait = 10 if is_rate_limited else 5
+                        logger.warning(f"⚠️ {'115 分享接口触发限速' if is_rate_limited else '文件尚未就绪'}，等待 {wait} 秒后重试 (分卷 {batch_idx})...")
+                        await asyncio.sleep(wait)
                     else:
                         logger.error(f"❌ 直接分享分卷 {batch_idx} 失败: {share_error}")
                         if batch_idx == 1:
@@ -1505,9 +1529,30 @@ class P115Service:
                             timeout=API_TIMEOUT, max_retries=1, label=f"share_send_batch_{batch_idx}",
                             **self._get_ios_ua_kwargs()
                         )
-                        check_response(send_resp)
                         
-                        data = send_resp["data"]
+                        # 主动检测 115 非标限速响应（仅含 {"margin": N}，无 state/data）
+                        if isinstance(send_resp, dict) and "margin" in send_resp and "data" not in send_resp:
+                            margin_val = send_resp.get("margin", 10)
+                            wait = max(int(margin_val), 5)
+                            logger.warning(f"⚠️ 115 分享接口触发限速 (margin={margin_val})，等待 {wait} 秒后重试... (尝试 {retry_attempt}/{max_share_retries})")
+                            if retry_attempt < max_share_retries:
+                                await asyncio.sleep(wait)
+                                continue
+                            else:
+                                raise KeyError("margin")
+                        
+                        check_response(send_resp)
+                        logger.debug(f"📋 share_send 响应: {send_resp}")
+                        
+                        data = send_resp.get("data")
+                        if not data or not isinstance(data, dict):
+                            logger.warning(f"⚠️ share_send 响应缺少 data 字段: {send_resp}")
+                            if retry_attempt < max_share_retries:
+                                await asyncio.sleep(5)
+                                continue
+                            else:
+                                raise KeyError("data")
+                        
                         batch_share_code = data.get("share_code")
                         batch_receive_code = data.get("receive_code") or data.get("recv_code")
                         
@@ -1516,11 +1561,11 @@ class P115Service:
                         
                     except Exception as share_error:
                         error_str = str(share_error)
-                        # margin 字段：115 非标限速响应（仅含 {"margin": N} 无 data），触发重试
-                        is_rate_limited = isinstance(share_error, KeyError) and share_error.args and share_error.args[0] == "margin"
+                        # margin / data 缺失：115 非标限速响应，触发重试
+                        is_rate_limited = isinstance(share_error, KeyError) and share_error.args and share_error.args[0] in ("margin", "data")
                         if ("4100005" in error_str or "已被移动或删除" in error_str or is_rate_limited) and retry_attempt < max_share_retries:
                             wait = 10 if is_rate_limited else 5
-                            logger.warning(f"⚠️ {'115 分享接口触发限速 (margin)' if is_rate_limited else '文件尚未就绪'}，等待 {wait} 秒后重试...")
+                            logger.warning(f"⚠️ {'115 分享接口触发限速' if is_rate_limited else '文件尚未就绪'}，等待 {wait} 秒后重试...")
                             await asyncio.sleep(wait)
                         else:
                             logger.error(
