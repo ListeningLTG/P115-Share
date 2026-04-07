@@ -341,6 +341,14 @@ class TGService:
                         
                         asyncio.create_task(self.poll_pending_link(message, save_res))
                         return save_res, None
+                    elif save_res.get("status") == "margin_limited":
+                        logger.info(f"⏳ 分享被限制 (margin)，已加入排队: {share_url}")
+                        await message.reply(
+                            f"⏳ 分享被限制，文件已转存成功。\n"
+                            f"系统将在检测到解除限制后，自动继续创建分享并推送。\n"
+                            f"📋 当前排队: {svc.margin_queue_size} 个任务"
+                        )
+                        return save_res, None
                     elif save_res.get("status") == "error":
                         error_type = save_res.get("error_type")
                         error_msg = save_res.get("message") or "未知错误"

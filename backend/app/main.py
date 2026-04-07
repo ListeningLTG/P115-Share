@@ -20,6 +20,11 @@ from app.api.sensitive import router as sensitive_router
 from app.services.tg_bot import tg_service
 from app.version import VERSION
 
+# 启动时清除进程级代理环境变量，防止 docker-compose 注入的 HTTP_PROXY 等
+# 被 httpcore/aiohttp 自动读取，导致 P115Client 意外走代理
+for _proxy_key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+    os.environ.pop(_proxy_key, None)
+
 # Setup Loguru to capture standard logging
 class InterceptHandler(logging.Handler):
     def emit(self, record):

@@ -48,8 +48,6 @@ class Settings(BaseSettings):
     PROXY_USER: str = ""
     PROXY_PASS: str = ""
     PROXY_TYPE: str = "HTTP" # Options: HTTP, SOCKS5
-    HTTP_PROXY: str = ""
-    HTTPS_PROXY: str = ""
 
     def _migrate_columns(self, conn):
         """Check all model tables for missing columns and add them via ALTER TABLE"""

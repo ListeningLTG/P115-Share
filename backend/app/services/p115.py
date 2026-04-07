@@ -59,6 +59,10 @@ class P115Service:
         self._batch_yield_count: int = 0     # 批量任务避让次数统计
         self._batch_yield_total_time: float = 0.0  # 批量任务避让累计时间
 
+        # margin 限速重试队列：存放 (save_result, metadata) 元组
+        self._margin_retry_queue: deque = deque()
+        self._margin_poller_task: Optional[asyncio.Task] = None
+
         if account is None and settings.P115_COOKIE:
             self.init_client(settings.P115_COOKIE)
 
@@ -156,6 +160,19 @@ class P115Service:
         except Exception as e:
             logger.warning(f"持久化风控状态失败: {e}")
 
+    @staticmethod
+    def _is_margin_response(resp) -> bool:
+        """检测 115 API 是否返回了限速响应 {"margin": N}。
+        这种响应没有 state/data 等正常字段，仅含 margin 秒数。
+        """
+        return (
+            isinstance(resp, dict)
+            and "margin" in resp
+            and "data" not in resp
+            and "state" not in resp
+            and "count" not in resp
+        )
+
     def _get_ios_ua_kwargs(self):
         """获取 iOS 用户代理相关的参数"""
         return {
@@ -236,26 +253,11 @@ class P115Service:
 
     def init_client(self, cookie: str):
         try:
-            # Apply proxy settings to environment if configured
-            import os
-            if settings.PROXY_ENABLED and settings.PROXY_HOST and settings.PROXY_PORT:
-                proxy_type = settings.PROXY_TYPE.lower()
-                auth = f"{settings.PROXY_USER}:{settings.PROXY_PASS}@" if settings.PROXY_USER and settings.PROXY_PASS else ""
-                proxy_url = f"{proxy_type}://{auth}{settings.PROXY_HOST}:{settings.PROXY_PORT}"
-                
-                os.environ['HTTP_PROXY'] = proxy_url
-                os.environ['http_proxy'] = proxy_url
-                os.environ['HTTPS_PROXY'] = proxy_url
-                os.environ['https_proxy'] = proxy_url
-                
             self.client = P115Client(cookie, check_for_relogin=True)
             self.fs = P115FileSystem(self.client)
             self.clear_save_dir_cache()
             
-            proxy_info = ""
-            if settings.PROXY_ENABLED:
-                proxy_info = f" (Proxy: {settings.PROXY_TYPE}://{settings.PROXY_HOST}:{settings.PROXY_PORT})"
-            logger.info(f"P115Client and FileSystem initialized successfully{proxy_info}")
+            logger.info("P115Client and FileSystem initialized successfully (direct, no proxy)")
             # Verify connection asynchronously
             asyncio.create_task(self.verify_connection())
         except Exception as e:
@@ -544,6 +546,15 @@ class P115Service:
                 share_res = await self.create_share_link(save_res)
                 if isinstance(share_res, str):
                     return {"status": "success", "share_link": share_res}
+                elif isinstance(share_res, dict) and share_res.get("status") == "margin_limited":
+                    # margin 限速 → 入队等待
+                    self._enqueue_margin_retry(share_res.get("save_result"), metadata)
+                    return {
+                        "status": "margin_limited",
+                        "message": "分享被限制，将在检测到解除限制后继续分享",
+                        "share_url": share_url,
+                        "metadata": metadata or {}
+                    }
                 elif isinstance(share_res, dict) and share_res.get("status") == "error":
                     # 将创建分享时的特定错误映射回转存结果
                     return {
@@ -559,6 +570,163 @@ class P115Service:
             return save_res
 
         return await self._enqueue_op(f"save_and_share({share_url})", _internal_flow, is_batch=is_batch)
+
+    # ── margin 限速排队重试机制 ────────────────────────────────
+
+    def _enqueue_margin_retry(self, save_result: dict, metadata: dict = None):
+        """将 margin 限速的任务加入排队队列，并启动后台轮询器"""
+        self._margin_retry_queue.append({
+            "save_result": save_result,
+            "metadata": metadata or {},
+            "share_url": save_result.get("share_url", ""),
+            "enqueue_time": time.time()
+        })
+        queue_len = len(self._margin_retry_queue)
+        logger.info(f"📋 margin 排队: {save_result.get('share_url', '?')} (队列长度: {queue_len})")
+        self._ensure_margin_poller()
+
+    def _ensure_margin_poller(self):
+        """确保 margin 轮询器正在运行"""
+        if self._margin_poller_task is None or self._margin_poller_task.done():
+            self._margin_poller_task = asyncio.create_task(self._margin_retry_poller())
+            logger.info("🔄 margin 排队轮询器已启动")
+
+    @property
+    def margin_queue_size(self) -> int:
+        return len(self._margin_retry_queue)
+
+    async def _margin_retry_poller(self):
+        """后台每 5 分钟用队列头部任务探测限速是否解除，解除后逐个处理队列"""
+        POLL_INTERVAL = 300  # 5 分钟
+        logger.info(f"⏰ margin 轮询器开始运行，队列中有 {len(self._margin_retry_queue)} 个任务")
+
+        while self._margin_retry_queue:
+            await asyncio.sleep(POLL_INTERVAL)
+
+            if not self._margin_retry_queue:
+                break
+
+            # 用队列第一个任务探测
+            probe_item = self._margin_retry_queue[0]
+            probe_url = probe_item.get("share_url", "?")
+            logger.info(f"🔍 margin 探测: 尝试为 {probe_url} 创建分享链接...")
+
+            try:
+                result = await self.create_share_link(probe_item["save_result"])
+            except Exception as e:
+                logger.error(f"❌ margin 探测异常: {e}")
+                result = None
+
+            # 判断探测结果
+            if isinstance(result, str):
+                # 成功！限速已解除，处理这个任务并继续处理队列
+                logger.info(f"✅ margin 限速已解除！探测任务成功: {probe_url}")
+                self._margin_retry_queue.popleft()
+                await self._margin_task_success(probe_item, result)
+
+                # 通知用户限速解除
+                try:
+                    from app.services.tg_bot import tg_service
+                    if tg_service:
+                        remaining = len(self._margin_retry_queue)
+                        await tg_service.send_admin_msg(
+                            f"🔓 115 分享限速已解除！\n"
+                            f"✅ 已完成: {probe_url}\n"
+                            f"📋 队列中还有 {remaining} 个待处理任务，正在逐个处理..."
+                        )
+                except Exception as e:
+                    logger.warning(f"发送限速解除通知失败: {e}")
+
+                # 逐个处理剩余队列
+                while self._margin_retry_queue:
+                    item = self._margin_retry_queue[0]
+                    item_url = item.get("share_url", "?")
+                    logger.info(f"📤 margin 队列处理: {item_url}")
+                    try:
+                        item_result = await self.create_share_link(item["save_result"])
+                    except Exception as e:
+                        logger.error(f"❌ margin 队列处理异常: {item_url}: {e}")
+                        item_result = None
+
+                    if isinstance(item_result, str):
+                        self._margin_retry_queue.popleft()
+                        await self._margin_task_success(item, item_result)
+                    elif isinstance(item_result, dict) and item_result.get("status") == "margin_limited":
+                        # 又被限速了，停止处理，等下一轮探测
+                        logger.warning(f"⚠️ 处理队列时再次触发 margin 限速，暂停处理")
+                        try:
+                            from app.services.tg_bot import tg_service
+                            if tg_service:
+                                remaining = len(self._margin_retry_queue)
+                                await tg_service.send_admin_msg(
+                                    f"⚠️ 处理排队任务时再次触发分享限速，暂停处理。\n"
+                                    f"📋 剩余 {remaining} 个任务，将在 5 分钟后继续探测。"
+                                )
+                        except Exception:
+                            pass
+                        break
+                    else:
+                        # 其他错误，跳过该任务
+                        self._margin_retry_queue.popleft()
+                        logger.warning(f"⚠️ margin 队列任务失败，已跳过: {item_url}, 结果: {item_result}")
+                        await self._margin_task_failed(item, item_result)
+
+            elif isinstance(result, dict) and result.get("status") == "margin_limited":
+                # 仍然被限速，继续等待
+                remaining = len(self._margin_retry_queue)
+                logger.info(f"⏳ margin 探测: 仍在限速中，{remaining} 个任务排队等待，{POLL_INTERVAL}s 后再试")
+            else:
+                # 探测返回其他错误（非 margin），跳过这个任务
+                self._margin_retry_queue.popleft()
+                logger.warning(f"⚠️ margin 探测返回非 margin 错误，跳过: {probe_url}, 结果: {result}")
+                await self._margin_task_failed(probe_item, result)
+
+        logger.info("✅ margin 排队队列已清空，轮询器退出")
+
+    async def _margin_task_success(self, item: dict, share_link: str):
+        """margin 排队任务成功后：保存历史 + 推送 TG"""
+        share_url = item.get("share_url", "")
+        metadata = item.get("metadata", {})
+        try:
+            await self.save_history_link(share_url, share_link)
+        except Exception as e:
+            logger.warning(f"保存历史记录失败: {e}")
+
+        try:
+            from app.services.tg_bot import tg_service
+            if tg_service:
+                # 发送给管理员
+                await tg_service.send_admin_msg(
+                    f"✅ 限速排队任务已完成！\n"
+                    f"原链接: {share_url}\n"
+                    f"新分享: {share_link}"
+                )
+                # 推送到频道
+                await tg_service.broadcast_to_channels(
+                    {share_url: share_link},
+                    metadata
+                )
+        except Exception as e:
+            logger.warning(f"margin 成功回调通知失败: {e}")
+
+    async def _margin_task_failed(self, item: dict, result):
+        """margin 排队任务最终失败的通知"""
+        share_url = item.get("share_url", "")
+        error_msg = ""
+        if isinstance(result, dict):
+            error_msg = result.get("message", str(result))
+        else:
+            error_msg = str(result) if result else "未知错误"
+        try:
+            from app.services.tg_bot import tg_service
+            if tg_service:
+                await tg_service.send_admin_msg(
+                    f"❌ 限速排队任务失败\n"
+                    f"原链接: {share_url}\n"
+                    f"错误: {error_msg}"
+                )
+        except Exception as e:
+            logger.warning(f"margin 失败回调通知失败: {e}")
 
     async def _save_share_link_internal(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, db_id: Optional[int] = None):
         """Internal logic for saving a 115 share link (no locking)"""
@@ -1278,6 +1446,12 @@ class P115Service:
                     timeout=30, max_retries=2, label="fs_files_snapshot",
                     **self._get_ios_ua_kwargs()
                 )
+                # 🛡️ 检测 115 限速响应
+                if self._is_margin_response(resp):
+                    margin_val = int(resp.get("margin", 5))
+                    logger.warning(f"⚠️ fs_files 快照触发 115 限速 (margin={margin_val})，等待后重试")
+                    await asyncio.sleep(max(margin_val, 3))
+                    continue
                 check_response(resp)
                 file_list = resp.get("data", [])
                 if isinstance(file_list, dict):
@@ -1442,6 +1616,9 @@ class P115Service:
             max_poll_attempts = 45 # 最多等待约 90s
             min_stable_required = 3 # 稳定不变的次数要求
 
+            margin_hit_count = 0  # margin 限速不消耗轮询次数，单独计数
+            max_margin_hits = 30  # margin 最多容忍 30 次（约 2.5 分钟）
+
             for poll_attempt in range(1, max_poll_attempts + 1):
                 try:
                     logger.debug(f"🔍 探测子目录属性详情 (第 {poll_attempt}/{max_poll_attempts} 次), CID: {to_cid}")
@@ -1452,6 +1629,23 @@ class P115Service:
                         async_=True, timeout=10, max_retries=1, label="fs_category_get_poll",
                         **self._get_ios_ua_kwargs()
                     )
+                    
+                    # 🛡️ 检测 115 限速响应 {"margin": N}，不消耗轮询次数
+                    if self._is_margin_response(resp):
+                        margin_hit_count += 1
+                        margin_val = int(resp.get("margin", 5))
+                        wait = max(margin_val, 3)
+                        logger.warning(f"⚠️ fs_category_get 触发 115 限速 (margin={margin_val})，等待 {wait}s 后重试 (margin 第 {margin_hit_count}/{max_margin_hits} 次)")
+                        if margin_hit_count >= max_margin_hits:
+                            logger.warning(f"🚫 轮询阶段 margin 限速持续过久 ({margin_hit_count} 次)，转入 margin 排队")
+                            return {
+                                "status": "margin_limited",
+                                "save_result": save_result,
+                                "message": "分享被限制（margin），已加入排队等待"
+                            }
+                        await asyncio.sleep(wait)
+                        continue  # 不递增 poll_attempt
+                    
                     logger.info(f"📋 [深度属性 RAW API 完整响应] {resp}")
                     
                     # 2. 从原生响应中直接读取（而不是从 data 中读）
@@ -1531,7 +1725,7 @@ class P115Service:
                         )
                         
                         # 主动检测 115 非标限速响应（仅含 {"margin": N}，无 state/data）
-                        if isinstance(send_resp, dict) and "margin" in send_resp and "data" not in send_resp:
+                        if self._is_margin_response(send_resp):
                             margin_val = send_resp.get("margin", 10)
                             wait = max(int(margin_val), 5)
                             logger.warning(f"⚠️ 115 分享接口触发限速 (margin={margin_val})，等待 {wait} 秒后重试... (尝试 {retry_attempt}/{max_share_retries})")
@@ -1539,7 +1733,13 @@ class P115Service:
                                 await asyncio.sleep(wait)
                                 continue
                             else:
-                                raise KeyError("margin")
+                                # 3 次都 margin，返回 margin_limited 状态进入排队
+                                logger.warning(f"🚫 分享创建阶段 margin 限速 {max_share_retries} 次，转入 margin 排队")
+                                return {
+                                    "status": "margin_limited",
+                                    "save_result": save_result,
+                                    "message": "分享被限制（margin），已加入排队等待"
+                                }
                         
                         check_response(send_resp)
                         logger.debug(f"📋 share_send 响应: {send_resp}")
@@ -1561,8 +1761,8 @@ class P115Service:
                         
                     except Exception as share_error:
                         error_str = str(share_error)
-                        # margin / data 缺失：115 非标限速响应，触发重试
-                        is_rate_limited = isinstance(share_error, KeyError) and share_error.args and share_error.args[0] in ("margin", "data")
+                        # data 缺失：115 非标响应，触发重试
+                        is_rate_limited = isinstance(share_error, KeyError) and share_error.args and share_error.args[0] == "data"
                         if ("4100005" in error_str or "已被移动或删除" in error_str or is_rate_limited) and retry_attempt < max_share_retries:
                             wait = 10 if is_rate_limited else 5
                             logger.warning(f"⚠️ {'115 分享接口触发限速' if is_rate_limited else '文件尚未就绪'}，等待 {wait} 秒后重试...")
@@ -1642,9 +1842,16 @@ class P115Service:
                     "metadata": save_result.get("metadata", {})
                 }
 
-            # 115 接口偶发返回结构变动时，底层解析可能抛出 KeyError（如 {'margin'}）
+            # 115 接口偶发返回结构变动时，底层解析可能抛出 KeyError
             if isinstance(e, KeyError):
                 missing_key = e.args[0] if e.args else "unknown"
+                # margin 类 KeyError 转为 margin_limited 排队
+                if missing_key == "margin":
+                    return {
+                        "status": "margin_limited",
+                        "save_result": save_result,
+                        "message": "分享被限制（margin），已加入排队等待"
+                    }
                 return {
                     "status": "error",
                     "error_type": "share_response_parse_error",
