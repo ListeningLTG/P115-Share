@@ -56,6 +56,7 @@ class P115Service:
         self._last_save_times = deque(maxlen=1000)  # 限制最大长度，防止无限增长
         self._last_tg_link_time: float = 0.0 # 最近收到 TG 链接的时间
         self._silent_until: float = 0.0      # 静默期截止时间
+        self._last_verify_failed: bool = False # 记录最后一次验证是否明确失败
         self._batch_yield_count: int = 0     # 批量任务避让次数统计
         self._batch_yield_total_time: float = 0.0  # 批量任务避让累计时间
 
@@ -108,6 +109,11 @@ class P115Service:
     def is_restricted(self) -> bool:
         """检查当前是否处于 115 限制状态"""
         return time.time() < self._restriction_until
+
+    @property
+    def is_login_failed(self) -> bool:
+        """最后一次验证是否明确失败（如密码错误、Cookie失效等）"""
+        return self._last_verify_failed
 
     async def set_restriction(self, hours: float = 1.0):
         """设置全局限制状态并持久化到 DB"""
@@ -371,14 +377,17 @@ class P115Service:
             )
             if resp.get("state"):
                 self.is_connected = True
+                self._last_verify_failed = False
                 logger.info("✅ 115 网盘登录验证成功")
                 return True
         except Exception as e:
             logger.error(f"❌ 115 网盘登录验证失败: {e}")
             self.is_connected = False
+            self._last_verify_failed = True
             return False
-            
+        
         self.is_connected = False
+        self._last_verify_failed = True
         return False
 
     def clear_save_dir_cache(self):
@@ -1344,6 +1353,12 @@ class P115Service:
                     "is_prohibited": False,
                     "title": ""
                 }
+            # 检查是否登录失效（常见错误: 请重新登录, errno=99）
+            if "99" in error_msg or "请重新登录" in error_msg:
+                self.is_connected = False
+                self._last_verify_failed = True
+                logger.warning(f"🔐 检测到账号登录失效 (状态检查): {share_url}")
+
             logger.error(f"❌ 检查链接状态失败: {share_url}, 错误: {e}")
             return None
 
@@ -1399,6 +1414,10 @@ class P115Service:
                     break
                 except Exception as share_error:
                     error_str = str(share_error)
+                    if "99" in error_str or "请重新登录" in error_str:
+                        self.is_connected = False
+                        logger.warning(f"🔐 检测到账号登录失效 (直接分享): {share_error}")
+
                     is_rate_limited = isinstance(share_error, KeyError) and share_error.args and share_error.args[0] in ("margin", "data")
                     if ("4100005" in error_str or "已被移动或删除" in error_str or is_rate_limited) and retry_attempt < max_share_retries:
                         wait = 10 if is_rate_limited else 5
@@ -1760,10 +1779,15 @@ class P115Service:
                         break
                         
                     except Exception as share_error:
-                        error_str = str(share_error)
+                        error_msg = str(share_error)
+                        if "99" in error_msg or "请重新登录" in error_msg:
+                            self.is_connected = False
+                            self._last_verify_failed = True
+                            logger.warning(f"🔐 检测到账号登录失效 (创建分享): {share_error}")
+                        
                         # data 缺失：115 非标响应，触发重试
                         is_rate_limited = isinstance(share_error, KeyError) and share_error.args and share_error.args[0] == "data"
-                        if ("4100005" in error_str or "已被移动或删除" in error_str or is_rate_limited) and retry_attempt < max_share_retries:
+                        if ("4100005" in error_msg or "已被移动或删除" in error_msg or is_rate_limited) and retry_attempt < max_share_retries:
                             wait = 10 if is_rate_limited else 5
                             logger.warning(f"⚠️ {'115 分享接口触发限速' if is_rate_limited else '文件尚未就绪'}，等待 {wait} 秒后重试...")
                             await asyncio.sleep(wait)

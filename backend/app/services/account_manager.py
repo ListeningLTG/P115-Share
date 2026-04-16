@@ -175,10 +175,15 @@ class AccountManager:
                 if not svc.is_restricted and svc.is_connected:
                     logger.info(f"👤 使用账号 [{svc.account.id}] {svc.account.name}")
                     return svc
-            # 如果没有可用的，返回优先级最高的
-            svc = min(self._services.values(), key=lambda s: s.account.priority)
-            logger.info(f"👤 使用账号 [{svc.account.id}] {svc.account.name}（无可用账号，降级使用）")
-            return svc
+            # 如果没有互补可用的，优先选一个没报错过的账号
+            enabled = [s for s in self._services.values() if s.account.enabled]
+            if enabled:
+                # 排序：登录失败状态（升序，False优先）→ 优先级（数字越小越优先）
+                enabled.sort(key=lambda s: (s.is_login_failed, s.account.priority))
+                svc = enabled[0]
+                logger.info(f"👤 使用账号 [{svc.account.id}] {svc.account.name}（无可用账号，降级使用，失败状态: {svc.is_login_failed}）")
+                return svc
+            return None
 
         # 负载均衡：选择最空闲的账号
         available = [
@@ -186,11 +191,12 @@ class AccountManager:
             if svc.account.enabled and not svc.is_restricted and svc.is_connected
         ]
         if not available:
-            # 降级：返回优先级最高的
             enabled = [s for s in self._services.values() if s.account.enabled]
             if enabled:
-                svc = min(enabled, key=lambda s: s.account.priority)
-                logger.info(f"👤 ⚖️ 负载均衡使用账号 [{svc.account.id}] {svc.account.name}（无可用账号，降级使用）")
+                # 降级排序：登录失败状态（False优先）→ 优先级（升序）
+                enabled.sort(key=lambda s: (s.is_login_failed, s.account.priority))
+                svc = enabled[0]
+                logger.info(f"👤 ⚖️ 负载均衡使用账号 [{svc.account.id}] {svc.account.name}（无可用账号，降级使用，失败状态: {svc.is_login_failed}）")
                 return svc
             return None
 
