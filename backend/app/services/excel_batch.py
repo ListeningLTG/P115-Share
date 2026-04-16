@@ -109,6 +109,8 @@ class ExcelBatchService:
                     return len(s.encode('utf-16-le')) // 2
 
                 current_offset = 0
+                links_info = [] # [(start_u16, end_u16, url, password)]
+
                 for entity in text_entities:
                     entity_text = entity.get('text', '')
                     entity_type = entity.get('type')
@@ -146,30 +148,23 @@ class ExcelBatchService:
                         }
                         if entity_type == 'text_link':
                             ent_data["url"] = entity.get('href')
+                            # Check URL for 115 link
+                            match = link_pattern.search(ent_data["url"])
+                            if match:
+                                links_info.append((current_offset, current_offset + length, ent_data["url"], match.group(2)))
+                        elif entity_type == 'link':
+                            # Check plain text URL for 115 link
+                            match = link_pattern.search(entity_text)
+                            if match:
+                                links_info.append((current_offset, current_offset + length, entity_text, match.group(2)))
                         
                         entities.append(ent_data)
                     
                     full_text += entity_text
                     current_offset += length
 
-                # 2. Extract specific 115 links from the reconstructed entities
-                title = None
-                # First bold entity as title fallback
-                for entity in text_entities:
-                    if entity.get('type') == 'bold' and not title:
-                        title = entity.get('text', '').strip()
-                        break
-
-                # New fallback: If no bold title, use the first line of full_text if it looks like a title
-                if not title and full_text:
-                    first_line = full_text.split('\n')[0].strip()
-                    # Check if it starts with common resource icons or "电视剧"/"电影"
-                    if any(icon in first_line for icon in ['📺', '🎬', '🎥', '🎞️', '📁']) or \
-                       any(keyword in first_line for keyword in ['电视剧', '电影']):
-                        title = first_line
-
-                if title:
-                    title = re.sub(r'^[🎬🎥🎞️📀📁📺]\s*', '', title)
+                if not links_info:
+                    continue
 
                 # Extract message date and format it as [MM-DD HH:MM]
                 date_suffix = ""
@@ -180,49 +175,129 @@ class ExcelBatchService:
                         date_suffix = f" [{dt.strftime('%m-%d %H:%M')}]"
                     except Exception:
                         pass
-
-                for entity in text_entities:
-                    if entity.get('type') == 'text_link':
-                        href = entity.get('href', '')
-                        match = link_pattern.search(href)
-                        if match:
-                            share_code = match.group(1)
-                            password = match.group(2)
+                
+                # 2. Smart Segmentation logic
+                text_utf16_len = get_u16_len(full_text)
+                last_boundary = 0
+                segments = []
+                
+                for idx, pos in enumerate(links_info):
+                    start_u16, end_u16, url, password = pos
+                    seg_end = end_u16
+                    
+                    if idx < len(links_info) - 1:
+                        next_start_u16 = links_info[idx + 1][0]
+                        try:
+                            # Convert U16 offsets to string characters for string searching
+                            between_start_char = len(full_text.encode('utf-16-le')[:end_u16*2].decode('utf-16-le', errors='ignore'))
+                            between_end_char = len(full_text.encode('utf-16-le')[:next_start_u16*2].decode('utf-16-le', errors='ignore'))
+                            between_text = full_text[between_start_char:between_end_char]
                             
-                            current_title = (title or f"Message_{msg.get('id')}") + date_suffix
+                            double_newline_pos = between_text.find('\n\n')
+                            if double_newline_pos != -1:
+                                split_char = between_start_char + double_newline_pos + 2
+                                seg_end = get_u16_len(full_text[:split_char])
+                            else:
+                                if len(between_text.strip()) > 10:
+                                    seg_end = next_start_u16
+                        except Exception:
+                            seg_end = next_start_u16
+                    else:
+                        seg_end = text_utf16_len
+                        
+                    # Slice text and entities
+                    try:
+                        u16_text = full_text.encode('utf-16-le')
+                        slice_u16 = u16_text[last_boundary*2:seg_end*2]
+                        seg_text = slice_u16.decode('utf-16-le', errors='ignore')
+                        
+                        seg_entities = []
+                        for e in entities:
+                            offset = e["offset"]
+                            length = e["length"]
+                            if offset >= last_boundary and (offset + length) <= seg_end:
+                                e_copy = e.copy()
+                                e_copy["offset"] = offset - last_boundary
+                                seg_entities.append(e_copy)
+                            elif offset < seg_end and (offset + length) > last_boundary:
+                                o_start = max(offset, last_boundary)
+                                o_end = min(offset + length, seg_end)
+                                e_copy = e.copy()
+                                e_copy["offset"] = o_start - last_boundary
+                                e_copy["length"] = o_end - o_start
+                                seg_entities.append(e_copy)
+                                
+                        segments.append({
+                            "text": seg_text,
+                            "entities": seg_entities,
+                            "url": url,
+                            "password": password
+                        })
+                    except Exception as sl_e:
+                        # Fallback if slice fails
+                        logger.error(f"Slice message failed: {sl_e}")
+                        segments.append({
+                            "text": full_text,
+                            "entities": entities,
+                            "url": url,
+                            "password": password
+                        })
 
-                            extracted_data.append({
-                                "链接": href,
-                                "标题": current_title,
-                                "消息时间": date_suffix.strip(' []') if date_suffix else "",
-                                "提取码": password or "",
-                                "item_metadata": {
-                                    "full_text": full_text,
-                                    "entities": entities,
-                                    "msg_date": date_suffix.strip(' []') if date_suffix else ""
-                                }
-                            })
+                    last_boundary = seg_end
+                    
+                # 3. Process each segment and extract title
+                for seg in segments:
+                    seg_text = seg["text"]
+                    seg_entities = seg["entities"]
+                    url = seg["url"]
+                    password = seg["password"]
+                    title = None
+                    if seg_text:
+                        first_line = seg_text.split('\n')[0].strip()
+                        if first_line:
+                            if any(first_line.startswith(prefix) for prefix in ['📺', '🎬', '🎥', '🎞️', '📁', '【', '[']) or \
+                               any(keyword in first_line for keyword in ['电视剧', '电影', '剧集', '名称', '资源']):
+                                clean_title = re.sub(r'^[🎬🎥🎞️📀📁📺\s]*(剧集|电影|名称|内容|资源)?[:：]?\s*', '', first_line)
+                                if clean_title:
+                                    title = clean_title.strip()
+                    
+                    if not title:
+                        try:
+                            for e in seg_entities:
+                                if e.get('type') == 'bold':
+                                    e_offset = e.get('offset')
+                                    e_length = e.get('length')
+                                    extracted = seg_text.encode('utf-16-le')[e_offset*2:(e_offset+e_length)*2].decode('utf-16-le', errors='ignore').strip()
+                                    if len(extracted) > 3 and extracted not in ["名称", "剧集", "电影", "资源", "标 签", "标签", "分 类", "分类", "体 积", "体积", "链接"]:
+                                        title = extracted
+                                        break
+                        except Exception:
+                            pass
+                            
+                    if not title and seg_text:
+                        first_line = seg_text.split('\n')[0].strip()
+                        if first_line and len(first_line) > 1 and "http" not in first_line:
+                            if "链接" not in first_line and "网盘" not in first_line:
+                                title = first_line
+                            elif len(first_line) > 10:
+                                title = first_line
 
-                # Also handle 'link' type entities (bare URLs in text field)
-                for entity in text_entities:
-                    if entity.get('type') == 'link':
-                        url = entity.get('text', '')
-                        match = link_pattern.search(url)
-                        if match:
-                            password = match.group(2)
-                            current_title = (title or f"Message_{msg.get('id')}") + date_suffix
+                    if title:
+                        title = re.sub(r'^[🎬🎥🎞️📀📁📺\s]*', '', title).strip()
+                        
+                    current_title = (title or f"Message_{msg.get('id')}") + date_suffix
 
-                            extracted_data.append({
-                                "链接": url,
-                                "标题": current_title,
-                                "消息时间": date_suffix.strip(' []') if date_suffix else "",
-                                "提取码": password or "",
-                                "item_metadata": {
-                                    "full_text": full_text,
-                                    "entities": entities,
-                                    "msg_date": date_suffix.strip(' []') if date_suffix else ""
-                                }
-                            })
+                    extracted_data.append({
+                        "链接": url,
+                        "标题": current_title,
+                        "消息时间": date_suffix.strip(' []') if date_suffix else "",
+                        "提取码": password or "",
+                        "item_metadata": {
+                            "full_text": seg_text,
+                            "entities": seg_entities,
+                            "msg_date": date_suffix.strip(' []') if date_suffix else ""
+                        }
+                    })
             
             if not extracted_data:
                 raise Exception("未在 JSON 文件中找到有效的 115 分享链接")
