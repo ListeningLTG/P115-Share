@@ -8,6 +8,7 @@ from app.services.p115 import p115_service
 from loguru import logger
 import asyncio
 import re
+import time
 
 def _get_svc():
     """获取当前最优 P115Service（负载均衡调度），降级到全局单例"""
@@ -21,6 +22,9 @@ def _get_svc():
     return p115_service, None
 
 class TGService:
+    # 60s 内同一链接去重窗口（秒）
+    _DEDUP_WINDOW = 60
+
     def __init__(self):
         self.bot = None
         self.dp = None
@@ -29,6 +33,8 @@ class TGService:
         self._lock = asyncio.Lock()
         self._current_polling_id = 0
         self._verify_tasks = []
+        # url -> 开始处理时的时间戳，用于60s内去重
+        self._processing_urls: dict[str, float] = {}
         if settings.TG_BOT_TOKEN:
             self.init_bot(settings.TG_BOT_TOKEN)
 
@@ -224,6 +230,35 @@ class TGService:
                 await message.answer("⚠️ 请发送有效的 115 分享链接。\n支持域名: 115.com, 115cdn.com, anxia.com")
             return
 
+        # ── 60s 内重复提交去重 ──────────────────────────────────────────
+        now = time.monotonic()
+        # 先清理已过期的记录
+        expired = [u for u, ts in self._processing_urls.items() if now - ts > self._DEDUP_WINDOW]
+        for u in expired:
+            self._processing_urls.pop(u, None)
+
+        dedup_skipped = []
+        filtered_urls = []
+        for url in share_urls:
+            if url in self._processing_urls:
+                elapsed = now - self._processing_urls[url]
+                remaining = int(self._DEDUP_WINDOW - elapsed)
+                logger.info(f"⏭️ 链接在 {self._DEDUP_WINDOW}s 内已提交处理，跳过重复请求 (还有 {remaining}s): {url}")
+                dedup_skipped.append((url, remaining))
+            else:
+                filtered_urls.append(url)
+                self._processing_urls[url] = now  # 标记为处理中
+
+        if dedup_skipped:
+            skip_msgs = "\n".join([f"• {u}\n  ⏱ 距上次提交不足 {self._DEDUP_WINDOW}s（还有 {r}s），已跳过" for u, r in dedup_skipped])
+            await message.answer(f"⚠️ 以下链接在 {self._DEDUP_WINDOW}s 内已提交过，自动跳过重复处理：\n{skip_msgs}")
+
+        if not filtered_urls:
+            return  # 全部都是重复链接，直接返回
+
+        share_urls = filtered_urls
+        # ────────────────────────────────────────────────────────────────
+
         total_links = len(share_urls)
         logger.info(f"🎯 发现 {total_links} 个 115 链接，开始批量处理...")
 
@@ -360,6 +395,10 @@ class TGService:
             except Exception as e:
                 logger.error(f"❌ 处理链接出错 {share_url}: {e}")
                 return {"error_type": "exception", "message": str(e)}, None
+            finally:
+                # 处理完成后（无论成功/失败），将该 URL 从去重字典中移除
+                # 这样下次发送同一链接时，会重新走完整的 get_history_link 路径
+                self._processing_urls.pop(share_url, None)
 
         # Prepare segments for broadcasting
         # We find the positions of all share URLs in the original text (UTF-16)
