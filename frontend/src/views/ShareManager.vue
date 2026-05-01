@@ -37,7 +37,7 @@
           </template>
         </a-dropdown>
         <a-button
-          :disabled="isAnalyzing || statsNormal === 0"
+          :disabled="isAnalyzing || (statsTotal - statsExpired) === 0"
           @click="showPushModal = true"
         >
           <template #icon><SendOutlined /></template>
@@ -146,7 +146,7 @@
         <a-form-item label="推送范围">
           <a-radio-group v-model:value="pushMode">
             <a-radio value="selected">已选中的 ({{ selectedRowKeys.length }} 条)</a-radio>
-            <a-radio value="all">所有正常状态的分享</a-radio>
+            <a-radio value="all">所有有效的分享 (排除已过期)</a-radio>
           </a-radio-group>
         </a-form-item>
 
@@ -185,7 +185,7 @@
 
         <a-alert
           v-if="pushMode === 'all'"
-          message="将推送所有正常状态的分享链接，请谨慎操作"
+          message="将推送所有未过期的分享链接，请谨慎操作"
           type="warning"
           show-icon
           style="margin-top: 12px"
@@ -749,7 +749,7 @@ const rowSelection = computed(() => ({
     selectedRowKeys.value = keys;
   },
   getCheckboxProps: (record: any) => ({
-    disabled: record.is_violated || record.is_expired || record.is_reviewing,
+    disabled: record.is_expired,
   }),
 }));
 

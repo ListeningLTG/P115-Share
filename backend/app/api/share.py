@@ -572,9 +572,7 @@ async def push_to_channel(
     async with async_session() as session:
         stmt = select(ShareAnalysisResult).where(
             ShareAnalysisResult.account_id == account_id,
-            ShareAnalysisResult.is_violated == False,
             ShareAnalysisResult.is_expired == False,
-            ShareAnalysisResult.is_reviewing == False,
         )
 
         # 时间范围过滤
