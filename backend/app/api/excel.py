@@ -20,6 +20,7 @@ class StartTaskRequest(BaseModel):
     white_list_keywords: Optional[str] = None
     black_list_keywords: Optional[str] = None
     skip_large_package: Optional[bool] = False
+    strategy: Optional[str] = "transfer"
     force: Optional[bool] = False
 
 @router.post("/parse")
@@ -160,7 +161,8 @@ async def start_task(task_id: int, req: StartTaskRequest, current_user: dict = D
         req.target_channels,
         req.white_list_keywords,
         req.black_list_keywords,
-        req.skip_large_package
+        req.skip_large_package,
+        req.strategy
     )
     return {"status": "success"}
 

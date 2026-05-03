@@ -250,6 +250,16 @@
                 
                 <div class="form-row">
                   <div class="form-item" style="flex: 1">
+                    <label>任务策略</label>
+                    <a-select v-model:value="taskStrategy" style="width: 100%" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)">
+                      <a-select-option value="transfer">转存分享 (默认)</a-select-option>
+                      <a-select-option value="push">直接推送 (仅转发原链接)</a-select-option>
+                    </a-select>
+                  </div>
+                </div>
+
+                <div class="form-row">
+                  <div class="form-item" style="flex: 1">
                     <label>白名单关键词 (包含任一则执行)</label>
                     <a-input v-model:value="whiteListKeywords" placeholder="关键词1, 关键词2 (逗号分隔)" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
                   </div>
@@ -285,14 +295,14 @@
                       type="primary" 
                       @click="handleStartTask" 
                     >
-                      {{ currentTask?.status === 'paused' ? '继续转存分享' : '开始转存分享' }}
+                      {{ currentTask?.status === 'paused' ? '继续' : '开始' }}
                     </a-button>
                      <a-button v-if="currentTask?.status === 'running' || currentTask?.status === 'pausing'" type="primary" @click="handlePauseTask" :loading="pausing || currentTask?.status === 'pausing'" :disabled="currentTask?.status === 'pausing'">
-                       暂停转存分享
+                       暂停
                      </a-button>
                      <!-- User mentioned "暂停/继续、取消" -->
                      <a-button v-if="['running', 'paused', 'pausing'].includes(currentTask?.status)" @click="handleCancelTask" :loading="cancelling || currentTask?.status === 'cancelling'" :disabled="currentTask?.status === 'cancelling'">
-                       取消转存分享
+                       取消
                      </a-button>
                   </a-space>
                </div>
@@ -497,6 +507,7 @@ const tgChannels = ref<any[]>([]);
 const selectedChannels = ref<string[]>([]);
 const whiteListKeywords = ref('');
 const blackListKeywords = ref('');
+const taskStrategy = ref('transfer');
 
 // Upload & Mapping
 const mappingModalVisible = ref(false);
@@ -562,8 +573,10 @@ const fetchSettings = async () => {
            tgChannels.value.unshift({ id: legacyId, enabled: true, name: '默认频道', concise: false });
         }
         
-        // Default select all
-        selectedChannels.value = tgChannels.value.map((c: any) => c.id);
+        // Default select all (only if currently empty)
+        if (selectedChannels.value.length === 0) {
+          selectedChannels.value = tgChannels.value.map((c: any) => c.id);
+        }
       } catch (e) {
         console.error("Failed to parse tg_channels", e);
         tgChannels.value = [];
@@ -571,7 +584,9 @@ const fetchSettings = async () => {
     } else if (res.data.tg_channel_id) {
        // Only legacy
        tgChannels.value = [{ id: res.data.tg_channel_id, enabled: true, name: '默认频道', concise: false }];
-       selectedChannels.value = [res.data.tg_channel_id];
+       if (selectedChannels.value.length === 0) {
+         selectedChannels.value = [res.data.tg_channel_id];
+       }
     }
   } catch (e) {
     console.error('获取设置失败', e);
@@ -598,6 +613,7 @@ const fetchCurrentTask = async () => {
       if (updatedTask.white_list_keywords !== undefined) whiteListKeywords.value = updatedTask.white_list_keywords || '';
       if (updatedTask.black_list_keywords !== undefined) blackListKeywords.value = updatedTask.black_list_keywords || '';
       if (updatedTask.skip_large_package !== undefined) skipLargePackage.value = updatedTask.skip_large_package || false;
+      if (updatedTask.strategy !== undefined) taskStrategy.value = updatedTask.strategy || 'transfer';
     }
   } catch (e) {
     console.error('获取任务详情失败', e);
@@ -645,6 +661,7 @@ const selectTask = (id: number) => {
   whiteListKeywords.value = task?.white_list_keywords || '';
   blackListKeywords.value = task?.black_list_keywords || '';
   skipLargePackage.value = task?.skip_large_package || false;
+  taskStrategy.value = task?.strategy || 'transfer';
   
   pagination.current = 1;
   pagination.pageSize = 50;
@@ -739,10 +756,11 @@ const handleStartTask = async (forceParam?: any) => {
       white_list_keywords: whiteListKeywords.value,
       black_list_keywords: blackListKeywords.value,
       skip_large_package: skipLargePackage.value,
+      strategy: taskStrategy.value,
       force: force
 
     });
-    message.success(isResume ? '正在继续转存分享...' : '正在启动转存分享...');
+    message.success(isResume ? '正在继续...' : '正在启动...');
     await fetchTasks();
     await fetchSettings();
   } catch (e: any) {

@@ -460,7 +460,8 @@ class ExcelBatchService:
                             "target_channels": task.target_channels,
                             "white_list_keywords": task.white_list_keywords,
                             "black_list_keywords": task.black_list_keywords,
-                            "skip_large_package": task.skip_large_package
+                            "skip_large_package": task.skip_large_package,
+                            "strategy": task.strategy
                         }
 
                         is_processed = await self._process_item(item_id, task_config, svc=svc, acct_mgr=acct_mgr)
@@ -555,6 +556,7 @@ class ExcelBatchService:
                     white_list = task_config.get("white_list_keywords")
                     black_list = task_config.get("black_list_keywords")
                     skip_large_package = task_config.get("skip_large_package")
+                    strategy = task_config.get("strategy", "transfer")
                 else:
                     task_result = await session.execute(
                         select(ExcelTask).where(ExcelTask.id == item.task_id)
@@ -564,6 +566,7 @@ class ExcelBatchService:
                     white_list = t_row.white_list_keywords
                     black_list = t_row.black_list_keywords
                     skip_large_package = t_row.skip_large_package
+                    strategy = t_row.strategy
             except Exception:
                 logger.error(f"Item {item_id} not found or task deleted")
                 return
@@ -616,6 +619,28 @@ class ExcelBatchService:
                 await self._update_task_counts(task_id)
                 return True
 
+            # --- Strategy: Push ---
+            if strategy == "push":
+                if tg_service:
+                    if item.item_metadata:
+                        metadata = item.item_metadata.copy()
+                        metadata["share_url"] = original_url
+                    else:
+                        metadata = {
+                            "description": item.title or "Excel Batch Push",
+                            "full_text": f"资源推送\n资源名称：{item.title or '未知'}\n分享链接：{{{{share_link}}}}",
+                            "share_url": original_url
+                        }
+                    await tg_service.broadcast_to_channels({original_url: original_url}, metadata, channel_ids=target_channels)
+                
+                item.status = "成功"
+                item.new_share_url = original_url
+                item.error_msg = "直接推送完成"
+                await session.commit()
+                await self._update_task_counts(task_id)
+                return True
+
+            # --- Strategy: Transfer (Original Logic) ---
             # 1. Check history first
             history_url = await svc.get_history_link(original_url)
             if history_url:
@@ -742,7 +767,7 @@ class ExcelBatchService:
             )
             await session.commit()
 
-    async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False):
+    async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False, strategy: str = "transfer"):
         async with async_session() as session:
             # Get currrent status
             result = await session.execute(select(ExcelTask).where(ExcelTask.id == task_id))
@@ -774,6 +799,7 @@ class ExcelBatchService:
                 task.black_list_keywords = black_list_keywords
             
             task.skip_large_package = skip_large_package
+            task.strategy = strategy
             
             if not is_resume:
                 task.skip_count = skip_count
