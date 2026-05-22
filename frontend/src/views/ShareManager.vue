@@ -26,7 +26,7 @@
         </a-button>
         <a-button
           danger
-          :disabled="isAnalyzing || (statsViolated === 0 && statsExpired === 0)"
+          :disabled="isAnalyzing || (statsInvalid === 0 && statsExpired === 0)"
           :loading="isCancelingBatch"
           @click="cancelInvalidExpired"
         >
@@ -80,6 +80,7 @@
               <a-select-option value="all">全部</a-select-option>
               <a-select-option value="normal">正常</a-select-option>
               <a-select-option value="violated">违规</a-select-option>
+              <a-select-option value="invalid">已失效</a-select-option>
               <a-select-option value="expired">已过期</a-select-option>
               <a-select-option value="reviewing">审核中</a-select-option>
             </a-select>
@@ -92,6 +93,7 @@
         <a-statistic title="总分享数" :value="statsTotal" style="margin-right: 20px" />
         <a-statistic title="正常" :value="statsNormal" :value-style="{ color: '#52c41a' }" style="margin-right: 20px" />
         <a-statistic title="违规" :value="statsViolated" :value-style="{ color: '#ff4d4f' }" style="margin-right: 20px" />
+        <a-statistic title="已失效" :value="statsInvalid" :value-style="{ color: '#d46b08' }" style="margin-right: 20px" />
         <a-statistic title="已过期" :value="statsExpired" :value-style="{ color: '#fa8c16' }" style="margin-right: 20px" />
         <a-statistic title="审核中" :value="statsReviewing" :value-style="{ color: '#1890ff' }" />
       </div>
@@ -327,6 +329,7 @@ const statusFilter = ref('all');
 const statsTotal = ref(0);
 const statsNormal = ref(0);
 const statsViolated = ref(0);
+const statsInvalid = ref(0);
 const statsExpired = ref(0);
 const statsReviewing = ref(0);
 const scannedCount = ref(0);
@@ -406,7 +409,7 @@ const loadChannels = async () => {
 const onAccountChange = async () => {
   // 重置统计
   statsTotal.value = 0; statsNormal.value = 0; statsViolated.value = 0;
-  statsExpired.value = 0; statsReviewing.value = 0; scannedCount.value = 0;
+  statsInvalid.value = 0; statsExpired.value = 0; statsReviewing.value = 0; scannedCount.value = 0;
   lastUpdated.value = ''; shareData.value = [];
   pagination.value.total = 0;
   // 加载新账号的状态
@@ -485,6 +488,7 @@ const pollAnalysisStatus = async () => {
     statsTotal.value = data.total;
     statsNormal.value = data.normal;
     statsViolated.value = data.violated;
+    statsInvalid.value = data.invalid ?? 0;
     statsExpired.value = data.expired ?? 0;
     statsReviewing.value = data.reviewing ?? 0;
     scannedCount.value = data.scanned;
@@ -540,7 +544,7 @@ const resetAnalysis = () => {
         });
         if (response.data.state) {
           statsTotal.value = 0; statsNormal.value = 0; statsViolated.value = 0;
-          statsExpired.value = 0; statsReviewing.value = 0;
+          statsInvalid.value = 0; statsExpired.value = 0; statsReviewing.value = 0;
           scannedCount.value = 0; lastUpdated.value = '';
           shareData.value = []; pagination.value.total = 0;
           message.success('分析结果已重置');

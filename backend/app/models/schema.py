@@ -114,6 +114,7 @@ class ShareAnalysisState(Base):
     total: Mapped[int] = mapped_column(Integer, default=0)
     normal: Mapped[int] = mapped_column(Integer, default=0)
     violated: Mapped[int] = mapped_column(Integer, default=0)
+    invalid: Mapped[int] = mapped_column(Integer, default=0)
     expired: Mapped[int] = mapped_column(Integer, default=0)
     reviewing: Mapped[int] = mapped_column(Integer, default=0)
     scanned: Mapped[int] = mapped_column(Integer, default=0)

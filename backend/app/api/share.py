@@ -92,6 +92,7 @@ def _get_state(account_id: int) -> dict:
             "total": 0,
             "normal": 0,
             "violated": 0,
+            "invalid": 0,
             "expired": 0,
             "reviewing": 0,
             "scanned": 0,
@@ -114,6 +115,7 @@ async def _load_state_from_db(account_id: int):
                 "total": row.total,
                 "normal": row.normal,
                 "violated": row.violated,
+                "invalid": getattr(row, "invalid", 0),
                 "expired": row.expired,
                 "reviewing": row.reviewing,
                 "scanned": row.scanned,
@@ -134,6 +136,7 @@ async def _save_state_to_db(account_id: int):
             row.total = state["total"]
             row.normal = state["normal"]
             row.violated = state["violated"]
+            row.invalid = state["invalid"]
             row.expired = state["expired"]
             row.reviewing = state["reviewing"]
             row.scanned = state["scanned"]
@@ -145,6 +148,7 @@ async def _save_state_to_db(account_id: int):
                 total=state["total"],
                 normal=state["normal"],
                 violated=state["violated"],
+                invalid=state["invalid"],
                 expired=state["expired"],
                 reviewing=state["reviewing"],
                 scanned=state["scanned"],
@@ -167,6 +171,7 @@ async def perform_share_analysis(account_id: int):
     state["is_analyzing"] = True
     state["normal"] = 0
     state["violated"] = 0
+    state["invalid"] = 0
     state["expired"] = 0
     state["reviewing"] = 0
     state["scanned"] = 0
@@ -205,7 +210,9 @@ async def perform_share_analysis(account_id: int):
             for item in items:
                 status_info = get_share_status(item)
 
-                if status_info["is_violated"]:
+                if status_info["is_invalid"]:
+                    state["invalid"] += 1
+                elif status_info["is_violated"]:
                     state["violated"] += 1
                 elif status_info["is_expired"]:
                     state["expired"] += 1
@@ -272,7 +279,8 @@ async def _refresh_analysis_stats(account_id: int):
     state = _get_state(account_id)
     state["total"] = len(rows)
     state["normal"] = sum(1 for r in rows if not r.is_violated and not r.is_expired and not r.is_reviewing)
-    state["violated"] = sum(1 for r in rows if r.is_violated)
+    state["invalid"] = sum(1 for r in rows if r.is_invalid)
+    state["violated"] = sum(1 for r in rows if r.is_violated and not r.is_invalid)
     state["expired"] = sum(1 for r in rows if r.is_expired)
     state["reviewing"] = sum(1 for r in rows if r.is_reviewing)
     state["scanned"] = state["total"]
@@ -306,7 +314,7 @@ async def perform_batch_cancel(account_id: int):
         for i, (db_id, share_code) in enumerate(targets):
             try:
                 resp = await svc.client.share_update(
-                    {"share_code": share_code, "action": "cancel"},
+                    {"share_code": share_code, "action": "delete"},
                     async_=True
                 )
                 if resp.get("state"):
@@ -437,7 +445,12 @@ async def list_shares(
                 ShareAnalysisResult.is_reviewing == False,
             )
         elif status_filter == "violated":
-            stmt = stmt.where(ShareAnalysisResult.is_violated == True)
+            stmt = stmt.where(
+                ShareAnalysisResult.is_violated == True,
+                ShareAnalysisResult.is_invalid == False,
+            )
+        elif status_filter == "invalid":
+            stmt = stmt.where(ShareAnalysisResult.is_invalid == True)
         elif status_filter == "expired":
             stmt = stmt.where(ShareAnalysisResult.is_expired == True)
         elif status_filter == "reviewing":
@@ -504,8 +517,19 @@ async def _get_filtered_results(account_id: int, status_filter: str, search_valu
                 ShareAnalysisResult.is_expired == False,
                 ShareAnalysisResult.is_reviewing == False,
             )
+        if status_filter == "normal":
+            stmt = stmt.where(
+                ShareAnalysisResult.is_violated == False,
+                ShareAnalysisResult.is_expired == False,
+                ShareAnalysisResult.is_reviewing == False,
+            )
         elif status_filter == "violated":
-            stmt = stmt.where(ShareAnalysisResult.is_violated == True)
+            stmt = stmt.where(
+                ShareAnalysisResult.is_violated == True,
+                ShareAnalysisResult.is_invalid == False,
+            )
+        elif status_filter == "invalid":
+            stmt = stmt.where(ShareAnalysisResult.is_invalid == True)
         elif status_filter == "expired":
             stmt = stmt.where(ShareAnalysisResult.is_expired == True)
         elif status_filter == "reviewing":
@@ -960,7 +984,7 @@ async def cancel_share(share_code: str, account_id: Optional[int] = None):
 
     try:
         resp = await svc.client.share_update(
-            {"share_code": share_code, "action": "cancel"},
+            {"share_code": share_code, "action": "delete"},
             async_=True
         )
         if not resp.get("state"):
