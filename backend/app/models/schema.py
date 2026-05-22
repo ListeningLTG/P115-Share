@@ -98,6 +98,7 @@ class ShareAnalysisResult(Base):
     share_state: Mapped[int] = mapped_column(Integer, default=1)
     status_text: Mapped[str] = mapped_column(String(20), default="正常")
     is_violated: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_invalid: Mapped[bool] = mapped_column(Boolean, default=False)
     is_expired: Mapped[bool] = mapped_column(Boolean, default=False)
     is_reviewing: Mapped[bool] = mapped_column(Boolean, default=False)
     receive_count: Mapped[int] = mapped_column(Integer, default=0)

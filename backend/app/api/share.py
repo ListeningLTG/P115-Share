@@ -7,7 +7,7 @@ from app.services.account_manager import account_manager
 from app.core.config import settings
 from app.core.database import async_session
 from app.models.schema import ShareAnalysisResult, ShareAnalysisState, P115Account, SharePushTask
-from sqlalchemy import select, delete, desc
+from sqlalchemy import select, delete, desc, or_, func
 from loguru import logger
 import asyncio
 import time
@@ -38,8 +38,15 @@ def get_share_status(item: dict) -> dict:
     is_violated = False
     is_expired = False
     is_reviewing = False
+    is_invalid = False
 
-    if state == 6 or have_vio == 1:
+    if state == 6:
+        # share_state==6：链接已被 115 因违规撤销，公开访问返回 errno 4100009「链接已失效」
+        status_text = "已失效"
+        is_violated = True
+        is_invalid = True
+    elif have_vio == 1:
+        # have_vio_file==1：分享包含违规内容标记，但链接本身仍可访问（页面显示「文件内含违规内容」警告）
         status_text = "违规"
         is_violated = True
     elif state == 7:
@@ -54,6 +61,7 @@ def get_share_status(item: dict) -> dict:
     return {
         "status_text": status_text,
         "is_violated": is_violated,
+        "is_invalid": is_invalid,
         "is_expired": is_expired,
         "is_reviewing": is_reviewing,
     }
@@ -62,6 +70,19 @@ def get_share_status(item: dict) -> dict:
 # ──── 内存分析状态（按 account_id 分组）─────────────────────────────────
 # account_id(int) -> state dict
 _analysis_states: dict[int, dict] = {}
+
+# ──── 批量取消状态（按 account_id 分组）─────────────────────────────────
+_cancel_states: dict[int, dict] = {}
+
+def _get_cancel_state(account_id: int) -> dict:
+    if account_id not in _cancel_states:
+        _cancel_states[account_id] = {
+            "is_canceling": False,
+            "total": 0,
+            "done": 0,
+            "failed": 0,
+        }
+    return _cancel_states[account_id]
 
 def _get_state(account_id: int) -> dict:
     """获取或初始化某账号的内存分析状态"""
@@ -212,6 +233,7 @@ async def perform_share_analysis(account_id: int):
                     share_state=item.get("share_state"),
                     status_text=status_info["status_text"],
                     is_violated=status_info["is_violated"],
+                    is_invalid=status_info["is_invalid"],
                     is_expired=status_info["is_expired"],
                     is_reviewing=status_info["is_reviewing"],
                     receive_count=item.get("receive_count", 0),
@@ -241,8 +263,81 @@ async def perform_share_analysis(account_id: int):
         await _save_state_to_db(account_id)
 
 
-async def _get_default_account_id() -> Optional[int]:
-    """获取默认账号 ID（优先级最高的账号）"""
+async def _refresh_analysis_stats(account_id: int):
+    """从数据库重新计算分析统计并更新内存状态及数据库"""
+    async with async_session() as session:
+        rows = (await session.execute(
+            select(ShareAnalysisResult).where(ShareAnalysisResult.account_id == account_id)
+        )).scalars().all()
+    state = _get_state(account_id)
+    state["total"] = len(rows)
+    state["normal"] = sum(1 for r in rows if not r.is_violated and not r.is_expired and not r.is_reviewing)
+    state["violated"] = sum(1 for r in rows if r.is_violated)
+    state["expired"] = sum(1 for r in rows if r.is_expired)
+    state["reviewing"] = sum(1 for r in rows if r.is_reviewing)
+    state["scanned"] = state["total"]
+    await _save_state_to_db(account_id)
+
+
+async def perform_batch_cancel(account_id: int):
+    """批量取消已失效和已过期的分享"""
+    state = _get_cancel_state(account_id)
+    state["is_canceling"] = True
+    state["done"] = 0
+    state["failed"] = 0
+
+    svc = account_manager.get_service(account_id)
+    if not svc or not svc.client:
+        state["is_canceling"] = False
+        return
+
+    try:
+        async with async_session() as session:
+            stmt = select(ShareAnalysisResult).where(
+                ShareAnalysisResult.account_id == account_id,
+                or_(ShareAnalysisResult.is_invalid == True, ShareAnalysisResult.is_expired == True)
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            targets = [(r.id, r.share_code) for r in rows if r.share_code]
+
+        state["total"] = len(targets)
+        canceled_ids = []
+
+        for i, (db_id, share_code) in enumerate(targets):
+            try:
+                resp = await svc.client.share_update(
+                    {"share_code": share_code, "action": "cancel"},
+                    async_=True
+                )
+                if resp.get("state"):
+                    canceled_ids.append(db_id)
+                    state["done"] += 1
+                else:
+                    state["failed"] += 1
+                    logger.warning(f"取消分享 {share_code} 返回失败: {resp.get('error', '')}")
+            except Exception as e:
+                state["failed"] += 1
+                logger.warning(f"取消分享 {share_code} 异常: {e}")
+
+            if (i + 1) % 10 == 0:
+                await asyncio.sleep(0.5)
+
+        if canceled_ids:
+            async with async_session() as session:
+                await session.execute(
+                    delete(ShareAnalysisResult).where(ShareAnalysisResult.id.in_(canceled_ids))
+                )
+                await session.commit()
+
+        await _refresh_analysis_stats(account_id)
+        logger.info(f"批量取消完成: 成功 {state['done']}，失败 {state['failed']}")
+
+    except Exception as e:
+        logger.error(f"批量取消分享失败: {e}")
+    finally:
+        state["is_canceling"] = False
+
+
     async with async_session() as session:
         result = await session.execute(
             select(P115Account).where(P115Account.enabled == True).order_by(P115Account.priority).limit(1)
@@ -388,6 +483,7 @@ async def list_shares(
             "share_state": r.share_state,
             "status_text": r.status_text,
             "is_violated": r.is_violated,
+            "is_invalid": r.is_invalid,
             "is_expired": r.is_expired,
             "is_reviewing": r.is_reviewing,
             "receive_count": r.receive_count,
@@ -846,3 +942,91 @@ async def delete_push_task(task_id: int):
         await session.commit()
 
     return {"state": True, "message": "任务已删除"}
+
+
+# ──── 取消分享 ─────────────────────────────────────────────────────────────────
+
+@router.post("/cancel")
+async def cancel_share(share_code: str, account_id: Optional[int] = None):
+    """取消单个分享链接"""
+    if account_id is None:
+        account_id = await _get_default_account_id()
+    if account_id is None:
+        return {"state": False, "error": "未配置任何账号"}
+
+    svc = account_manager.get_service(account_id)
+    if not svc or not svc.client:
+        return {"state": False, "error": "账号未连接"}
+
+    try:
+        resp = await svc.client.share_update(
+            {"share_code": share_code, "action": "cancel"},
+            async_=True
+        )
+        if not resp.get("state"):
+            return {"state": False, "error": resp.get("error", "取消失败")}
+
+        async with async_session() as session:
+            await session.execute(
+                delete(ShareAnalysisResult).where(
+                    ShareAnalysisResult.account_id == account_id,
+                    ShareAnalysisResult.share_code == share_code,
+                )
+            )
+            await session.commit()
+
+        await _refresh_analysis_stats(account_id)
+        return {"state": True, "message": "取消成功"}
+    except Exception as e:
+        logger.error(f"取消分享 {share_code} 失败: {e}")
+        return {"state": False, "error": str(e)}
+
+
+@router.post("/cancel-invalid-expired")
+async def cancel_invalid_expired(
+    background_tasks: BackgroundTasks,
+    account_id: Optional[int] = None,
+):
+    """批量取消所有已失效和已过期的分享"""
+    if account_id is None:
+        account_id = await _get_default_account_id()
+    if account_id is None:
+        return {"state": False, "error": "未配置任何账号"}
+
+    state = _get_cancel_state(account_id)
+    if state["is_canceling"]:
+        return {"state": True, "message": "正在取消中，请稍候"}
+
+    async with async_session() as session:
+        count = (await session.execute(
+            select(func.count()).select_from(
+                select(ShareAnalysisResult).where(
+                    ShareAnalysisResult.account_id == account_id,
+                    or_(ShareAnalysisResult.is_invalid == True, ShareAnalysisResult.is_expired == True)
+                ).subquery()
+            )
+        )).scalar_one()
+
+    if count == 0:
+        return {"state": True, "message": "没有需要取消的分享", "count": 0}
+
+    background_tasks.add_task(perform_batch_cancel, account_id)
+    return {"state": True, "message": f"已启动批量取消任务，共 {count} 条", "count": count}
+
+
+@router.get("/cancel-status")
+async def get_cancel_status(account_id: Optional[int] = None):
+    """获取批量取消任务状态"""
+    if account_id is None:
+        account_id = await _get_default_account_id()
+    if account_id is None:
+        return {"is_canceling": False, "total": 0, "done": 0, "failed": 0}
+
+    state = _get_cancel_state(account_id)
+    return {
+        "account_id": account_id,
+        "is_canceling": state["is_canceling"],
+        "total": state["total"],
+        "done": state["done"],
+        "failed": state["failed"],
+    }
