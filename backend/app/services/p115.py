@@ -825,16 +825,25 @@ class P115Service:
                         "db_id": db_id
                     }
 
-                # Save to DB for persistence
+                # Save to DB for persistence（先检查是否已存在，避免重复入库）
+                from sqlalchemy import select as sa_select
                 async with async_session() as session:
-                    new_task = PendingLink(
-                        share_url=share_url,
-                        metadata_json=metadata or {},
-                        status=reason
+                    existing = await session.execute(
+                        sa_select(PendingLink).where(PendingLink.share_url == share_url)
                     )
-                    session.add(new_task)
-                    await session.commit()
-                    db_id = new_task.id
+                    existing_task = existing.scalars().first()
+                    if existing_task:
+                        logger.info(f"♻️ 发现已有等待任务 (id={existing_task.id})，复用现有记录: {share_url}")
+                        db_id = existing_task.id
+                    else:
+                        new_task = PendingLink(
+                            share_url=share_url,
+                            metadata_json=metadata or {},
+                            status=reason
+                        )
+                        session.add(new_task)
+                        await session.commit()
+                        db_id = new_task.id
                 
                 return {
                     "status": "pending",
@@ -1043,15 +1052,24 @@ class P115Service:
                         "db_id": db_id
                     }
 
+                from sqlalchemy import select as sa_select
                 async with async_session() as session:
-                    new_task = PendingLink(
-                        share_url=share_url,
-                        metadata_json=metadata or {},
-                        status="snapshotting"
+                    existing = await session.execute(
+                        sa_select(PendingLink).where(PendingLink.share_url == share_url)
                     )
-                    session.add(new_task)
-                    await session.commit()
-                    db_id = new_task.id
+                    existing_task = existing.scalars().first()
+                    if existing_task:
+                        logger.info(f"♻️ 发现已有等待任务 (id={existing_task.id})，复用现有记录: {share_url}")
+                        db_id = existing_task.id
+                    else:
+                        new_task = PendingLink(
+                            share_url=share_url,
+                            metadata_json=metadata or {},
+                            status="snapshotting"
+                        )
+                        session.add(new_task)
+                        await session.commit()
+                        db_id = new_task.id
                 
                 return {
                     "status": "pending",
@@ -1075,15 +1093,24 @@ class P115Service:
                         "db_id": db_id
                     }
 
+                from sqlalchemy import select as sa_select
                 async with async_session() as session:
-                    new_task = PendingLink(
-                        share_url=share_url,
-                        metadata_json=metadata or {},
-                        status="restricted"
+                    existing = await session.execute(
+                        sa_select(PendingLink).where(PendingLink.share_url == share_url)
                     )
-                    session.add(new_task)
-                    await session.commit()
-                    db_id = new_task.id
+                    existing_task = existing.scalars().first()
+                    if existing_task:
+                        logger.info(f"♻️ 发现已有等待任务 (id={existing_task.id})，复用现有记录: {share_url}")
+                        db_id = existing_task.id
+                    else:
+                        new_task = PendingLink(
+                            share_url=share_url,
+                            metadata_json=metadata or {},
+                            status="restricted"
+                        )
+                        session.add(new_task)
+                        await session.commit()
+                        db_id = new_task.id
                 
                 return {
                     "status": "pending",
