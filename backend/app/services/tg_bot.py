@@ -1160,7 +1160,7 @@ class TGService:
         from app.models.schema import PendingLink
         from sqlalchemy import select, delete
         async with async_session() as session:
-            result = await session.execute(select(PendingLink).where(PendingLink.status.in_(["auditing", "snapshotting", "restricted"])))
+            result = await session.execute(select(PendingLink).where(PendingLink.status.in_(["auditing", "snapshotting", "restricted", "no_space"])))
             tasks = result.scalars().all()
             if tasks:
                 # 按 share_url 去重：保留每个 URL 的最新一条（id 最大），删除其余重复行

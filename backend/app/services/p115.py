@@ -1143,6 +1143,62 @@ class P115Service:
                 }
                 return await self._handle_already_received(_cid, names, share_url, metadata, have_vio_file, retry_payload)
 
+            # 检查是否为"空间不足"异常：触发清理并将任务放入待重试队列
+            if "空间不足" in error_msg or "扩容" in error_msg:
+                logger.warning(f"⚠️ 检测到 115 账号空间不足，触发紧急清理并将任务放入待重试队列: {share_url}")
+                # 清理本次失败留下的空子目录（避免垃圾堆积）
+                _failed_cid = task_cid if 'task_cid' in locals() and task_cid else None
+                async def _cleanup_and_delete(failed_cid):
+                    if failed_cid:
+                        try:
+                            await self._api_call_with_timeout(
+                                self.client.fs_delete, failed_cid, async_=True,
+                                timeout=API_TIMEOUT, label="fs_delete_empty_subdir",
+                                **self._get_ios_ua_kwargs()
+                            )
+                            logger.info(f"🗑️ 已清理空间不足时留下的空子目录 (CID: {failed_cid})")
+                        except Exception:
+                            pass
+                    await self._do_cleanup_logic()
+                # 异步触发清理，不阻塞当前返回（清理本身耗时较长）
+                asyncio.create_task(_cleanup_and_delete(_failed_cid))
+
+                if db_id:
+                    return {
+                        "status": "pending",
+                        "reason": "no_space",
+                        "share_url": share_url,
+                        "metadata": metadata or {},
+                        "db_id": db_id
+                    }
+
+                from sqlalchemy import select as sa_select
+                async with async_session() as session:
+                    existing = await session.execute(
+                        sa_select(PendingLink).where(PendingLink.share_url == share_url)
+                    )
+                    existing_task = existing.scalars().first()
+                    if existing_task:
+                        logger.info(f"♻️ 发现已有等待任务 (id={existing_task.id})，复用现有记录: {share_url}")
+                        db_id = existing_task.id
+                    else:
+                        new_task = PendingLink(
+                            share_url=share_url,
+                            metadata_json=metadata or {},
+                            status="no_space"
+                        )
+                        session.add(new_task)
+                        await session.commit()
+                        db_id = new_task.id
+
+                return {
+                    "status": "pending",
+                    "reason": "no_space",
+                    "share_url": share_url,
+                    "metadata": metadata or {},
+                    "db_id": db_id
+                }
+
             logger.error("❌ 保存分享链接发生程序异常: {}", error_msg)
             return {
                 "status": "error",
