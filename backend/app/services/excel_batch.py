@@ -22,11 +22,16 @@ def _get_svc():
         pass
     return p115_service, None
 
+# 审核中条目重试配置
+AUDIT_MAX_RETRIES = 3         # 最大重试轮次
+AUDIT_RETRY_INTERVAL = 300    # 每轮重试前等待秒数（5分钟）
+
 class ExcelBatchService:
     def __init__(self):
         self.worker_task = None
         self.active_task_id = None
         self._lock = asyncio.Lock()
+        self._audit_retry_rounds: dict[int, int] = {}  # task_id -> 已重试轮次
 
     def _read_csv(self, content: bytes):
         """Try reading CSV with multiple encodings"""
@@ -418,17 +423,65 @@ class ExcelBatchService:
                                 )
                                 await session.commit()
                             else:
-                                # No more pending items for this task
-                                await session.execute(
-                                    update(ExcelTask).where(ExcelTask.id == task.id).values(
-                                        status="completed", 
-                                        current_row=0,
-                                        is_waiting=False
+                                # 主流程条目全部处理完 — 检查是否有「待审核」条目需要重试
+                                auditing_count = await session.scalar(
+                                    select(func.count(ExcelTaskItem.id)).where(
+                                        ExcelTaskItem.task_id == task.id,
+                                        ExcelTaskItem.status == "待审核"
                                     )
                                 )
-                                await session.commit()
-                                self.active_task_id = None
-                                continue
+
+                                if auditing_count > 0:
+                                    retry_round = self._audit_retry_rounds.get(task.id, 0) + 1
+                                    if retry_round > AUDIT_MAX_RETRIES:
+                                        logger.info(f"⏭️ 任务 {task.id} 中 {auditing_count} 个审核中条目已达最大重试轮次 ({AUDIT_MAX_RETRIES})，标记为跳过")
+                                        await session.execute(
+                                            update(ExcelTaskItem).where(
+                                                ExcelTaskItem.task_id == task.id,
+                                                ExcelTaskItem.status == "待审核"
+                                            ).values(status="跳过", error_msg=f"审核中超时，已达最大重试次数({AUDIT_MAX_RETRIES}轮)")
+                                        )
+                                        await session.execute(
+                                            update(ExcelTask).where(ExcelTask.id == task.id).values(
+                                                status="completed", current_row=0, is_waiting=False
+                                            )
+                                        )
+                                        await session.commit()
+                                        self._audit_retry_rounds.pop(task.id, None)
+                                        await self._update_task_counts(task.id)
+                                        self.active_task_id = None
+                                        continue
+                                    else:
+                                        self._audit_retry_rounds[task.id] = retry_round
+                                        logger.info(f"🔄 任务 {task.id} 主流程完成，第 {retry_round}/{AUDIT_MAX_RETRIES} 轮重试 {auditing_count} 个审核中条目，等待 {AUDIT_RETRY_INTERVAL}s...")
+                                        await session.execute(
+                                            update(ExcelTaskItem).where(
+                                                ExcelTaskItem.task_id == task.id,
+                                                ExcelTaskItem.status == "待审核"
+                                            ).values(status="待处理", error_msg=f"审核中，第 {retry_round} 轮重试")
+                                        )
+                                        await session.execute(
+                                            update(ExcelTask).where(ExcelTask.id == task.id).values(
+                                                current_row=0, is_waiting=True
+                                            )
+                                        )
+                                        await session.commit()
+                                        self.active_task_id = None
+                                        await asyncio.sleep(AUDIT_RETRY_INTERVAL)
+                                        continue
+                                else:
+                                    # 真正完成
+                                    await session.execute(
+                                        update(ExcelTask).where(ExcelTask.id == task.id).values(
+                                            status="completed",
+                                            current_row=0,
+                                            is_waiting=False
+                                        )
+                                    )
+                                    await session.commit()
+                                    self._audit_retry_rounds.pop(task.id, None)
+                                    self.active_task_id = None
+                                    continue
 
                         # Process the item
                         svc, acct_mgr = _get_svc()
@@ -713,8 +766,8 @@ class ExcelBatchService:
                     elif save_res.get("status") == "pending":
                         reason = save_res.get("reason")
                         if reason == "snapshotting":
-                            item.status = "待处理"
-                            item.error_msg = "快照生成中，已在后台排队处理"
+                            item.status = "待审核"
+                            item.error_msg = "快照生成中，等待本批次完成后自动重试"
                         elif reason == "restricted":
                             item.status = "待处理"
                             item.error_msg = "检测到115账号限制接收，等待恢复"
@@ -722,8 +775,8 @@ class ExcelBatchService:
                             await self._update_task_counts(task_id)
                             return "RESTRICTED"
                         else:
-                            item.status = "待处理"
-                            item.error_msg = "已在115审核队列"
+                            item.status = "待审核"
+                            item.error_msg = "审核中，等待本批次完成后自动重试"
                     elif save_res.get("status") == "skipped":
                         item.status = "跳过"
                         item.error_msg = save_res.get("message", "跳过处理")
@@ -802,6 +855,7 @@ class ExcelBatchService:
             task.strategy = strategy
             
             if not is_resume:
+                self._audit_retry_rounds.pop(task_id, None)
                 task.skip_count = skip_count
                 task.stop_row = stop_row
                 task.current_row = 0

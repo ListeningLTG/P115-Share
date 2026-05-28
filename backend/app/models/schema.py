@@ -131,7 +131,7 @@ class ExcelTaskItem(Base):
     original_url: Mapped[str] = mapped_column(String(255))
     title: Mapped[str] = mapped_column(String(255), nullable=True)
     extraction_code: Mapped[str] = mapped_column(String(50), nullable=True)
-    status: Mapped[str] = mapped_column(String(20), default="待处理")  # 待处理, 处理中, 成功, 失败, 跳过
+    status: Mapped[str] = mapped_column(String(20), default="待处理")  # 待处理, 处理中, 成功, 失败, 跳过, 待审核
     new_share_url: Mapped[str] = mapped_column(Text, nullable=True)
     error_msg: Mapped[str] = mapped_column(Text, nullable=True)
     item_metadata: Mapped[dict] = mapped_column(JSON, nullable=True)  # Store original message text and entities
