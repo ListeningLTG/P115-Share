@@ -30,6 +30,7 @@ class ExcelBatchService:
     def __init__(self):
         self.worker_task = None
         self.active_task_id = None
+        self.active_task_strategy = None  # 当前活跃任务的策略: 'transfer' | 'push'
         self._lock = asyncio.Lock()
         self._audit_retry_rounds: dict[int, int] = {}  # task_id -> 已重试轮次
 
@@ -397,6 +398,7 @@ class ExcelBatchService:
                         break
                     
                     self.active_task_id = task.id
+                    self.active_task_strategy = task.strategy
                     interval_min = task.interval_min
                     interval_max = task.interval_max
                     

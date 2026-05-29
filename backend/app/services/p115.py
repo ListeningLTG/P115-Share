@@ -125,12 +125,15 @@ class P115Service:
         if self.account:
             asyncio.create_task(self._persist_restriction(self._restriction_until))
 
-        # Pause Batch Tasks
+        # Pause Batch Tasks（直接推送模式不受全局限制影响，仅暂停转存分享模式）
         try:
             from app.services.excel_batch import excel_batch_service
             if excel_batch_service and excel_batch_service.active_task_id:
-                task_id = excel_batch_service.active_task_id
-                asyncio.create_task(excel_batch_service.pause_task(task_id))
+                if excel_batch_service.active_task_strategy == "push":
+                    logger.info("当前批量任务为直接推送模式，不受全局限制影响，跳过暂停。")
+                else:
+                    task_id = excel_batch_service.active_task_id
+                    asyncio.create_task(excel_batch_service.pause_task(task_id))
         except Exception as e:
             logger.error(f"暂停批量任务失败: {e}")
 
