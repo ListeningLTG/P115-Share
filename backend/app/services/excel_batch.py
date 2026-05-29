@@ -487,7 +487,7 @@ class ExcelBatchService:
 
                         # Process the item
                         svc, acct_mgr = _get_svc()
-                        if svc.is_restricted:
+                        if task.strategy != "push" and svc.is_restricted:
                             # 尝试切换到未被风控的账号
                             new_svc, new_acct_mgr = _get_svc()
                             if new_svc is not svc and not new_svc.is_restricted:
