@@ -39,6 +39,9 @@ class ConfigUpdate(BaseModel):
     p115_rate_limit_window: Optional[int] = None
     p115_rate_limit_silent_duration: Optional[int] = None
     p115_batch_yield_duration: Optional[int] = None
+    direct_save_account_id: Optional[int] = None
+    direct_save_dir: Optional[str] = None
+    tg_default_command_mode: Optional[str] = None
 
     @field_validator('p115_cleanup_dir_cron', 'p115_cleanup_trash_cron')
     @classmethod
@@ -141,6 +144,14 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
     for field in limit_fields:
         if field in update_data:
             await settings.save_setting(field.upper(), update_data[field])
+
+    # 4.7 Update Direct Save settings
+    if "direct_save_account_id" in update_data:
+        await settings.save_setting("DIRECT_SAVE_ACCOUNT_ID", cfg.direct_save_account_id)
+    if "direct_save_dir" in update_data:
+        await settings.save_setting("DIRECT_SAVE_DIR", cfg.direct_save_dir)
+    if "tg_default_command_mode" in update_data:
+        await settings.save_setting("TG_DEFAULT_COMMAND_MODE", cfg.tg_default_command_mode)
     
     if capacity_changed:
         from app.services.scheduler import cleanup_scheduler
@@ -184,6 +195,9 @@ async def get_config(user=Depends(get_current_user)):
         "p115_rate_limit_window": settings.P115_RATE_LIMIT_WINDOW,
         "p115_rate_limit_silent_duration": settings.P115_RATE_LIMIT_SILENT_DURATION,
         "p115_batch_yield_duration": settings.P115_BATCH_YIELD_DURATION,
+        "direct_save_account_id": settings.DIRECT_SAVE_ACCOUNT_ID,
+        "direct_save_dir": settings.DIRECT_SAVE_DIR,
+        "tg_default_command_mode": settings.TG_DEFAULT_COMMAND_MODE,
         "version": VERSION
     }
 

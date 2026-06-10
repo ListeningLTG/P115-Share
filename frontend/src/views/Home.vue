@@ -32,6 +32,10 @@
           <template #icon><CloudServerOutlined /></template>
           <span>账号管理</span>
         </a-menu-item>
+        <a-menu-item key="scheduled" @click="currentView = 'scheduled'">
+          <template #icon><ClockCircleOutlined /></template>
+          <span>定时分享管理</span>
+        </a-menu-item>
         <!-- <a-menu-item key="sensitive" @click="currentView = 'sensitive'">
           <template #icon><WarningOutlined /></template>
           <span>敏感词库</span>
@@ -76,6 +80,10 @@
         <a-menu-item key="accounts" @click="currentView = 'accounts'">
           <template #icon><CloudServerOutlined /></template>
           <span>账号管理</span>
+        </a-menu-item>
+        <a-menu-item key="scheduled" @click="currentView = 'scheduled'">
+          <template #icon><ClockCircleOutlined /></template>
+          <span>定时分享管理</span>
         </a-menu-item>
         <!-- <a-menu-item key="sensitive" @click="currentView = 'sensitive'">
           <template #icon><WarningOutlined /></template>
@@ -152,6 +160,7 @@
           <LogViewer v-if="currentView === 'logs'" />
           <AccountManager v-if="currentView === 'accounts'" />
           <Sensitive v-if="currentView === 'sensitive'" />
+          <ScheduledShareManager v-if="currentView === 'scheduled'" />
           <Settings v-if="currentView === 'settings'" />
         </div>
       </a-layout-content>
@@ -204,7 +213,8 @@ import {
   BulbOutlined,
   FileExcelOutlined,
   ShareAltOutlined,
-  CloudServerOutlined
+  CloudServerOutlined,
+  ClockCircleOutlined
 } from '@ant-design/icons-vue';
 import { Grid, message, theme } from 'ant-design-vue';
 import Dashboard from './Dashboard.vue';
@@ -214,6 +224,7 @@ import LogViewer from './LogViewer.vue';
 import Settings from './Settings.vue';
 import AccountManager from './AccountManager.vue';
 import Sensitive from './Sensitive.vue';
+import ScheduledShareManager from './ScheduledShareManager.vue';
 import { useAuthStore } from '../stores/auth';
 import { useThemeStore } from '../stores/theme';
 import { useRouter } from 'vue-router';

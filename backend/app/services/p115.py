@@ -407,6 +407,12 @@ class P115Service:
         is_default = path is None
         path = path or self.save_dir or "/分享保存"
         
+        # Standardize path and check if it represents root
+        path_str = str(path).strip().replace('\\', '/')
+        if path_str in ('', '/', '.'):
+            logger.info("📂 目标为根目录，直接返回 CID: 0")
+            return 0
+            
         # Return cached CID if available and using default path
         if is_default and self._save_dir_cid > 0:
             logger.debug(f"📂 使用缓存的保存目录 CID: {self._save_dir_cid}")
@@ -558,14 +564,33 @@ class P115Service:
                 "message": f"保存失败，且重试转存报错: {str(check_e)}"
             }
 
-    async def save_share_link(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, is_batch: bool = False):
+    async def save_share_link(
+        self,
+        share_url: str,
+        metadata: dict = None,
+        target_dir: Optional[str] = None,
+        skip_large_package: bool = False,
+        is_batch: bool = False,
+        db_id: Optional[int] = None,
+        create_task_subdir: bool = False
+    ):
         """通过队列保存链接"""
-        return await self._enqueue_op(f"save_share_link({share_url})", self._save_share_link_internal, share_url, metadata, target_dir, skip_large_package, is_batch=is_batch)
+        return await self._enqueue_op(
+            f"save_share_link({share_url})",
+            self._save_share_link_internal,
+            share_url,
+            metadata,
+            target_dir,
+            skip_large_package,
+            db_id,
+            create_task_subdir,
+            is_batch=is_batch
+        )
 
     async def save_and_share(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, db_id: Optional[int] = None, is_batch: bool = False):
         """通过队列进行转存并分享"""
         async def _internal_flow():
-            save_res = await self._save_share_link_internal(share_url, metadata, target_dir, skip_large_package, db_id=db_id)
+            save_res = await self._save_share_link_internal(share_url, metadata, target_dir, skip_large_package, db_id=db_id, create_task_subdir=True)
             if save_res and save_res.get("status") == "success":
                 share_res = await self.create_share_link(save_res)
                 if isinstance(share_res, str):
@@ -752,7 +777,15 @@ class P115Service:
         except Exception as e:
             logger.warning(f"margin 失败回调通知失败: {e}")
 
-    async def _save_share_link_internal(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, db_id: Optional[int] = None):
+    async def _save_share_link_internal(
+        self,
+        share_url: str,
+        metadata: dict = None,
+        target_dir: Optional[str] = None,
+        skip_large_package: bool = False,
+        db_id: Optional[int] = None,
+        create_task_subdir: bool = True
+    ):
         """Internal logic for saving a 115 share link (no locking)"""
         if not self.client:
             logger.warning("P115Client not initialized, cannot save link")
@@ -982,23 +1015,31 @@ class P115Service:
             to_cid = await self._ensure_save_dir(target_dir)
 
             # 为本次任务创建独立子目录，完全隔离不同任务的文件，避免分享时误纳入其他文件
-            task_folder_name = f"{int(time.time())}"
-            logger.info(f"📁 为本次任务创建独立子目录: {task_folder_name} (父目录 CID: {to_cid})")
-            sub_dir_resp = await self._api_call_with_timeout(
-                self.client.fs_makedirs_app, task_folder_name, pid=to_cid, async_=True,
-                label="fs_makedirs_task_subdir",
-                **self._get_ios_ua_kwargs()
-            )
-            check_response(sub_dir_resp)
-            task_cid = int(
-                sub_dir_resp.get("cid")
-                or sub_dir_resp.get("id")
-                or (sub_dir_resp.get("data") or {}).get("cid")
-                or 0
-            )
-            if not task_cid:
-                raise RuntimeError(f"创建任务子目录失败，未获取到有效 CID: {sub_dir_resp}")
-            logger.info(f"✅ 任务子目录已创建: {task_folder_name} (CID: {task_cid})")
+            if create_task_subdir:
+                clean_title = re.sub(r'[\\/:*?"<>|]', '', share_title).strip()
+                if clean_title:
+                    task_folder_name = f"{clean_title}_{time.strftime('%Y%m%d_%H%M%S')}"
+                else:
+                    task_folder_name = f"{int(time.time())}"
+                logger.info(f"📁 为本次任务创建独立子目录: {task_folder_name} (父目录 CID: {to_cid})")
+                sub_dir_resp = await self._api_call_with_timeout(
+                    self.client.fs_makedirs_app, task_folder_name, pid=to_cid, async_=True,
+                    label="fs_makedirs_task_subdir",
+                    **self._get_ios_ua_kwargs()
+                )
+                check_response(sub_dir_resp)
+                task_cid = int(
+                    sub_dir_resp.get("cid")
+                    or sub_dir_resp.get("id")
+                    or (sub_dir_resp.get("data") or {}).get("cid")
+                    or 0
+                )
+                if not task_cid:
+                    raise RuntimeError(f"创建任务子目录失败，未获取到有效 CID: {sub_dir_resp}")
+                logger.info(f"✅ 任务子目录已创建: {task_folder_name} (CID: {task_cid})")
+            else:
+                task_cid = to_cid
+                task_folder_name = ""
 
             receive_payload = {
                 "share_code": payload["share_code"],
@@ -1561,9 +1602,9 @@ class P115Service:
             return "\n".join(f"链接 {idx}: {link}" for idx, link in enumerate(result_links, 1))
         return result_links[0]
 
-    async def _snapshot_dir_ids(self, cid: int) -> set:
-        """快照目录中所有顶层文件/文件夹的 ID，用于保存前后 diff 找新增项（自动翻页，避免 >1000 条时漏记）"""
-        ids = set()
+    async def _get_dir_items(self, cid: int) -> list:
+        """获取目录中所有顶层文件/文件夹的详细信息，用于保存前后 diff 或目录树展示（自动翻页，避免 >1000 条时漏记）"""
+        items = []
         offset = 0
         limit = 1000
         try:
@@ -1572,13 +1613,13 @@ class P115Service:
                     self.client.fs_files_app2,
                     {"cid": cid, "limit": limit, "offset": offset, "show_dir": 1},
                     async_=True,
-                    timeout=30, max_retries=2, label="fs_files_snapshot",
+                    timeout=30, max_retries=2, label="fs_files_get_items",
                     **self._get_ios_ua_kwargs()
                 )
                 # 🛡️ 检测 115 限速响应
                 if self._is_margin_response(resp):
                     margin_val = int(resp.get("margin", 5))
-                    logger.warning(f"⚠️ fs_files 快照触发 115 限速 (margin={margin_val})，等待后重试")
+                    logger.warning(f"⚠️ fs_files 获取项触发 115 限速 (margin={margin_val})，等待后重试")
                     await asyncio.sleep(max(margin_val, 3))
                     continue
                 check_response(resp)
@@ -1587,15 +1628,28 @@ class P115Service:
                     file_list = file_list.get("list", [])
                 for item in file_list:
                     item_id = item.get("fid") or item.get("cid") or item.get("file_id") or item.get("category_id") or item.get("id")
-                    if item_id:
-                        ids.add(str(item_id))
+                    item_name = item.get("n") or item.get("fn") or item.get("name") or item.get("file_name") or item.get("title") or item.get("category_name")
+                    if item_id and item_name:
+                        # 文件夹通常不含 "fid" 字段，或者含 "cid"
+                        is_dir = "fid" not in item
+                        items.append({
+                            "id": str(item_id),
+                            "name": str(item_name),
+                            "is_dir": is_dir
+                        })
                 if len(file_list) < limit:
                     break  # 已是最后一页
                 offset += limit
-                logger.debug(f"📄 快照目录 {cid} 翻页: offset={offset}, 已收集 {len(ids)} 个 ID")
+                logger.debug(f"📄 快照目录 {cid} 翻页: offset={offset}, 已收集 {len(items)} 个项")
         except Exception as e:
-            logger.warning(f"⚠️ 快照目录 {cid} 失败: {e}")
-        return ids
+            logger.warning(f"⚠️ 获取目录 {cid} 顶级项失败: {e}")
+        return items
+
+    async def _snapshot_dir_ids(self, cid: int) -> set:
+        """快照目录中所有顶层文件/文件夹的 ID，用于保存前后 diff 找新增项（自动翻页，避免 >1000 条时漏记）"""
+        items = await self._get_dir_items(cid)
+        return {item["id"] for item in items}
+
 
     async def _find_files_in_dir(self, cid: int, target_names: list, save_start_time: int = 0) -> list:
         """在指定目录中查找文件，使用多种方式确保找到

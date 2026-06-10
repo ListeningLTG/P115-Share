@@ -191,3 +191,22 @@ class SharePushTask(Base):
     failed_ids: Mapped[dict] = mapped_column(JSON, default=list)  # 推送失败的分享ID列表
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ScheduledShareTask(Base):
+    """定时目录分享任务表"""
+    __tablename__ = "scheduled_share_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    account_id: Mapped[int] = mapped_column(Integer, index=True)
+    dir_path: Mapped[str] = mapped_column(String(255))                               # 115网盘目录路径，例如 /电影
+    cron_expression: Mapped[str] = mapped_column(String(50))                         # cron定时表达式，如 0 3 * * *
+    clear_files: Mapped[bool] = mapped_column(Boolean, default=False)                # 定时执行后是否清空原目录下的文件
+    target_channels: Mapped[dict] = mapped_column(JSON, default=list)                # 要推送的TG频道列表，支持多选
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)                      # 任务是否启用
+    status: Mapped[str] = mapped_column(String(50), default="waiting")               # 当前运行状态 (waiting, running, success, failed)
+    last_run_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)           # 最近一次执行时间
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+

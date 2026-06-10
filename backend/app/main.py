@@ -17,6 +17,7 @@ from app.api.excel import router as excel_router
 from app.api.share import router as share_router
 from app.api.accounts import router as accounts_router
 from app.api.sensitive import router as sensitive_router
+from app.api.scheduled_share import router as scheduled_share_router
 from app.services.tg_bot import tg_service
 from app.version import VERSION
 
@@ -127,6 +128,7 @@ async def lifespan(app: FastAPI):
     # Start cleanup scheduler  
     from app.services.scheduler import cleanup_scheduler
     cleanup_scheduler.start()
+    await cleanup_scheduler.sync_all_scheduled_share_jobs()
     
     # Excel Batch recovery and logic
     from app.services.excel_batch import excel_batch_service
@@ -162,6 +164,7 @@ app.include_router(excel_router, prefix="/api")
 app.include_router(share_router, prefix="/api")
 app.include_router(accounts_router, prefix="/api")
 app.include_router(sensitive_router, prefix="/api")
+app.include_router(scheduled_share_router, prefix="/api")
 
 # Mount static files separately (highest priority for /static)
 app.mount("/static", StaticFiles(directory="static"), name="static")

@@ -142,6 +142,40 @@
           <a-divider />
           <a-button type="primary" @click="onFinish('proxy')" :loading="loading" block>保存代理配置</a-button>
         </a-collapse-panel>
+
+        <a-collapse-panel key="save" header="直接保存 & 默认行为">
+          <a-form-item label="默认指令模式" name="tg_default_command_mode">
+            <template #extra>
+              <div style="font-size: 12px; color: #999; margin-top: 4px">TG 机器人收到链接且无 /save 或 /share 指令时的全局默认处理模式。</div>
+            </template>
+            <a-select v-model:value="formState.tg_default_command_mode">
+              <a-select-option value="share">分享并推送 (share)</a-select-option>
+              <a-select-option value="save">直接保存不推送 (save)</a-select-option>
+            </a-select>
+          </a-form-item>
+
+          <a-form-item label="直接保存账号" name="direct_save_account_id">
+            <template #extra>
+              <div style="font-size: 12px; color: #999; margin-top: 4px">使用 /save 指令时，将资源保存至哪个 115 账号。</div>
+            </template>
+            <a-select v-model:value="formState.direct_save_account_id">
+              <a-select-option :value="0">默认/首选账号</a-select-option>
+              <a-select-option v-for="acc in accounts" :key="acc.id" :value="acc.id">
+                {{ acc.name }} (ID: {{ acc.id }})
+              </a-select-option>
+            </a-select>
+          </a-form-item>
+
+          <a-form-item label="直接保存目录" name="direct_save_dir">
+            <template #extra>
+              <div style="font-size: 12px; color: #999; margin-top: 4px">直接转存时在 115 网盘中存放的相对目标路径。</div>
+            </template>
+            <a-input v-model:value="formState.direct_save_dir" placeholder="例如 115-Share/DirectSave" />
+          </a-form-item>
+
+          <a-divider />
+          <a-button type="primary" @click="onFinish('save')" :loading="loading" block>保存保存与行为配置</a-button>
+        </a-collapse-panel>
       </a-collapse>
     </a-form>
   </div>
@@ -171,6 +205,13 @@ interface ChannelConfig {
 
 const tgChannels = ref<ChannelConfig[]>([]);
 
+interface Account {
+  id: number;
+  name: string;
+  enabled: boolean;
+}
+const accounts = ref<Account[]>([]);
+
 const formState = reactive({
   tg_bot_token: '',
   tg_user_id: '',
@@ -182,7 +223,19 @@ const formState = reactive({
   proxy_user: '',
   proxy_pass: '',
   proxy_type: 'HTTP',
+  direct_save_account_id: 0,
+  direct_save_dir: '115-Share/DirectSave',
+  tg_default_command_mode: 'share',
 });
+
+const loadAccounts = async () => {
+  try {
+    const res = await axios.get('/api/accounts/');
+    accounts.value = res.data.accounts || [];
+  } catch (e) {
+    console.error("加载账号列表失败:", e);
+  }
+};
 
 const addChannel = () => {
   tgChannels.value.push({ id: '', enabled: true, concise: false, auto_forward: true, remove_image: false, flatten_link: false, name: '' });
@@ -250,16 +303,20 @@ const loadConfig = async () => {
     formState.proxy_user = res.data.proxy_user || '';
     formState.proxy_pass = res.data.proxy_pass || '';
     formState.proxy_type = res.data.proxy_type || 'HTTP';
+    formState.direct_save_account_id = res.data.direct_save_account_id !== undefined ? res.data.direct_save_account_id : 0;
+    formState.direct_save_dir = res.data.direct_save_dir || '115-Share/DirectSave';
+    formState.tg_default_command_mode = res.data.tg_default_command_mode || 'share';
   } catch (e) {
     console.error(e);
   }
 };
 
-const onFinish = async (section: 'tg' | 'proxy' = 'tg') => {
+const onFinish = async (section: 'tg' | 'proxy' | 'save' = 'tg') => {
   try {
     const sectionFields: Record<string, string[]> = {
       tg: ['tg_bot_token', 'tg_user_id', 'tg_allow_chats', 'tg_skip_large_package'],
-      proxy: ['proxy_enabled', 'proxy_host', 'proxy_port', 'proxy_user', 'proxy_pass', 'proxy_type']
+      proxy: ['proxy_enabled', 'proxy_host', 'proxy_port', 'proxy_user', 'proxy_pass', 'proxy_type'],
+      save: ['direct_save_account_id', 'direct_save_dir', 'tg_default_command_mode']
     };
 
     await formRef.value.validate(sectionFields[section]!);
@@ -288,7 +345,10 @@ const onFinish = async (section: 'tg' | 'proxy' = 'tg') => {
     }
 
     const res = await axios.post('/api/config/update', payload);
-    message.success(section === 'tg' ? 'Telegram 配置已保存' : '代理配置已保存');
+    message.success(
+      section === 'tg' ? 'Telegram 配置已保存' :
+      section === 'proxy' ? '代理配置已保存' : '保存与行为配置已保存'
+    );
     if (res.data.bot_restarted) {
       message.info('机器人已根据新配置安全重启');
     }
@@ -366,7 +426,10 @@ const detectProtocol = async () => {
   }
 };
 
-onMounted(loadConfig);
+onMounted(() => {
+  loadConfig();
+  loadAccounts();
+});
 </script>
 
 <style scoped>

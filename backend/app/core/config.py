@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     P115_COOKIE: str = ""
     P115_SAVE_DIR: str = "115-Share"
     
+    # Direct save configuration
+    DIRECT_SAVE_ACCOUNT_ID: int = 0
+    DIRECT_SAVE_DIR: str = "115-Share/DirectSave"
+    TG_DEFAULT_COMMAND_MODE: str = "share"
+
+    
     # App
     WEB_PORT: int = 8000
     LOG_LEVEL: str = "INFO"

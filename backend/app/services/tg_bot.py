@@ -259,8 +259,15 @@ class TGService:
         share_urls = filtered_urls
         # ────────────────────────────────────────────────────────────────
 
+        # Determine command mode
+        command_mode = settings.TG_DEFAULT_COMMAND_MODE
+        if full_text.startswith("/save"):
+            command_mode = "save"
+        elif full_text.startswith("/share"):
+            command_mode = "share"
+
         total_links = len(share_urls)
-        logger.info(f"🎯 发现 {total_links} 个 115 链接，开始批量处理...")
+        logger.info(f"🎯 发现 {total_links} 个 115 链接，开始批量处理 (模式: {command_mode})...")
 
         # 通过负载均衡选择本次处理使用的账号（用列表包装，闭包内可重新赋值）
         _svc_box, _acct_mgr_box = [None], [None]
@@ -298,15 +305,32 @@ class TGService:
             svc = _svc_box[0]
             acct_mgr = _acct_mgr_box[0]
             try:
-                # 0. Check history first
-                history_share_link = await svc.get_history_link(share_url)
+                # Clean description for folder/link naming
+                clean_description = full_text
+                if clean_description.startswith("/save"):
+                    clean_description = clean_description[5:].strip()
+                elif clean_description.startswith("/share"):
+                    clean_description = clean_description[6:].strip()
 
-                if history_share_link:
-                    logger.info(f"✨ [{index}/{total_links}] 发现历史记录: {share_url}")
-                    processed_links[share_url] = history_share_link
-                    await message.reply(f"✅ 处理成功！\n长期分享链接：\n{history_share_link}")
-                    await message.reply(f"🔔 链接保存成功！\n原链接: {share_url}\n新分享: {history_share_link}")
-                    return True, history_share_link
+                metadata = {
+                    "description": clean_description.strip(),
+                    "full_text": segment_info["text"] if segment_info else full_text,
+                    "photo_id": segment_info["photo_id"] if segment_info else (photo.file_id if photo else None),
+                    "share_url": share_url,
+                    "entities": segment_info["entities"] if segment_info else ser_entities,
+                    "command_mode": command_mode
+                }
+
+                # 0. Check history first (Only for share mode)
+                if command_mode == "share":
+                    history_share_link = await svc.get_history_link(share_url)
+
+                    if history_share_link:
+                        logger.info(f"✨ [{index}/{total_links}] 发现历史记录: {share_url}")
+                        processed_links[share_url] = history_share_link
+                        await message.reply(f"✅ 处理成功！\n长期分享链接：\n{history_share_link}")
+                        await message.reply(f"🔔 链接保存成功！\n原链接: {share_url}\n新分享: {history_share_link}")
+                        return True, history_share_link
 
                 # 1. Check restriction & queue status
                 q_size = svc.queue_size
@@ -330,14 +354,54 @@ class TGService:
                         await message.reply(f"⏳ 系统繁忙，您的请求已加入队列（当前排在第 {position} 位），请稍候...")
 
                 # 2. Save link with metadata
-                # Use segmented metadata if available
-                metadata = {
-                    "description": full_text.strip(),
-                    "full_text": segment_info["text"] if segment_info else full_text,
-                    "photo_id": segment_info["photo_id"] if segment_info else (photo.file_id if photo else None),
-                    "share_url": share_url,
-                    "entities": segment_info["entities"] if segment_info else ser_entities
-                }
+                # Determine correct service for saving
+                save_svc = svc
+                if command_mode == "save" and settings.DIRECT_SAVE_ACCOUNT_ID and acct_mgr:
+                    custom_svc = acct_mgr.get_service(settings.DIRECT_SAVE_ACCOUNT_ID)
+                    if custom_svc and custom_svc.is_connected:
+                        save_svc = custom_svc
+
+                if command_mode == "save":
+                    save_res = await save_svc.save_share_link(
+                        share_url,
+                        metadata=metadata,
+                        target_dir=settings.DIRECT_SAVE_DIR,
+                        skip_large_package=True
+                    )
+                    if save_res:
+                        if save_res.get("status") == "success":
+                            acc_name = save_svc.account.name if save_svc.account else "默认账号"
+                            names = save_res.get("names", [])
+                            names_str = ", ".join(names[:3]) + ("..." if len(names) > 3 else "")
+                            await message.reply(
+                                f"✅ 直接保存成功！\n"
+                                f"原链接: {share_url}\n"
+                                f"保存账号: {acc_name}\n"
+                                f"保存路径: {settings.DIRECT_SAVE_DIR}\n"
+                                f"包含项目: {names_str}"
+                            )
+                            return True, None
+                        elif save_res.get("status") == "skipped":
+                            await message.reply("⚠️ 此分享链接为大包，已跳过处理")
+                            return "skipped", None
+                        elif save_res.get("status") == "pending":
+                            reason = save_res.get("reason", "auditing")
+                            if reason == "restricted":
+                                logger.info(f"🚫 账号受限排队中: {share_url}")
+                            else:
+                                logger.info(f"🔍 分享链接正在审核中: {share_url}")
+                            
+                            asyncio.create_task(self.poll_pending_link(message, save_res))
+                            return save_res, None
+                        elif save_res.get("status") == "error":
+                            error_type = save_res.get("error_type")
+                            error_msg = save_res.get("message") or "未知错误"
+                            logger.warning(f"⚠️ 处理链接失败 ({error_type}): {error_msg}")
+                            await message.reply(f"❌ 直接保存失败: {error_msg}")
+                            return save_res, None
+                    return {"error_type": "unknown", "message": "处理过程中发生未知错误"}, None
+
+                # Share mode
                 save_res = await svc.save_and_share(
                     share_url,
                     metadata=metadata,
@@ -484,27 +548,28 @@ class TGService:
 
             if res is True:
                 success_count += 1
-                # Broadcast this segment IMMEDIATELY
-                if target_segment:
-                    await self.broadcast_to_channels(
-                        {url: share_link}, 
-                        {
-                            "full_text": target_segment["text"],
-                            "entities": target_segment["entities"],
-                            "photo_id": target_segment["photo_id"]
-                        }
-                    )
-                else:
-                    # URL not found in visible text (e.g. text_link entity),
-                    # broadcast with the full original message metadata
-                    await self.broadcast_to_channels(
-                        {url: share_link},
-                        {
-                            "full_text": full_text,
-                            "entities": ser_entities,
-                            "photo_id": photo.file_id if photo else None
-                        }
-                    )
+                # Broadcast this segment IMMEDIATELY only if share_link is generated
+                if share_link:
+                    if target_segment:
+                        await self.broadcast_to_channels(
+                            {url: share_link}, 
+                            {
+                                "full_text": target_segment["text"],
+                                "entities": target_segment["entities"],
+                                "photo_id": target_segment["photo_id"]
+                            }
+                        )
+                    else:
+                        # URL not found in visible text (e.g. text_link entity),
+                        # broadcast with the full original message metadata
+                        await self.broadcast_to_channels(
+                            {url: share_link},
+                            {
+                                "full_text": full_text,
+                                "entities": ser_entities,
+                                "photo_id": photo.file_id if photo else None
+                            }
+                        )
             elif res == "pending":
                 pending_count += 1
             elif res == "skipped":
@@ -688,8 +753,57 @@ class TGService:
                     svc.clear_restriction()
 
                 logger.info(f"🎉 链接可以开始处理 (status: {status_info['share_state']}): {share_url}")
-                if acct_mgr and svc.account:
-                    asyncio.create_task(acct_mgr.update_last_used(svc.account.id))
+                
+                # Check command mode
+                command_mode = metadata.get("command_mode", "share")
+                
+                # Determine correct service
+                save_svc = svc
+                if command_mode == "save" and settings.DIRECT_SAVE_ACCOUNT_ID and acct_mgr:
+                    custom_svc = acct_mgr.get_service(settings.DIRECT_SAVE_ACCOUNT_ID)
+                    if custom_svc and custom_svc.is_connected:
+                        save_svc = custom_svc
+
+                if acct_mgr and save_svc.account:
+                    asyncio.create_task(acct_mgr.update_last_used(save_svc.account.id))
+
+                if command_mode == "save":
+                    save_res = await save_svc.save_share_link(share_url, metadata=metadata, target_dir=settings.DIRECT_SAVE_DIR, db_id=pending_info.get("db_id"))
+                    if save_res and save_res.get("status") == "success":
+                        logger.info(f"✅ 审核通过后直接保存成功: {share_url}")
+                        acc_name = save_svc.account.name if save_svc.account else "默认账号"
+                        names = save_res.get("names", [])
+                        names_str = ", ".join(names[:3]) + ("..." if len(names) > 3 else "")
+                        success_text = f"✅ 直接保存成功！\n原链接: {share_url}\n保存账号: {acc_name}\n保存路径: {settings.DIRECT_SAVE_DIR}\n包含项目: {names_str}"
+                        if not silent:
+                            await message.reply(success_text)
+                        
+                        # Notify admin if not silent and not admin chat
+                        is_admin_chat = settings.TG_USER_ID and str(message.chat.id) == str(settings.TG_USER_ID)
+                        if not is_admin_chat:
+                            try:
+                                await self.send_admin_msg(f"🔔 [后台处理] {success_text}")
+                            except Exception:
+                                pass
+                        
+                        await self._delete_pending_task(pending_info.get("db_id"))
+                        return
+                    elif save_res and save_res.get("status") == "pending":
+                        new_reason = save_res.get("reason", reason)
+                        logger.warning(f"⚠️ 尝试直接保存时再次返回排队状态(原因: {new_reason})，维持轮询: {share_url}")
+                        reason = new_reason
+                        continue
+                    else:
+                        logger.error(f"❌ 审核通过后直接保存仍然失败: {share_url}")
+                        error_msg = "自动直接保存失败，请手动尝试"
+                        if isinstance(save_res, dict) and save_res.get("message"):
+                            error_msg = save_res.get("message")
+                        if not silent:
+                            await message.reply(f"❌ 直接保存失败: {error_msg}")
+                        await self._delete_pending_task(pending_info.get("db_id"))
+                        return
+
+                # Share mode (original flow)
                 save_res = await svc.save_and_share(share_url, metadata=metadata, db_id=pending_info.get("db_id"))
                 
                 if save_res and save_res.get("status") == "success":
