@@ -1158,20 +1158,39 @@ class TGService:
     async def recover_pending_tasks(self):
         from app.core.database import async_session
         from app.models.schema import PendingLink
-        from sqlalchemy import select
+        from sqlalchemy import select, delete
         async with async_session() as session:
-            result = await session.execute(select(PendingLink).where(PendingLink.status.in_(["auditing", "snapshotting", "restricted"])))
+            result = await session.execute(select(PendingLink).where(PendingLink.status.in_(["auditing", "snapshotting", "restricted", "no_space"])))
             tasks = result.scalars().all()
             if tasks:
+                # 按 share_url 去重：保留每个 URL 的最新一条（id 最大），删除其余重复行
+                seen_urls: dict[str, PendingLink] = {}
+                dup_ids: list[int] = []
+                for task in tasks:
+                    if task.share_url in seen_urls:
+                        # 保留 id 较大（较新）的那条，丢弃较旧的
+                        older = seen_urls[task.share_url] if seen_urls[task.share_url].id < task.id else task
+                        newer = task if seen_urls[task.share_url].id < task.id else seen_urls[task.share_url]
+                        dup_ids.append(older.id)
+                        seen_urls[task.share_url] = newer
+                    else:
+                        seen_urls[task.share_url] = task
+                if dup_ids:
+                    logger.warning(f"⚠️ 发现 {len(dup_ids)} 条重复 pending_links 记录，已清理: {dup_ids}")
+                    await session.execute(delete(PendingLink).where(PendingLink.id.in_(dup_ids)))
+                    await session.commit()
+
+                deduped_tasks = list(seen_urls.values())
+
                 # 统计受限链接并发送汇总消息
-                restricted_tasks = [t for t in tasks if t.status == "restricted"]
+                restricted_tasks = [t for t in deduped_tasks if t.status == "restricted"]
                 if restricted_tasks:
                     svc, _ = _get_svc()
                     if svc.is_restricted:
                         summary_msg = f"目前 115 云盘账号已被限制接收分享文件，共有 {len(restricted_tasks)} 个链接已进入排队队列，将在检测到解除限制后，开始处理队列中的任务。"
                         await self.send_admin_msg(summary_msg)
                 
-                for task in tasks:
+                for task in deduped_tasks:
                     pending_info = {
                         "share_url": task.share_url, 
                         "metadata": task.metadata_json, 

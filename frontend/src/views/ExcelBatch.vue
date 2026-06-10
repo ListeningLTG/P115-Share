@@ -330,6 +330,7 @@
             <div class="filter-bar">
                <a-select v-model:value="filterStatus" placeholder="选择状态" style="width: 120px" allow-clear @change="fetchTaskItems(1)">
                   <a-select-option value="待处理">待处理</a-select-option>
+                  <a-select-option value="待审核">待审核</a-select-option>
                   <a-select-option value="处理中">处理中</a-select-option>
                   <a-select-option value="成功">成功</a-select-option>
                   <a-select-option value="失败">失败</a-select-option>
@@ -919,6 +920,7 @@ const getStatusColor = (status: string) => {
     case '处理中': return 'processing';
     case '跳过': return 'default';
     case '待处理': return 'warning';
+    case '待审核': return 'orange';
     default: return 'default';
   }
 };

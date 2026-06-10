@@ -2,7 +2,8 @@
 FROM node:20-alpine AS build-stage
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
-RUN npm install
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --network-timeout 300000
 COPY frontend/ ./
 RUN npm run build
 
@@ -15,7 +16,8 @@ RUN mkdir -p /app/data
 
 # Install dependencies
 COPY backend/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
 
 # Copy backend code

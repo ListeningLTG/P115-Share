@@ -24,6 +24,15 @@
           <template #icon><DeleteOutlined /></template>
           重置
         </a-button>
+        <a-button
+          danger
+          :disabled="isAnalyzing || (statsInvalid === 0 && statsExpired === 0)"
+          :loading="isCancelingBatch"
+          @click="cancelInvalidExpired"
+        >
+          <template #icon><StopOutlined /></template>
+          {{ isCancelingBatch ? `取消中 ${cancelDone}/${cancelTotal}` : '一键取消失效/过期' }}
+        </a-button>
         <a-dropdown :disabled="isAnalyzing || statsTotal === 0">
           <a-button>
             <template #icon><DownloadOutlined /></template>
@@ -71,6 +80,7 @@
               <a-select-option value="all">全部</a-select-option>
               <a-select-option value="normal">正常</a-select-option>
               <a-select-option value="violated">违规</a-select-option>
+              <a-select-option value="invalid">已失效</a-select-option>
               <a-select-option value="expired">已过期</a-select-option>
               <a-select-option value="reviewing">审核中</a-select-option>
             </a-select>
@@ -83,6 +93,7 @@
         <a-statistic title="总分享数" :value="statsTotal" style="margin-right: 20px" />
         <a-statistic title="正常" :value="statsNormal" :value-style="{ color: '#52c41a' }" style="margin-right: 20px" />
         <a-statistic title="违规" :value="statsViolated" :value-style="{ color: '#ff4d4f' }" style="margin-right: 20px" />
+        <a-statistic title="已失效" :value="statsInvalid" :value-style="{ color: '#d46b08' }" style="margin-right: 20px" />
         <a-statistic title="已过期" :value="statsExpired" :value-style="{ color: '#fa8c16' }" style="margin-right: 20px" />
         <a-statistic title="审核中" :value="statsReviewing" :value-style="{ color: '#1890ff' }" />
       </div>
@@ -113,7 +124,16 @@
           </a-tag>
         </template>
         <template v-if="column.key === 'actions'">
-          <a-button type="link" size="small" @click="openLink(record)">打开链接</a-button>
+          <a-space size="small">
+            <a-button type="link" size="small" @click="openLink(record)">打开链接</a-button>
+            <a-button
+              v-if="record.is_invalid || record.is_expired"
+              type="link"
+              size="small"
+              danger
+              @click="cancelShare(record)"
+            >取消分享</a-button>
+          </a-space>
         </template>
       </template>
     </a-table>
@@ -289,7 +309,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, computed, onUnmounted } from 'vue';
-import { ReloadOutlined, DeleteOutlined, DownloadOutlined, SendOutlined, UnorderedListOutlined } from '@ant-design/icons-vue';
+import { ReloadOutlined, DeleteOutlined, DownloadOutlined, SendOutlined, UnorderedListOutlined, StopOutlined } from '@ant-design/icons-vue';
 import { message, Modal } from 'ant-design-vue';
 import axios from 'axios';
 import type { Dayjs } from 'dayjs';
@@ -309,6 +329,7 @@ const statusFilter = ref('all');
 const statsTotal = ref(0);
 const statsNormal = ref(0);
 const statsViolated = ref(0);
+const statsInvalid = ref(0);
 const statsExpired = ref(0);
 const statsReviewing = ref(0);
 const scannedCount = ref(0);
@@ -316,6 +337,11 @@ const lastUpdated = ref('');
 const sortField = ref('create_time');
 const sortOrder = ref('descend');
 let pollTimer: any = null;
+
+const isCancelingBatch = ref(false);
+const cancelTotal = ref(0);
+const cancelDone = ref(0);
+let cancelPollTimer: any = null;
 
 // 账号选择
 const accounts = ref<Account[]>([]);
@@ -383,7 +409,7 @@ const loadChannels = async () => {
 const onAccountChange = async () => {
   // 重置统计
   statsTotal.value = 0; statsNormal.value = 0; statsViolated.value = 0;
-  statsExpired.value = 0; statsReviewing.value = 0; scannedCount.value = 0;
+  statsInvalid.value = 0; statsExpired.value = 0; statsReviewing.value = 0; scannedCount.value = 0;
   lastUpdated.value = ''; shareData.value = [];
   pagination.value.total = 0;
   // 加载新账号的状态
@@ -399,7 +425,7 @@ const columns = [
   { title: '大小', dataIndex: 'size_text', key: 'size_text', width: 120 },
   { title: '分享时间', dataIndex: 'create_time', key: 'create_time', width: 180, sorter: true, defaultSortOrder: 'descend' },
   { title: '接收次数', dataIndex: 'receive_count', key: 'receive_count', width: 100, sorter: true },
-  { title: '操作', key: 'actions', width: 100 }
+  { title: '操作', key: 'actions', width: 160 }
 ];
 
 const pagination = ref({
@@ -411,6 +437,7 @@ const pagination = ref({
 });
 
 const getStatusColor = (record: any) => {
+  if (record.is_violated && record.is_invalid) return 'volcano';
   if (record.is_violated) return 'error';
   if (record.is_expired) return 'warning';
   if (record.is_reviewing) return 'processing';
@@ -461,6 +488,7 @@ const pollAnalysisStatus = async () => {
     statsTotal.value = data.total;
     statsNormal.value = data.normal;
     statsViolated.value = data.violated;
+    statsInvalid.value = data.invalid ?? 0;
     statsExpired.value = data.expired ?? 0;
     statsReviewing.value = data.reviewing ?? 0;
     scannedCount.value = data.scanned;
@@ -516,7 +544,7 @@ const resetAnalysis = () => {
         });
         if (response.data.state) {
           statsTotal.value = 0; statsNormal.value = 0; statsViolated.value = 0;
-          statsExpired.value = 0; statsReviewing.value = 0;
+          statsInvalid.value = 0; statsExpired.value = 0; statsReviewing.value = 0;
           scannedCount.value = 0; lastUpdated.value = '';
           shareData.value = []; pagination.value.total = 0;
           message.success('分析结果已重置');
@@ -534,6 +562,86 @@ const onFilterChange = () => { fetchShares(1, pagination.value.pageSize); };
 const handleTableChange = (pag: any, _filters: any, sorter: any) => {
   if (sorter.field) { sortField.value = sorter.field; sortOrder.value = sorter.order || 'descend'; }
   fetchShares(pag.current, pag.pageSize);
+};
+
+const cancelShare = async (record: any) => {
+  Modal.confirm({
+    title: '确认取消分享',
+    content: `确定要取消「${record.share_title}」的分享吗？此操作不可恢复。`,
+    okText: '确认取消',
+    okType: 'danger',
+    cancelText: '返回',
+    onOk: async () => {
+      try {
+        const resp = await axios.post('/api/share/cancel', null, {
+          params: { share_code: record.share_code, account_id: selectedAccountId.value }
+        });
+        if (resp.data.state) {
+          message.success('已取消分享');
+          fetchShares(pagination.value.current, pagination.value.pageSize);
+          await pollAnalysisStatus();
+        } else {
+          message.error(resp.data.error || '取消失败');
+        }
+      } catch {
+        message.error('请求失败');
+      }
+    }
+  });
+};
+
+const pollCancelStatus = async () => {
+  try {
+    const resp = await axios.get('/api/share/cancel-status', {
+      params: { account_id: selectedAccountId.value }
+    });
+    const data = resp.data;
+    cancelTotal.value = data.total;
+    cancelDone.value = data.done;
+    if (!data.is_canceling) {
+      isCancelingBatch.value = false;
+      if (cancelPollTimer) { clearInterval(cancelPollTimer); cancelPollTimer = null; }
+      message.success(`批量取消完成：成功 ${data.done} 条，失败 ${data.failed} 条`);
+      fetchShares(pagination.value.current, pagination.value.pageSize);
+      await pollAnalysisStatus();
+    }
+  } catch {
+    if (cancelPollTimer) { clearInterval(cancelPollTimer); cancelPollTimer = null; }
+    isCancelingBatch.value = false;
+  }
+};
+
+const cancelInvalidExpired = async () => {
+  Modal.confirm({
+    title: '一键取消失效/过期分享',
+    content: '将取消所有「已失效」和「已过期」的分享链接，此操作不可恢复，确定继续？',
+    okText: '确认取消',
+    okType: 'danger',
+    cancelText: '返回',
+    onOk: async () => {
+      try {
+        const resp = await axios.post('/api/share/cancel-invalid-expired', null, {
+          params: { account_id: selectedAccountId.value }
+        });
+        if (resp.data.state) {
+          if (resp.data.count === 0) {
+            message.info('没有需要取消的分享');
+            return;
+          }
+          isCancelingBatch.value = true;
+          cancelTotal.value = resp.data.count;
+          cancelDone.value = 0;
+          message.info(`已启动批量取消任务，共 ${resp.data.count} 条`);
+          if (cancelPollTimer) clearInterval(cancelPollTimer);
+          cancelPollTimer = setInterval(pollCancelStatus, 2000);
+        } else {
+          message.error(resp.data.error || '启动失败');
+        }
+      } catch {
+        message.error('请求失败');
+      }
+    }
+  });
 };
 
 const openLink = (record: any) => {
@@ -765,6 +873,7 @@ onMounted(async () => {
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer);
   if (pushTaskPollTimer) clearInterval(pushTaskPollTimer);
+  if (cancelPollTimer) clearInterval(cancelPollTimer);
 });
 </script>
 

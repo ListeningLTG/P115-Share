@@ -98,6 +98,7 @@ class ShareAnalysisResult(Base):
     share_state: Mapped[int] = mapped_column(Integer, default=1)
     status_text: Mapped[str] = mapped_column(String(20), default="正常")
     is_violated: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_invalid: Mapped[bool] = mapped_column(Boolean, default=False)
     is_expired: Mapped[bool] = mapped_column(Boolean, default=False)
     is_reviewing: Mapped[bool] = mapped_column(Boolean, default=False)
     receive_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -113,6 +114,7 @@ class ShareAnalysisState(Base):
     total: Mapped[int] = mapped_column(Integer, default=0)
     normal: Mapped[int] = mapped_column(Integer, default=0)
     violated: Mapped[int] = mapped_column(Integer, default=0)
+    invalid: Mapped[int] = mapped_column(Integer, default=0)
     expired: Mapped[int] = mapped_column(Integer, default=0)
     reviewing: Mapped[int] = mapped_column(Integer, default=0)
     scanned: Mapped[int] = mapped_column(Integer, default=0)
@@ -129,7 +131,7 @@ class ExcelTaskItem(Base):
     original_url: Mapped[str] = mapped_column(String(255))
     title: Mapped[str] = mapped_column(String(255), nullable=True)
     extraction_code: Mapped[str] = mapped_column(String(50), nullable=True)
-    status: Mapped[str] = mapped_column(String(20), default="待处理")  # 待处理, 处理中, 成功, 失败, 跳过
+    status: Mapped[str] = mapped_column(String(20), default="待处理")  # 待处理, 处理中, 成功, 失败, 跳过, 待审核
     new_share_url: Mapped[str] = mapped_column(Text, nullable=True)
     error_msg: Mapped[str] = mapped_column(Text, nullable=True)
     item_metadata: Mapped[dict] = mapped_column(JSON, nullable=True)  # Store original message text and entities
