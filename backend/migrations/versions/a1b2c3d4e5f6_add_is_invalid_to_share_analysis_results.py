@@ -18,11 +18,21 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        'share_analysis_results',
-        sa.Column('is_invalid', sa.Boolean(), nullable=False, server_default=sa.false())
-    )
+    conn = op.get_bind()
+    inspector = sa.inspect(conn)
+    if inspector.has_table('share_analysis_results'):
+        columns = [col['name'] for col in inspector.get_columns('share_analysis_results')]
+        if 'is_invalid' not in columns:
+            op.add_column(
+                'share_analysis_results',
+                sa.Column('is_invalid', sa.Boolean(), nullable=False, server_default=sa.false())
+            )
 
 
 def downgrade() -> None:
-    op.drop_column('share_analysis_results', 'is_invalid')
+    conn = op.get_bind()
+    inspector = sa.inspect(conn)
+    if inspector.has_table('share_analysis_results'):
+        columns = [col['name'] for col in inspector.get_columns('share_analysis_results')]
+        if 'is_invalid' in columns:
+            op.drop_column('share_analysis_results', 'is_invalid')
