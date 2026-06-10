@@ -196,8 +196,19 @@
 
           <!-- Control Section -->
           <div class="control-panel">
-            <div class="section-title"><SettingOutlined /> 转存分享配置</div>
-            <div class="control-form">
+            <div 
+              class="section-title" 
+              @click="isConfigCollapsed = !isConfigCollapsed"
+              :style="{ cursor: 'pointer', userSelect: 'none', marginBottom: isConfigCollapsed ? '0' : '16px' }"
+            >
+              <div style="display: flex; align-items: center; gap: 8px; flex: 1">
+                <SettingOutlined />
+                <span>转存分享配置</span>
+              </div>
+              <DownOutlined v-if="!isConfigCollapsed" style="font-size: 12px; color: #999" />
+              <RightOutlined v-else style="font-size: 12px; color: #999" />
+            </div>
+            <div class="control-form" v-show="!isConfigCollapsed">
                 <div class="form-row">
                   <div class="form-item">
                      <label>保存位置 (全局配置)</label>
@@ -471,7 +482,9 @@ import {
   KeyOutlined,
   LeftOutlined,
   DeleteOutlined,
-  InfoCircleOutlined
+  InfoCircleOutlined,
+  DownOutlined,
+  RightOutlined
 } from '@ant-design/icons-vue';
 import { message, Modal, Grid, theme } from 'ant-design-vue';
 import axios from 'axios';
@@ -508,6 +521,7 @@ const selectedChannels = ref<string[]>([]);
 const whiteListKeywords = ref('');
 const blackListKeywords = ref('');
 const taskStrategy = ref('transfer');
+const isConfigCollapsed = ref(false);
 
 // Upload & Mapping
 const mappingModalVisible = ref(false);
@@ -1148,7 +1162,7 @@ onUnmounted(() => {
   flex: 1;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-y: auto;
   padding-right: 8px;
 }
 
@@ -1274,7 +1288,7 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  min-height: 0;
+  min-height: 380px;
 }
 
 .flex-table {
