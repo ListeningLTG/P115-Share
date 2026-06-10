@@ -456,6 +456,18 @@ class P115Service:
                 last_error = TimeoutError(f"fs_makedirs_app 请求超时 (30s), 尝试 {attempt}/3")
                 logger.warning(f"⏱️ fs_makedirs_app 请求超时 (尝试 {attempt}/3)")
             except Exception as e:
+                # 🔑 Bug 修复: 检测到 errno=99 (Session 过期) 时，立即清除缓存的目录 CID。
+                # 旧 CID 在账号重新登录后可能已失效（目录被重建、CID 变更），
+                # 继续使用缓存值会导致后续任务把文件保存到错误目录，进而错误地分享根目录内容。
+                err_str = str(e)
+                err_errno = getattr(e, 'errno', None)
+                if not err_errno and hasattr(e, 'args') and len(e.args) >= 2 and isinstance(e.args[1], dict):
+                    err_errno = e.args[1].get('errno')
+                if err_errno == 99 or '99' in err_str or '请重新登录' in err_str:
+                    if self._save_dir_cid > 0:
+                        logger.warning(f"🔑 检测到 Session 过期 (errno=99)，清除保存目录 CID 缓存 (旧值: {self._save_dir_cid})")
+                        self._save_dir_cid = 0
+                    self.is_connected = False
                 last_error = e
                 logger.warning(f"⚠️ 创建目录失败 (尝试 {attempt}/3): {e}")
             
@@ -792,6 +804,18 @@ class P115Service:
             have_vio_file = share_info.get("have_vio_file", 0)
             
             logger.info(f"📊 分享状态: {share_state}, 标题: {share_title}, 违规标志: {have_vio_file}")
+
+            # 🔑 Bug 修复: 拦截 115 系统保留目录作为转存来源。
+            # 「最近接收」等系统目录包含用户所有接收文件，若被转存再分享将严重泄露隐私。
+            # 通过对比 share_title 拦截这类链接，在任何后续处理之前提前退出。
+            _SYSTEM_DIR_BLOCKLIST = {"最近接收", "我的文件", "我的接收", "接收文件", "最近"}
+            if share_title and share_title.strip() in _SYSTEM_DIR_BLOCKLIST:
+                logger.warning(f"⛔ 拒绝处理：原始分享内容为 115 系统保留目录 [{share_title}]，跳过: {share_url}")
+                return {
+                    "status": "error",
+                    "error_type": "system_dir_blocked",
+                    "message": f"原链接分享的是 115 系统目录「{share_title}」，无法转存。请确认分享的是具体文件/文件夹而非系统目录。"
+                }
 
             # 🚀 Early Skip Large Package (Check even if auditing)
             if skip_large_package:
@@ -1706,6 +1730,27 @@ class P115Service:
         original_total_size = save_result.get("original_total_size", 0)
         original_file_count = save_result.get("original_file_count", 0)
         original_folder_count = save_result.get("original_folder_count", 0)
+
+        # 🔑 Bug 修复: 安全断言——禁止对根保存目录或根目录(CID=0)发起分享。
+        # 当 _ensure_save_dir 缓存失效后回退到旧/错误 CID 时，to_cid 可能等于根保存目录
+        # 本身，导致 _snapshot_dir_ids 枚举出整个 115-Share 目录下的所有文件并分享出去。
+        if not to_cid or to_cid == 0:
+            logger.error(f"❌ [安全拦截] to_cid 为空或 0，拒绝创建分享链接，避免意外分享根目录内容")
+            return {
+                "status": "error",
+                "error_type": "invalid_cid",
+                "message": "任务子目录 CID 无效 (0)，无法创建分享链接"
+            }
+        if self._save_dir_cid > 0 and to_cid == self._save_dir_cid:
+            logger.error(
+                f"❌ [安全拦截] to_cid ({to_cid}) 与根保存目录 CID 相同，"
+                f"拒绝创建分享链接，避免泄露整个保存目录内容"
+            )
+            return {
+                "status": "error",
+                "error_type": "root_dir_share_blocked",
+                "message": "检测到即将对保存根目录发起分享，已安全拦截。请检查账号 Session 状态。"
+            }
 
         # 有时候外层分享根节点如果算数的话，可能有轻微误差（原分享有1个文件夹A包含了3个子文件夹，新转存的到C中只有这一棵树）
         # 所以我们重点打印它，并允许极小误差
