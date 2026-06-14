@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     
     # Direct save configuration
     DIRECT_SAVE_ACCOUNT_ID: int = 0
-    DIRECT_SAVE_DIR: str = "115-Share/DirectSave"
+    DIRECT_SAVE_DIR: str = "115-Save"
     TG_DEFAULT_COMMAND_MODE: str = "share"
 
     
@@ -42,8 +42,8 @@ class Settings(BaseSettings):
     P115_CLEANUP_CAPACITY_TYPE: str = "ENTIRE" # ENTIRE or DIRECTORY
 
     # Rate limiting & Task Prioritization
-    P115_RATE_LIMIT_COUNT: int = 30             # Window count
-    P115_RATE_LIMIT_WINDOW: int = 300           # Window size (s)
+    P115_RATE_LIMIT_COUNT: int = 10             # Window count
+    P115_RATE_LIMIT_WINDOW: int = 60            # Window size (s)
     P115_RATE_LIMIT_SILENT_DURATION: int = 60   # Silence duration (s)
     P115_BATCH_YIELD_DURATION: int = 10         # Yield to TG links (s)
     
@@ -124,9 +124,29 @@ class Settings(BaseSettings):
 
     async def _ensure_all_settings_exist(self, session):
         """Ensure all fields defined in Settings exist in the system_settings table"""
-        result = await session.execute(select(SystemSettings.key))
-        existing_keys = set(result.scalars().all())
+        result = await session.execute(select(SystemSettings))
+        settings_rows = result.scalars().all()
+        existing_keys = {row.key for row in settings_rows}
         
+        # 自动将原有的旧默认路径 115-Share/DirectSave 迁移为 115-Save，旧频率限制默认值迁移为新默认值 (仅在首次更新时执行一次，不覆盖用户后续的手动修改)
+        migrated_defaults = "MIGRATED_DEFAULTS_TO_115_SAVE" in existing_keys
+        if not migrated_defaults:
+            for row in settings_rows:
+                if row.key == "DIRECT_SAVE_DIR" and row.value == "115-Share/DirectSave":
+                    row.value = "115-Save"
+                    logger.info("🔄 自动将数据库中的 DIRECT_SAVE_DIR 默认路径迁移至 '115-Save'")
+                elif row.key == "P115_RATE_LIMIT_COUNT" and row.value == "30":
+                    row.value = "10"
+                    logger.info("🔄 自动将数据库中的 P115_RATE_LIMIT_COUNT 默认值迁移至 10")
+                elif row.key == "P115_RATE_LIMIT_WINDOW" and row.value == "300":
+                    row.value = "60"
+                    logger.info("🔄 自动将数据库中的 P115_RATE_LIMIT_WINDOW 默认值迁移至 60")
+            
+            # 写入已迁移标记，防止后续覆盖用户在前端自主修改的值
+            session.add(SystemSettings(key="MIGRATED_DEFAULTS_TO_115_SAVE", value="true"))
+            existing_keys.add("MIGRATED_DEFAULTS_TO_115_SAVE")
+            logger.info("✅ 已记录系统默认值一键迁移标记。")
+          
         added_count = 0
         for field in self.model_fields:
             if field not in existing_keys:
@@ -161,7 +181,7 @@ class Settings(BaseSettings):
         if self.P115_RATE_LIMIT_COUNT < 0:
             self.P115_RATE_LIMIT_COUNT = 0
         if self.P115_RATE_LIMIT_WINDOW <= 0:
-            self.P115_RATE_LIMIT_WINDOW = 300
+            self.P115_RATE_LIMIT_WINDOW = 60
         if self.P115_RATE_LIMIT_SILENT_DURATION <= 0:
             self.P115_RATE_LIMIT_SILENT_DURATION = 60
         if self.P115_BATCH_YIELD_DURATION < 0:

@@ -22,6 +22,8 @@ class StartTaskRequest(BaseModel):
     skip_large_package: Optional[bool] = False
     strategy: Optional[str] = "transfer"
     force: Optional[bool] = False
+    target_account_id: Optional[int] = None
+    target_dir: Optional[str] = None
 
 @router.post("/parse")
 async def parse_excel(
@@ -162,7 +164,9 @@ async def start_task(task_id: int, req: StartTaskRequest, current_user: dict = D
         req.white_list_keywords,
         req.black_list_keywords,
         req.skip_large_package,
-        req.strategy
+        req.strategy,
+        req.target_account_id,
+        req.target_dir
     )
     return {"status": "success"}
 

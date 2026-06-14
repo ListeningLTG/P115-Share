@@ -3,7 +3,7 @@
 """
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional, List
 from sqlalchemy import select
 from app.api.auth import get_current_user
@@ -18,9 +18,19 @@ class ScheduledShareTaskCreate(BaseModel):
     account_id: int
     dir_path: str
     cron_expression: str
-    clear_files: bool = False
+    clear_files: bool = True
+    share_mode: str = "move"
+    min_size: float = 0.0
+    min_size_unit: str = "GB"
     target_channels: List[str] = []
     enabled: bool = True
+
+    @field_validator('min_size', mode='before')
+    @classmethod
+    def coerce_min_size(cls, v):
+        if v is None or v == "":
+            return 0.0
+        return v
 
 
 class ScheduledShareTaskUpdate(BaseModel):
@@ -29,8 +39,18 @@ class ScheduledShareTaskUpdate(BaseModel):
     dir_path: Optional[str] = None
     cron_expression: Optional[str] = None
     clear_files: Optional[bool] = None
+    share_mode: Optional[str] = None
+    min_size: Optional[float] = None
+    min_size_unit: Optional[str] = None
     target_channels: Optional[List[str]] = None
     enabled: Optional[bool] = None
+
+    @field_validator('min_size', mode='before')
+    @classmethod
+    def coerce_min_size(cls, v):
+        if v is None or v == "":
+            return 0.0
+        return v
 
 
 @router.get("/")
@@ -49,6 +69,9 @@ async def list_tasks(user=Depends(get_current_user)):
                     "dir_path": t.dir_path,
                     "cron_expression": t.cron_expression,
                     "clear_files": t.clear_files,
+                    "share_mode": t.share_mode or ("move" if t.clear_files else "copy"),
+                    "min_size": t.min_size,
+                    "min_size_unit": t.min_size_unit,
                     "target_channels": t.target_channels,
                     "enabled": t.enabled,
                     "status": t.status,
@@ -70,13 +93,28 @@ async def create_task(data: ScheduledShareTaskCreate, user=Depends(get_current_u
     except Exception as e:
         return {"state": False, "message": f"Cron 表达式格式错误: {e}"}
 
+    # Reconcile share_mode and clear_files:
+    share_mode = data.share_mode
+    clear_files = data.clear_files
+    if share_mode == "move" and not clear_files:
+        share_mode = "copy"
+    elif share_mode == "direct":
+        clear_files = False
+    elif share_mode == "copy":
+        clear_files = False
+    elif share_mode == "move":
+        clear_files = True
+
     async with async_session() as session:
         task = ScheduledShareTask(
             name=data.name,
             account_id=data.account_id,
             dir_path=data.dir_path,
             cron_expression=data.cron_expression,
-            clear_files=data.clear_files,
+            clear_files=clear_files,
+            share_mode=share_mode,
+            min_size=data.min_size,
+            min_size_unit=data.min_size_unit,
             target_channels=data.target_channels,
             enabled=data.enabled,
             status="waiting" if data.enabled else "disabled"
@@ -108,7 +146,25 @@ async def update_task(task_id: int, data: ScheduledShareTaskUpdate, user=Depends
             return {"state": False, "message": "任务不存在"}
 
         # 更新字段
-        for field, val in data.model_dump(exclude_unset=True).items():
+        update_dict = data.model_dump(exclude_unset=True)
+        # Reconcile share_mode and clear_files if either is updated
+        if "share_mode" in update_dict or "clear_files" in update_dict:
+            curr_share_mode = update_dict.get("share_mode", task.share_mode or ("move" if task.clear_files else "copy"))
+            curr_clear_files = update_dict.get("clear_files", task.clear_files)
+            
+            if curr_share_mode == "move" and not curr_clear_files:
+                curr_share_mode = "copy"
+            elif curr_share_mode == "direct":
+                curr_clear_files = False
+            elif curr_share_mode == "copy":
+                curr_clear_files = False
+            elif curr_share_mode == "move":
+                curr_clear_files = True
+                
+            update_dict["share_mode"] = curr_share_mode
+            update_dict["clear_files"] = curr_clear_files
+
+        for field, val in update_dict.items():
             setattr(task, field, val)
 
         if data.enabled is not None:

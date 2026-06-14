@@ -170,7 +170,7 @@
             <template #extra>
               <div style="font-size: 12px; color: #999; margin-top: 4px">直接转存时在 115 网盘中存放的相对目标路径。</div>
             </template>
-            <a-input v-model:value="formState.direct_save_dir" placeholder="例如 115-Share/DirectSave" />
+            <a-input v-model:value="formState.direct_save_dir" placeholder="例如 115-Save" />
           </a-form-item>
 
           <a-divider />
@@ -224,7 +224,7 @@ const formState = reactive({
   proxy_pass: '',
   proxy_type: 'HTTP',
   direct_save_account_id: 0,
-  direct_save_dir: '115-Share/DirectSave',
+  direct_save_dir: '115-Save',
   tg_default_command_mode: 'share',
 });
 
@@ -304,7 +304,7 @@ const loadConfig = async () => {
     formState.proxy_pass = res.data.proxy_pass || '';
     formState.proxy_type = res.data.proxy_type || 'HTTP';
     formState.direct_save_account_id = res.data.direct_save_account_id !== undefined ? res.data.direct_save_account_id : 0;
-    formState.direct_save_dir = res.data.direct_save_dir || '115-Share/DirectSave';
+    formState.direct_save_dir = res.data.direct_save_dir || '115-Save';
     formState.tg_default_command_mode = res.data.tg_default_command_mode || 'share';
   } catch (e) {
     console.error(e);

@@ -211,10 +211,10 @@
             <div class="control-form" v-show="!isConfigCollapsed">
                 <div class="form-row">
                   <div class="form-item">
-                     <label>保存位置 (全局配置)</label>
+                     <label>转存分享保存位置</label>
                      <div class="fake-input disabled">
                         <span>{{ systemSaveDir }}</span>
-                        <a-tooltip title="Excel 转存统一使用系统全局保存路径，如需更改请前往系统设置"><InfoCircleOutlined /></a-tooltip>
+                        <a-tooltip title="转存分享统一使用系统全局保存路径，如需更改请前往系统设置"><InfoCircleOutlined /></a-tooltip>
                      </div>
                   </div>
                </div>
@@ -265,7 +265,23 @@
                     <a-select v-model:value="taskStrategy" style="width: 100%" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)">
                       <a-select-option value="transfer">转存分享 (默认)</a-select-option>
                       <a-select-option value="push">直接推送 (仅转发原链接)</a-select-option>
+                      <a-select-option value="direct_save">直接保存 (不分享)</a-select-option>
                     </a-select>
+                  </div>
+                </div>
+
+                <div class="form-row" v-if="taskStrategy === 'direct_save'">
+                  <div class="form-item" style="flex: 1">
+                     <label>保存网盘账号</label>
+                     <a-select v-model:value="directSaveAccountId" placeholder="选择接收资源的 115 账号" style="width: 100%" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)">
+                       <a-select-option v-for="acc in accounts" :key="acc.id" :value="acc.id">
+                         {{ acc.name }} (ID: {{ acc.id }})
+                       </a-select-option>
+                     </a-select>
+                  </div>
+                  <div class="form-item" style="flex: 1; margin-left: 24px">
+                     <label>直接保存目录</label>
+                     <a-input v-model:value="directSaveDir" placeholder="保存的网盘目录，如 115-Save" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
                   </div>
                 </div>
 
@@ -522,6 +538,9 @@ const selectedChannels = ref<string[]>([]);
 const whiteListKeywords = ref('');
 const blackListKeywords = ref('');
 const taskStrategy = ref('transfer');
+const accounts = ref<any[]>([]);
+const directSaveAccountId = ref<number | undefined>(undefined);
+const directSaveDir = ref('115-Save');
 const isConfigCollapsed = ref(false);
 
 // Upload & Mapping
@@ -603,6 +622,12 @@ const fetchSettings = async () => {
          selectedChannels.value = [res.data.tg_channel_id];
        }
     }
+    // Fetch accounts
+    const accRes = await axios.get('/api/accounts/');
+    accounts.value = accRes.data.accounts || [];
+    if (accounts.value.length > 0 && !directSaveAccountId.value) {
+      directSaveAccountId.value = accounts.value[0].id;
+    }
   } catch (e) {
     console.error('获取设置失败', e);
   }
@@ -629,6 +654,8 @@ const fetchCurrentTask = async () => {
       if (updatedTask.black_list_keywords !== undefined) blackListKeywords.value = updatedTask.black_list_keywords || '';
       if (updatedTask.skip_large_package !== undefined) skipLargePackage.value = updatedTask.skip_large_package || false;
       if (updatedTask.strategy !== undefined) taskStrategy.value = updatedTask.strategy || 'transfer';
+      if (updatedTask.target_account_id !== undefined) directSaveAccountId.value = updatedTask.target_account_id || (accounts.value.length > 0 ? accounts.value[0].id : undefined);
+      if (updatedTask.target_dir !== undefined) directSaveDir.value = updatedTask.target_dir || '115-Save';
     }
   } catch (e) {
     console.error('获取任务详情失败', e);
@@ -677,6 +704,8 @@ const selectTask = (id: number) => {
   blackListKeywords.value = task?.black_list_keywords || '';
   skipLargePackage.value = task?.skip_large_package || false;
   taskStrategy.value = task?.strategy || 'transfer';
+  directSaveAccountId.value = task?.target_account_id || (accounts.value.length > 0 ? accounts.value[0].id : undefined);
+  directSaveDir.value = task?.target_dir || '115-Save';
   
   pagination.current = 1;
   pagination.pageSize = 50;
@@ -772,7 +801,9 @@ const handleStartTask = async (forceParam?: any) => {
       black_list_keywords: blackListKeywords.value,
       skip_large_package: skipLargePackage.value,
       strategy: taskStrategy.value,
-      force: force
+      force: force,
+      target_account_id: taskStrategy.value === 'direct_save' ? directSaveAccountId.value : null,
+      target_dir: taskStrategy.value === 'direct_save' ? directSaveDir.value : null
 
     });
     message.success(isResume ? '正在继续...' : '正在启动...');

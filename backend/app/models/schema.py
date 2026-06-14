@@ -48,6 +48,7 @@ class ExcelTask(Base):
     success_count: Mapped[int] = mapped_column(Integer, default=0)
     fail_count: Mapped[int] = mapped_column(Integer, default=0)
     target_dir: Mapped[str] = mapped_column(String(255), nullable=True)
+    target_account_id: Mapped[int] = mapped_column(Integer, nullable=True)
     interval_min: Mapped[int] = mapped_column(Integer, default=5)
     interval_max: Mapped[int] = mapped_column(Integer, default=10)
     skip_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -202,7 +203,10 @@ class ScheduledShareTask(Base):
     account_id: Mapped[int] = mapped_column(Integer, index=True)
     dir_path: Mapped[str] = mapped_column(String(255))                               # 115网盘目录路径，例如 /电影
     cron_expression: Mapped[str] = mapped_column(String(50))                         # cron定时表达式，如 0 3 * * *
-    clear_files: Mapped[bool] = mapped_column(Boolean, default=False)                # 定时执行后是否清空原目录下的文件
+    clear_files: Mapped[bool] = mapped_column(Boolean, default=True)                 # 定时执行模式：True为移动(剪切)，False为复制(保留)
+    share_mode: Mapped[str] = mapped_column(String(20), default="move", server_default="move") # 分享模式：move(移动), copy(复制), direct(直接)
+    min_size: Mapped[float] = mapped_column(Float, default=0.0)                      # 最小容量触发阈值，0表示不检测
+    min_size_unit: Mapped[str] = mapped_column(String(10), default="GB")             # 容量触发阈值单位 (GB/TB)
     target_channels: Mapped[dict] = mapped_column(JSON, default=list)                # 要推送的TG频道列表，支持多选
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)                      # 任务是否启用
     status: Mapped[str] = mapped_column(String(50), default="waiting")               # 当前运行状态 (waiting, running, success, failed)

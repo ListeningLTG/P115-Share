@@ -261,8 +261,8 @@ const p115Form = reactive({
   p115_cleanup_capacity_limit: 0,
   p115_cleanup_capacity_unit: 'GB',
   p115_cleanup_capacity_type: 'ENTIRE',
-  p115_rate_limit_count: 30,
-  p115_rate_limit_window: 300,
+  p115_rate_limit_count: 10,
+  p115_rate_limit_window: 60,
   p115_rate_limit_silent_duration: 60,
   p115_batch_yield_duration: 10,
 });
@@ -310,8 +310,8 @@ const loadP115Config = async () => {
     p115Form.p115_cleanup_capacity_limit = res.data.p115_cleanup_capacity_limit || 0;
     p115Form.p115_cleanup_capacity_unit = res.data.p115_cleanup_capacity_unit || 'GB';
     p115Form.p115_cleanup_capacity_type = res.data.p115_cleanup_capacity_type || 'ENTIRE';
-    p115Form.p115_rate_limit_count = res.data.p115_rate_limit_count !== undefined ? res.data.p115_rate_limit_count : 30;
-    p115Form.p115_rate_limit_window = res.data.p115_rate_limit_window || 300;
+    p115Form.p115_rate_limit_count = res.data.p115_rate_limit_count !== undefined ? res.data.p115_rate_limit_count : 10;
+    p115Form.p115_rate_limit_window = res.data.p115_rate_limit_window || 60;
     p115Form.p115_rate_limit_silent_duration = res.data.p115_rate_limit_silent_duration !== undefined ? res.data.p115_rate_limit_silent_duration : 60;
     p115Form.p115_batch_yield_duration = res.data.p115_batch_yield_duration !== undefined ? res.data.p115_batch_yield_duration : 10;
   } catch (e) {

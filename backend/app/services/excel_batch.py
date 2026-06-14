@@ -486,7 +486,15 @@ class ExcelBatchService:
                                     continue
 
                         # Process the item
-                        svc, acct_mgr = _get_svc()
+                        if task.strategy == "direct_save" and task.target_account_id:
+                            from app.services.account_manager import account_manager
+                            svc = account_manager.get_service(task.target_account_id)
+                            acct_mgr = account_manager
+                            if not svc:
+                                svc, acct_mgr = _get_svc()
+                        else:
+                            svc, acct_mgr = _get_svc()
+                        
                         if task.strategy != "push" and svc.is_restricted:
                             # 尝试切换到未被风控的账号
                             new_svc, new_acct_mgr = _get_svc()
@@ -516,7 +524,9 @@ class ExcelBatchService:
                             "white_list_keywords": task.white_list_keywords,
                             "black_list_keywords": task.black_list_keywords,
                             "skip_large_package": task.skip_large_package,
-                            "strategy": task.strategy
+                            "strategy": task.strategy,
+                            "target_account_id": task.target_account_id,
+                            "target_dir": task.target_dir
                         }
 
                         is_processed = await self._process_item(item_id, task_config, svc=svc, acct_mgr=acct_mgr)
@@ -596,9 +606,6 @@ class ExcelBatchService:
                 await asyncio.sleep(5)
 
     async def _process_item(self, item_id: int, task_config: dict = None, svc=None, acct_mgr=None):
-        # 若未从外部传入，则在此处重新选择最优账号
-        if svc is None:
-            svc, acct_mgr = _get_svc()
         async with async_session() as session:
             result = await session.execute(
                 select(ExcelTaskItem).where(ExcelTaskItem.id == item_id)
@@ -612,6 +619,8 @@ class ExcelBatchService:
                     black_list = task_config.get("black_list_keywords")
                     skip_large_package = task_config.get("skip_large_package")
                     strategy = task_config.get("strategy", "transfer")
+                    target_account_id = task_config.get("target_account_id")
+                    target_dir = task_config.get("target_dir")
                 else:
                     task_result = await session.execute(
                         select(ExcelTask).where(ExcelTask.id == item.task_id)
@@ -622,9 +631,20 @@ class ExcelBatchService:
                     black_list = t_row.black_list_keywords
                     skip_large_package = t_row.skip_large_package
                     strategy = t_row.strategy
+                    target_account_id = t_row.target_account_id
+                    target_dir = t_row.target_dir
             except Exception:
                 logger.error(f"Item {item_id} not found or task deleted")
                 return
+
+            # 若未从外部传入，则在此处重新选择账号
+            if svc is None:
+                if strategy == "direct_save" and target_account_id:
+                    from app.services.account_manager import account_manager
+                    svc = account_manager.get_service(target_account_id)
+                    acct_mgr = account_manager
+                if svc is None:
+                    svc, acct_mgr = _get_svc()
 
             task_id = item.task_id
             
@@ -674,23 +694,81 @@ class ExcelBatchService:
                 await self._update_task_counts(task_id)
                 return True
 
+            # Prepare metadata
+            if item.item_metadata:
+                metadata = item.item_metadata.copy()
+                metadata["share_url"] = original_url
+            else:
+                metadata = {
+                    "description": item.title or "Excel Batch Import",
+                    "full_text": f"云盘分享\n资源名称：{item.title or '未知'}\n分享链接：{{{{share_link}}}}",
+                    "share_url": original_url
+                }
+
             # --- Strategy: Push ---
             if strategy == "push":
                 if tg_service:
-                    if item.item_metadata:
-                        metadata = item.item_metadata.copy()
-                        metadata["share_url"] = original_url
-                    else:
-                        metadata = {
-                            "description": item.title or "Excel Batch Push",
-                            "full_text": f"资源推送\n资源名称：{item.title or '未知'}\n分享链接：{{{{share_link}}}}",
-                            "share_url": original_url
-                        }
                     await tg_service.broadcast_to_channels({original_url: original_url}, metadata, channel_ids=target_channels)
                 
                 item.status = "成功"
                 item.new_share_url = original_url
                 item.error_msg = "直接推送完成"
+                await session.commit()
+                await self._update_task_counts(task_id)
+                return True
+
+            # --- Strategy: Direct Save ---
+            if strategy == "direct_save":
+                try:
+                    # Combine password if present for saving
+                    url_to_save = original_url
+                    if item.extraction_code and "?password=" not in url_to_save:
+                        url_to_save = f"{url_to_save}?password={item.extraction_code}"
+
+                    save_res = await svc.save_share_link(
+                        url_to_save,
+                        metadata=metadata,
+                        target_dir=target_dir or "115-Save",
+                        skip_large_package=True,
+                        is_batch=True,
+                        create_task_subdir=False
+                    )
+                    
+                    if save_res:
+                        if save_res.get("status") == "success":
+                            item.status = "成功"
+                            item.new_share_url = None
+                            item.error_msg = f"已直接保存到 {target_dir or '115-Save'}"
+                            if acct_mgr and svc.account:
+                                asyncio.create_task(acct_mgr.update_last_used(svc.account.id))
+                        elif save_res.get("status") == "pending":
+                            reason = save_res.get("reason")
+                            if reason == "snapshotting":
+                                item.status = "待审核"
+                                item.error_msg = "快照生成中，等待本批次完成后自动重试"
+                            elif reason == "restricted":
+                                item.status = "待处理"
+                                item.error_msg = "检测到115账号限制接收，等待恢复"
+                                await session.commit()
+                                await self._update_task_counts(task_id)
+                                return "RESTRICTED"
+                            else:
+                                item.status = "待审核"
+                                item.error_msg = "审核中，等待本批次完成后自动重试"
+                        elif save_res.get("status") == "skipped":
+                            item.status = "跳过"
+                            item.error_msg = save_res.get("message", "跳过处理")
+                        else:
+                            item.status = "失败"
+                            item.error_msg = save_res.get("message", "保存失败")
+                    else:
+                        item.status = "失败"
+                        item.error_msg = "保存服务无响应"
+                except Exception as e:
+                    logger.exception(f"处理项目失败: {item_id}")
+                    item.status = "失败"
+                    item.error_msg = str(e)
+                
                 await session.commit()
                 await self._update_task_counts(task_id)
                 return True
@@ -706,23 +784,10 @@ class ExcelBatchService:
                 await session.commit()
                 await self._update_task_counts(task_id)
                 if tg_service:
-                    if item.item_metadata:
-                        await tg_service.broadcast_to_channels({original_url: history_url}, item.item_metadata, channel_ids=target_channels)
-                    else:
-                        await tg_service.broadcast_to_channels({original_url: history_url}, {"full_text": f"资源名称：{item.title or '未知'}\n分享链接：{{{{share_link}}}}"}, channel_ids=target_channels)
+                    await tg_service.broadcast_to_channels({original_url: history_url}, metadata, channel_ids=target_channels)
                 return True
 
             try:
-                # Prepare metadata for broadcasting
-                if item.item_metadata:
-                    metadata = item.item_metadata.copy()
-                    metadata["share_url"] = original_url
-                else:
-                    metadata = {
-                        "description": item.title or "Excel Batch Import",
-                        "full_text": f"云盘分享\n资源名称：{item.title or '未知'}\n分享链接：{{{{share_link}}}}",
-                        "share_url": original_url
-                    }
                 
                 # Combine password if present for saving
                 url_to_save = original_url
@@ -822,7 +887,7 @@ class ExcelBatchService:
             )
             await session.commit()
 
-    async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False, strategy: str = "transfer"):
+    async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False, strategy: str = "transfer", target_account_id: int = None, target_dir: str = None):
         async with async_session() as session:
             # Get currrent status
             result = await session.execute(select(ExcelTask).where(ExcelTask.id == task_id))
@@ -855,6 +920,8 @@ class ExcelBatchService:
             
             task.skip_large_package = skip_large_package
             task.strategy = strategy
+            task.target_account_id = target_account_id
+            task.target_dir = target_dir
             
             if not is_resume:
                 self._audit_retry_rounds.pop(task_id, None)

@@ -36,13 +36,16 @@
         <template v-if="column.key === 'cron_expression'">
           <a-tag color="blue">{{ record.cron_expression }}</a-tag>
         </template>
-
-        <template v-if="column.key === 'clear_files'">
-          <a-tag :color="record.clear_files ? 'orange' : 'default'">
-            {{ record.clear_files ? '是' : '否' }}
+        <template v-if="column.key === 'share_mode'">
+          <a-tag :color="getShareModeColor(record.share_mode)">
+            {{ getShareModeText(record.share_mode) }}
           </a-tag>
         </template>
-
+        <template v-if="column.key === 'min_size'">
+          <a-tag :color="record.min_size > 0 ? 'purple' : 'default'">
+            {{ record.min_size > 0 ? `≥ ${record.min_size} ${record.min_size_unit}` : '不检测' }}
+          </a-tag>
+        </template>
         <template v-if="column.key === 'target_channels'">
           <div style="max-width: 250px; display: flex; flex-wrap: wrap; gap: 4px">
             <a-tag v-for="ch in record.target_channels" :key="ch" color="cyan">
@@ -121,11 +124,40 @@
           </div>
         </a-form-item>
 
-        <a-form-item label="复制后清空原目录文件" name="clear_files">
+        <a-form-item label="文件处理模式" name="share_mode">
           <template #extra>
-            <div style="font-size: 12px; color: #999; margin-top: 4px">开启后，原目录下的文件会在成功备份复制及分享后被移除清空。</div>
+            <div style="font-size: 12px; color: #999; margin-top: 4px">
+              <span v-if="formState.share_mode === 'move'">移动模式：原目录文件会被直接剪切移动到临时目录，原目录自动清空，速度极快且不占额外空间（适合增量分享/追更）。</span>
+              <span v-else-if="formState.share_mode === 'copy'">复制模式：原目录文件会被复制一份进行分享，原目录文件保持不动，但下次会重复分享（适合全量分享/归档）。</span>
+              <span v-else-if="formState.share_mode === 'direct'">直接分享模式：直接对原目录（源目录本身）进行分享，不创建临时文件夹，不移动或复制任何文件，原目录文件保持不动。</span>
+            </div>
           </template>
-          <a-switch v-model:checked="formState.clear_files" />
+          <a-select v-model:value="formState.share_mode">
+            <a-select-option value="move">移动模式 (剪切)</a-select-option>
+            <a-select-option value="copy">复制模式 (保留)</a-select-option>
+            <a-select-option value="direct">直接分享模式 (只分享不操作文件)</a-select-option>
+          </a-select>
+        </a-form-item>
+
+        <a-form-item label="最小容量触发阈值" name="min_size">
+          <template #extra>
+            <div style="font-size: 12px; color: #999; margin-top: 4px">
+              原目录内文件总容量超过该阈值时才触发分享，0 表示不检测目录容量。
+            </div>
+          </template>
+          <a-input-group compact style="display: flex; width: 100%">
+            <a-input-number
+              v-model:value="formState.min_size"
+              :min="0"
+              :precision="2"
+              style="flex: 1"
+              placeholder="请输入阈值，如 1.5"
+            />
+            <a-select v-model:value="formState.min_size_unit" style="width: 100px">
+              <a-select-option value="GB">GB</a-select-option>
+              <a-select-option value="TB">TB</a-select-option>
+            </a-select>
+          </a-input-group>
         </a-form-item>
 
         <a-form-item label="推送目标频道" name="target_channels">
@@ -147,7 +179,7 @@
         </a-form-item>
       </a-form>
       
-      <div v-if="formState.clear_files" style="margin-top: 12px">
+      <div v-if="formState.share_mode === 'move' || formState.share_mode === 'copy'" style="margin-top: 12px">
         <a-alert message="安全警示" description="此任务在执行后会清空 115 账号下的回收站，以彻底删除复制生成的临时文件夹。请确保回收站内没有其他需要保留的文件！" type="warning" show-icon />
       </div>
     </a-modal>
@@ -168,6 +200,9 @@ interface Task {
   dir_path: string;
   cron_expression: string;
   clear_files: boolean;
+  share_mode: string;
+  min_size: number;
+  min_size_unit: string;
   target_channels: string[];
   enabled: boolean;
   status: string;
@@ -192,7 +227,8 @@ const columns = [
   { title: '源目录路径', key: 'dir_path', dataIndex: 'dir_path' },
   { title: 'Cron表达式', key: 'cron_expression', dataIndex: 'cron_expression' },
   { title: '推送频道', key: 'target_channels', dataIndex: 'target_channels' },
-  { title: '清空原目录', key: 'clear_files', dataIndex: 'clear_files' },
+  { title: '文件处理模式', key: 'share_mode', dataIndex: 'share_mode' },
+  { title: '容量检测阈值', key: 'min_size', dataIndex: 'min_size' },
   { title: '运行状态', key: 'status', dataIndex: 'status' },
   { title: '启用', key: 'enabled', dataIndex: 'enabled' },
   { title: '上次运行时间', key: 'last_run_at', dataIndex: 'last_run_at' },
@@ -214,7 +250,10 @@ const formState = reactive({
   account_id: undefined as number | undefined,
   dir_path: '',
   cron_expression: '',
-  clear_files: false,
+  clear_files: true,
+  share_mode: 'move',
+  min_size: 0.0,
+  min_size_unit: 'GB',
   target_channels: [] as string[],
   enabled: true,
 });
@@ -224,6 +263,20 @@ const formRules = {
   account_id: [{ required: true, message: '请选择执行账号', trigger: 'change' }],
   dir_path: [{ required: true, message: '请输入网盘目录路径', trigger: 'blur' }],
   cron_expression: [{ required: true, message: '请输入 Cron 表达式', trigger: 'blur' }],
+};
+
+const getShareModeColor = (mode: string) => {
+  if (mode === 'move') return 'orange';
+  if (mode === 'copy') return 'blue';
+  if (mode === 'direct') return 'green';
+  return 'default';
+};
+
+const getShareModeText = (mode: string) => {
+  if (mode === 'move') return '移动';
+  if (mode === 'copy') return '复制';
+  if (mode === 'direct') return '直接';
+  return mode;
 };
 
 const getAccountName = (id: number) => {
@@ -303,7 +356,10 @@ const openCreateModal = () => {
   formState.account_id = firstAcc ? firstAcc.id : undefined;
   formState.dir_path = '';
   formState.cron_expression = '0 3 * * *';
-  formState.clear_files = false;
+  formState.clear_files = true;
+  formState.share_mode = 'move';
+  formState.min_size = 0.0;
+  formState.min_size_unit = 'GB';
   formState.target_channels = [];
   formState.enabled = true;
   modalVisible.value = true;
@@ -316,6 +372,9 @@ const openEditModal = (record: Task) => {
   formState.dir_path = record.dir_path;
   formState.cron_expression = record.cron_expression;
   formState.clear_files = record.clear_files;
+  formState.share_mode = record.share_mode || (record.clear_files ? 'move' : 'copy');
+  formState.min_size = record.min_size ?? 0.0;
+  formState.min_size_unit = record.min_size_unit ?? 'GB';
   formState.target_channels = [...(record.target_channels || [])];
   formState.enabled = record.enabled;
   modalVisible.value = true;
@@ -327,6 +386,9 @@ const handleModalOk = async () => {
     modalSubmitting.value = true;
     
     const payload = { ...formState };
+    if (payload.min_size === null || payload.min_size === undefined || (payload.min_size as any) === '') {
+      payload.min_size = 0.0;
+    }
     if (editingId.value) {
       const res = await axios.put(`/api/scheduled-share/${editingId.value}`, payload);
       if (res.data.state) {
