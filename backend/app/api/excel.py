@@ -24,6 +24,7 @@ class StartTaskRequest(BaseModel):
     force: Optional[bool] = False
     target_account_id: Optional[int] = None
     target_dir: Optional[str] = None
+    share_interval: Optional[int] = 0
 
 @router.post("/parse")
 async def parse_excel(
@@ -166,7 +167,8 @@ async def start_task(task_id: int, req: StartTaskRequest, current_user: dict = D
         req.skip_large_package,
         req.strategy,
         req.target_account_id,
-        req.target_dir
+        req.target_dir,
+        req.share_interval
     )
     return {"status": "success"}
 

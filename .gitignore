@@ -31,3 +31,9 @@ backend/data/
 
 
 Helper/
+
+# Frontend build outputs in backend
+backend/static/assets/
+backend/static/index.html
+backend/static/logo.png
+backend/static/vite.svg

@@ -472,15 +472,43 @@ class ExcelBatchService:
                                         await asyncio.sleep(AUDIT_RETRY_INTERVAL)
                                         continue
                                 else:
-                                    # 真正完成
-                                    await session.execute(
-                                        update(ExcelTask).where(ExcelTask.id == task.id).values(
-                                            status="completed",
-                                            current_row=0,
-                                            is_waiting=False
-                                        )
-                                    )
+                                    # 真正完成 - 先从数据库读取最新的子批次状态
+                                    task_res = await session.execute(select(ExcelTask).where(ExcelTask.id == task.id))
+                                    task_db = task_res.scalar_one()
+                                    sub_batch_count = task_db.sub_batch_count
+                                    share_interval = task_db.share_interval
+                                    strategy = task_db.strategy
+                                    target_account_id = task_db.target_account_id
+                                    
+                                    # 结束并提交当前 session，避免长连接锁定
                                     await session.commit()
+                                    
+                                    if strategy == "direct_save" and share_interval > 0 and sub_batch_count > 0:
+                                        if target_account_id:
+                                            from app.services.account_manager import account_manager
+                                            task_svc = account_manager.get_service(target_account_id)
+                                        else:
+                                            task_svc = None
+                                        if not task_svc:
+                                            task_svc, _ = _get_svc()
+                                            
+                                        logger.info(f"🏁 任务完成，正在处理最后一批 sub-batch (剩余 {sub_batch_count} 条)")
+                                        try:
+                                            await self._trigger_sub_batch_share(task.id, task_svc)
+                                        except Exception as final_err:
+                                            logger.error(f"❌ 运行至最后一条处理最后一批 sub-batch 失败: {final_err}")
+                                            
+                                    # 重新开启 session 更新状态为 completed
+                                    async with async_session() as session_comp:
+                                        await session_comp.execute(
+                                            update(ExcelTask).where(ExcelTask.id == task.id).values(
+                                                status="completed",
+                                                current_row=0,
+                                                is_waiting=False
+                                            )
+                                        )
+                                        await session_comp.commit()
+                                        
                                     self._audit_retry_rounds.pop(task.id, None)
                                     self.active_task_id = None
                                     continue
@@ -547,6 +575,27 @@ class ExcelBatchService:
                                 await session.commit()
                             self.active_task_id = None
                             break
+                        
+                        # 检测并累计分批直接保存的成功次数
+                        if item_id and is_processed != "RESTRICTED":
+                            async with async_session() as session:
+                                item_res = await session.execute(select(ExcelTaskItem).where(ExcelTaskItem.id == item_id))
+                                item_db = item_res.scalar_one_or_none()
+                                if item_db and item_db.status == "成功":
+                                    task_res = await session.execute(select(ExcelTask).where(ExcelTask.id == task.id))
+                                    task_db = task_res.scalar_one()
+                                    if task_db.strategy == "direct_save" and task_db.share_interval > 0:
+                                        task_db.sub_batch_count += 1
+                                        if task_db.sub_batch_start_row == 0:
+                                            task_db.sub_batch_start_row = item_db.row_index
+                                        await session.commit()
+                                        
+                                        if task_db.sub_batch_count >= task_db.share_interval:
+                                            logger.info(f"📦 子批次达到上限数量 ({task_db.sub_batch_count}/{task_db.share_interval})，触发分享与重命名")
+                                            try:
+                                                await self._trigger_sub_batch_share(task.id, svc)
+                                            except Exception as trigger_err:
+                                                logger.error(f"❌ 触发子批次分享异常: {trigger_err}")
                         
                     finally:
                         # Find next row and set is_waiting to True before sleep
@@ -887,7 +936,117 @@ class ExcelBatchService:
             )
             await session.commit()
 
-    async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False, strategy: str = "transfer", target_account_id: int = None, target_dir: str = None):
+    async def _trigger_sub_batch_share(self, task_id: int, svc):
+        """执行一个子批次的重命名、分享、推送、删除与清空回收站流程"""
+        from p115client import check_response
+        
+        # 1. 从数据库读取子批次配置和状态
+        async with async_session() as session:
+            result = await session.execute(select(ExcelTask).where(ExcelTask.id == task_id))
+            task = result.scalar_one()
+            
+            start_row = task.sub_batch_start_row
+            sub_batch_count = task.sub_batch_count
+            target_channels = task.target_channels
+            target_dir = task.target_dir or "115-Save"
+            
+            # 获取该批次中最后一条成功的数据行号
+            last_success_row = await session.scalar(
+                select(func.max(ExcelTaskItem.row_index)).where(
+                    ExcelTaskItem.task_id == task_id,
+                    ExcelTaskItem.status == "成功",
+                    ExcelTaskItem.row_index >= start_row
+                )
+            )
+            if not last_success_row:
+                last_success_row = start_row + sub_batch_count - 1
+
+        # 2. 调用 115 网络接口执行操作（在数据库事务和 session 外部）
+        dir_path = target_dir
+        dir_basename = dir_path.strip('/').split('/')[-1]
+        
+        logger.info(f"📂 [分批分享] 获取目标目录 {dir_path} 的 CID")
+        target_cid = await svc._ensure_save_dir(dir_path)
+        
+        if not target_cid or target_cid == 0:
+            logger.error("❌ [分批分享] 无法获取有效的目标目录 CID")
+            return
+            
+        new_folder_name = f"{dir_basename}-{start_row}-{last_success_row}"
+        logger.info(f"📂 [分批分享] 正在将目标目录 '{dir_basename}' (CID: {target_cid}) 重命名为 '{new_folder_name}'")
+        
+        try:
+            rename_resp = await svc._api_call_with_timeout(
+                svc.client.fs_rename_app, (target_cid, new_folder_name), async_=True,
+                **svc._get_ios_ua_kwargs()
+            )
+            check_response(rename_resp)
+        except Exception as re_err:
+            logger.error(f"❌ [分批分享] 目录重命名失败: {re_err}")
+            raise re_err
+            
+        logger.info(f"🔗 [分批分享] 正在为已重命名的目录 '{new_folder_name}' (CID: {target_cid}) 生成分享链接")
+        try:
+            share_link = await svc._share_fids_direct([target_cid])
+            if not share_link:
+                raise RuntimeError("生成分享链接返回为空")
+            logger.info(f"✅ [分批分享] 生成分享链接成功: {share_link}")
+        except Exception as sh_err:
+            logger.error(f"❌ [分批分享] 生成分享链接失败: {sh_err}")
+            raise sh_err
+            
+        # 推送至 TG 频道
+        if target_channels:
+            logger.info(f"📢 [分批分享] 正在将分享链接推送至频道 {target_channels}")
+            try:
+                await tg_service.broadcast_to_channels(
+                    {"{{share_link}}": share_link},
+                    {"full_text": f"资源名称：{new_folder_name}\n分享链接：{{{{share_link}}}}"},
+                    channel_ids=target_channels
+                )
+            except Exception as push_err:
+                logger.error(f"❌ [分批分享] 推送至频道失败: {push_err}")
+                
+        # 删除重命名后的目录
+        logger.info(f"🗑️ [分批分享] 正在删除已分享的目录 '{new_folder_name}' (CID: {target_cid})")
+        try:
+            del_resp = await svc._api_call_with_timeout(
+                svc.client.fs_delete, target_cid, async_=True,
+                timeout=60, label="fs_delete_sub_batch",
+                **svc._get_ios_ua_kwargs()
+            )
+            check_response(del_resp)
+        except Exception as del_err:
+            logger.error(f"❌ [分批分享] 删除已分享的目录失败: {del_err}")
+            
+        # 清空回收站
+        logger.info("🗑️ [分批分享] 正在清空回收站...")
+        try:
+            await svc._cleanup_recycle_bin_internal()
+        except Exception as clean_err:
+            logger.error(f"❌ [分批分享] 清空回收站失败: {clean_err}")
+            
+        # 重新创建保存目录
+        logger.info(f"📁 [分批分享] 正在重新创建保存目录 {dir_path}")
+        try:
+            new_target_cid = await svc._ensure_save_dir(dir_path)
+            logger.info(f"✅ [分批分享] 重新创建保存目录成功 (新 CID: {new_target_cid})")
+        except Exception as create_err:
+            logger.error(f"❌ [分批分享] 重新创建目录失败: {create_err}")
+            raise create_err
+            
+        # 3. 更新数据库子批次状态
+        async with async_session() as session:
+            await session.execute(
+                update(ExcelTask).where(ExcelTask.id == task_id).values(
+                    sub_batch_start_row=0,
+                    sub_batch_count=0
+                )
+            )
+            await session.commit()
+            logger.info("✅ [分批分享] 子批次处理完成，状态已重置")
+
+    async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False, strategy: str = "transfer", target_account_id: int = None, target_dir: str = None, share_interval: int = 0):
         async with async_session() as session:
             # Get currrent status
             result = await session.execute(select(ExcelTask).where(ExcelTask.id == task_id))
@@ -922,12 +1081,15 @@ class ExcelBatchService:
             task.strategy = strategy
             task.target_account_id = target_account_id
             task.target_dir = target_dir
+            task.share_interval = share_interval
             
             if not is_resume:
                 self._audit_retry_rounds.pop(task_id, None)
                 task.skip_count = skip_count
                 task.stop_row = stop_row
                 task.current_row = 0
+                task.sub_batch_start_row = 0
+                task.sub_batch_count = 0
                 # Mark first skip_count items as "跳过"
                 await session.execute(
                     update(ExcelTaskItem).where(

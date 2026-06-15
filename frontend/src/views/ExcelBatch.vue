@@ -251,12 +251,6 @@
                        />
                      </a-tooltip>
                   </div>
-                  <!-- <div class="form-item" style="margin-left: 24px; flex: none; width: 140px">
-                     <label>跳过大包 (500文件限制)</label>
-                     <div style="height: 32px; display: flex; align-items: center">
-                        <a-switch v-model:checked="skipLargePackage" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
-                     </div>
-                  </div> -->
                 </div>
                 
                 <div class="form-row">
@@ -265,7 +259,7 @@
                     <a-select v-model:value="taskStrategy" style="width: 100%" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)">
                       <a-select-option value="transfer">转存分享 (默认)</a-select-option>
                       <a-select-option value="push">直接推送 (仅转发原链接)</a-select-option>
-                      <a-select-option value="direct_save">直接保存 (不分享)</a-select-option>
+                      <a-select-option value="direct_save">直接保存</a-select-option>
                     </a-select>
                   </div>
                 </div>
@@ -283,6 +277,13 @@
                      <label>直接保存目录</label>
                      <a-input v-model:value="directSaveDir" placeholder="保存的网盘目录，如 115-Save" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
                   </div>
+                  <div class="form-item" style="flex: 1; margin-left: 24px">
+                     <label>分批分享间隔 (条)</label>
+                     <a-tooltip title="每隔多少条成功转存后，将目录重命名并生成分享链接。0 代表不生成分享">
+                       <a-input-number v-model:value="shareInterval" :min="0" :precision="0" style="width: 100%" placeholder="默认 0" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
+                     </a-tooltip>
+                  </div>
+
                 </div>
 
                 <div class="form-row">
@@ -541,6 +542,7 @@ const taskStrategy = ref('transfer');
 const accounts = ref<any[]>([]);
 const directSaveAccountId = ref<number | undefined>(undefined);
 const directSaveDir = ref('115-Save');
+const shareInterval = ref(0);
 const isConfigCollapsed = ref(false);
 
 // Upload & Mapping
@@ -656,6 +658,7 @@ const fetchCurrentTask = async () => {
       if (updatedTask.strategy !== undefined) taskStrategy.value = updatedTask.strategy || 'transfer';
       if (updatedTask.target_account_id !== undefined) directSaveAccountId.value = updatedTask.target_account_id || (accounts.value.length > 0 ? accounts.value[0].id : undefined);
       if (updatedTask.target_dir !== undefined) directSaveDir.value = updatedTask.target_dir || '115-Save';
+      if (updatedTask.share_interval !== undefined) shareInterval.value = updatedTask.share_interval || 0;
     }
   } catch (e) {
     console.error('获取任务详情失败', e);
@@ -706,6 +709,7 @@ const selectTask = (id: number) => {
   taskStrategy.value = task?.strategy || 'transfer';
   directSaveAccountId.value = task?.target_account_id || (accounts.value.length > 0 ? accounts.value[0].id : undefined);
   directSaveDir.value = task?.target_dir || '115-Save';
+  shareInterval.value = task?.share_interval || 0;
   
   pagination.current = 1;
   pagination.pageSize = 50;
@@ -780,6 +784,7 @@ const handleStartTask = async (forceParam?: any) => {
   if (stopRow.value == null) { stopRow.value = 0; defaults.push('第几行停止 → 0'); }
   if (intervalMin.value == null) { intervalMin.value = 5; defaults.push('转存间隔最小值 → 5'); }
   if (intervalMax.value == null) { intervalMax.value = 10; defaults.push('转存间隔最大值 → 10'); }
+  if (shareInterval.value == null) { shareInterval.value = 0; defaults.push('分批分享间隔 → 0'); }
   if (defaults.length > 0) {
     message.warning(`空值已重置为默认值：${defaults.join('，')}`);
   }
@@ -803,8 +808,8 @@ const handleStartTask = async (forceParam?: any) => {
       strategy: taskStrategy.value,
       force: force,
       target_account_id: taskStrategy.value === 'direct_save' ? directSaveAccountId.value : null,
-      target_dir: taskStrategy.value === 'direct_save' ? directSaveDir.value : null
-
+      target_dir: taskStrategy.value === 'direct_save' ? directSaveDir.value : null,
+      share_interval: taskStrategy.value === 'direct_save' ? shareInterval.value : 0
     });
     message.success(isResume ? '正在继续...' : '正在启动...');
     await fetchTasks();

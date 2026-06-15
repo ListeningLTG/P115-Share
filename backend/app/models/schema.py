@@ -60,6 +60,9 @@ class ExcelTask(Base):
     black_list_keywords: Mapped[str] = mapped_column(Text, nullable=True)  # Comma separated
     skip_large_package: Mapped[bool] = mapped_column(Boolean, default=False)
     strategy: Mapped[str] = mapped_column(String(20), default="transfer")  # transfer, push
+    share_interval: Mapped[int] = mapped_column(Integer, default=0)
+    sub_batch_start_row: Mapped[int] = mapped_column(Integer, default=0)
+    sub_batch_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 class P115Account(Base):
