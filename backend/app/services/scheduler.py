@@ -127,211 +127,230 @@ async def _run_scheduled_share_task(task_id: int):
         if not task or not task.enabled:
             return
         
-        # 更新状态为运行中
-        task.status = "running"
-        await session.commit()
+    # 2. 获取网盘账号 service
+    from app.services.account_manager import account_manager
+    svc = account_manager.get_service(task.account_id)
+    if not svc:
+        raise ValueError(f"网盘账号 (ID: {task.account_id}) 不存在或未启用")
 
-    logger.info(f"🚀 开始执行定时分享任务 [{task_id}] '{task.name}'")
-    
-    try:
-        # 2. 获取网盘账号 service
-        from app.services.account_manager import account_manager
-        svc = account_manager.get_service(task.account_id)
-        if not svc:
-            raise ValueError(f"网盘账号 (ID: {task.account_id}) 不存在或未启用")
+    async def _execute_flow():
+        # 再次获取任务对象以更新其状态为运行中
+        async with async_session() as session:
+            task_db = await session.get(ScheduledShareTask, task_id)
+            if not task_db or not task_db.enabled:
+                return
+            task_db.status = "running"
+            await session.commit()
+
+        logger.info(f"🚀 开始执行定时分享任务 [{task_id}] '{task_db.name}'")
         
-        # 3. 解析源目录及其父路径
-        src_path = task.dir_path.strip().rstrip('/')
-        if not src_path.startswith('/'):
-            src_path = '/' + src_path
-        if src_path == '/':
-            raise ValueError("不能对根目录执行定时分享")
-            
-        parent_path, folder_name = os.path.split(src_path)
-        if not parent_path:
-            parent_path = '/'
-            
-        logger.info(f"📂 源目录: {src_path}, 父路径: {parent_path}, 文件夹名: {folder_name}")
-        
-        # 4. 获取/创建父目录 CID 与源目录 CID
-        parent_cid = await svc._ensure_save_dir(parent_path)
-        src_cid = await svc._ensure_save_dir(src_path)
-        
-        # 5. 获取源目录中所有顶级文件/目录的信息
-        items = await svc._get_dir_items(src_cid)
-        top_ids = {item["id"] for item in items}
-        if not top_ids:
-            logger.warning(f"⚠️ 源目录 {src_path} 为空，跳过定时分享。")
-            async with async_session() as session:
-                task_db = await session.get(ScheduledShareTask, task_id)
-                if task_db:
-                    task_db.status = "success"
-                    task_db.last_run_at = datetime.utcnow()
-                    await session.commit()
-            return
-            
-        # 5.5 如果设置了容量限制，进行源目录容量检测
         try:
-            min_size_val = float(getattr(task, "min_size", 0.0) or 0.0)
-        except (ValueError, TypeError):
-            min_size_val = 0.0
-
-        if min_size_val > 0.0:
-            logger.info(f"⚖️ 开始检测源目录容量 (阈值: {min_size_val} {task.min_size_unit})...")
+            # 3. 解析源目录及其父路径
+            src_path = task_db.dir_path.strip().rstrip('/')
+            if not src_path.startswith('/'):
+                src_path = '/' + src_path
+            if src_path == '/':
+                raise ValueError("不能对根目录执行定时分享")
+                
+            parent_path, folder_name = os.path.split(src_path)
+            if not parent_path:
+                parent_path = '/'
+                
+            logger.info(f"📂 源目录: {src_path}, 父路径: {parent_path}, 文件夹名: {folder_name}")
+            
+            # 4. 获取/创建父目录 CID 与源目录 CID
+            parent_cid = await svc._ensure_save_dir(parent_path)
+            src_cid = await svc._ensure_save_dir(src_path)
+            
+            # 5. 获取源目录中所有顶级文件/目录的信息
+            items = await svc._get_dir_items(src_cid)
+            top_ids = {item["id"] for item in items}
+            if not top_ids:
+                logger.warning(f"⚠️ 源目录 {src_path} 为空，跳过定时分享。")
+                async with async_session() as session:
+                    task_db_empty = await session.get(ScheduledShareTask, task_id)
+                    if task_db_empty:
+                        task_db_empty.status = "success"
+                        task_db_empty.last_run_at = datetime.utcnow()
+                        await session.commit()
+                return
+                
+            # 5.5 如果设置了容量限制，进行源目录容量检测
             try:
-                from p115client import check_response
-                cat_resp = await svc._api_call_with_timeout(
-                    svc.client.fs_category_get_app, src_cid, async_=True,
-                    **svc._get_ios_ua_kwargs()
-                )
-                check_response(cat_resp)
-                
-                # 获取源目录的实际总字节大小
-                dir_size = parse_size_to_bytes(cat_resp.get("size", 0))
-                
-                # 将任务设定的阈值换算为字节
-                unit = getattr(task, "min_size_unit", "GB").upper()
-                threshold_bytes = min_size_val * (1024**4 if unit == "TB" else 1024**3)
-                
-                logger.info(f"📊 源目录实际大小: {dir_size / (1024**3):.3f} GB ({dir_size} 字节), 设定阈值: {min_size_val} {unit} ({threshold_bytes} 字节)")
-                
-                if dir_size < threshold_bytes:
-                    logger.warning(f"⚠️ 源目录实际容量未达到阈值，跳过本次分享。")
-                    async with async_session() as session:
-                        task_db = await session.get(ScheduledShareTask, task_id)
-                        if task_db:
-                            task_db.status = "success"
-                            task_db.last_run_at = datetime.utcnow()
-                            await session.commit()
-                    return
-            except Exception as size_e:
-                logger.error(f"❌ 获取源目录容量失败: {size_e}，将直接进行备份分享。")
-            
-        # Determine actual share mode
-        share_mode = task.share_mode if (hasattr(task, "share_mode") and task.share_mode) else ("move" if task.clear_files else "copy")
+                min_size_val = float(getattr(task_db, "min_size", 0.0) or 0.0)
+            except (ValueError, TypeError):
+                min_size_val = 0.0
 
-        if share_mode == "direct":
-            logger.info(f"🔗 [直接分享模式] 正在为 {folder_name} (CID: {src_cid}) 创建分享链接...")
-            await asyncio.sleep(5)
-            share_link = await svc._share_fids_direct([src_cid])
-            if not share_link:
-                raise RuntimeError("创建分享链接失败")
-            logger.info(f"✅ 生成定时分享链接成功: {share_link}")
-        else:
-            # 6. 新建带时间戳的目标目录
-            timestamp = time.strftime('%Y%m%d_%H%M%S')
-            new_folder_name = f"{folder_name}_{timestamp}"
-            
-            logger.info(f"📁 新建复制目标文件夹: {new_folder_name}")
-            sub_dir_resp = await svc._api_call_with_timeout(
-                svc.client.fs_makedirs_app, new_folder_name, pid=parent_cid, async_=True,
-                **svc._get_ios_ua_kwargs()
-            )
-            from p115client import check_response
-            check_response(sub_dir_resp)
-            new_cid = int(sub_dir_resp.get("cid") or sub_dir_resp.get("id") or (sub_dir_resp.get("data") or {}).get("cid") or 0)
-            if not new_cid:
-                raise RuntimeError("创建目标复制子目录失败")
+            if min_size_val > 0.0:
+                logger.info(f"⚖️ 开始检测源目录容量 (阈值: {min_size_val} {task_db.min_size_unit})...")
+                try:
+                    from p115client import check_response
+                    cat_resp = await svc._api_call_with_timeout(
+                        svc.client.fs_category_get_app, src_cid, async_=True,
+                        **svc._get_ios_ua_kwargs()
+                    )
+                    check_response(cat_resp)
+                    
+                    # 获取源目录的实际总字节大小
+                    dir_size = parse_size_to_bytes(cat_resp.get("size", 0))
+                    
+                    # 将任务设定的阈值换算为字节
+                    unit = getattr(task_db, "min_size_unit", "GB").upper()
+                    threshold_bytes = min_size_val * (1024**4 if unit == "TB" else 1024**3)
+                    
+                    logger.info(f"📊 源目录实际大小: {dir_size / (1024**3):.3f} GB ({dir_size} 字节), 设定阈值: {min_size_val} {unit} ({threshold_bytes} 字节)")
+                    
+                    if dir_size < threshold_bytes:
+                        logger.warning(f"⚠️ 源目录实际容量未达到阈值，跳过本次分享。")
+                        async with async_session() as session:
+                            task_db_cap = await session.get(ScheduledShareTask, task_id)
+                            if task_db_cap:
+                                task_db_cap.status = "success"
+                                task_db_cap.last_run_at = datetime.utcnow()
+                                await session.commit()
+                        return
+                except Exception as size_e:
+                    logger.error(f"❌ 获取源目录容量失败: {size_e}，将直接进行备份分享。")
                 
-            # 7. 根据模式移动或复制顶级文件/目录到新目录
-            fids = list(top_ids)
-            if share_mode == "move":
-                logger.info(f"📤 [移动模式] 正在移动顶级项 {len(fids)} 个到 {new_folder_name} (CID: {new_cid})...")
-                move_resp = await svc._api_call_with_timeout(
-                    svc.client.fs_move_app, fids, pid=new_cid, async_=True,
-                    **svc._get_ios_ua_kwargs()
-                )
-                check_response(move_resp)
+            # Determine actual share mode
+            share_mode = task_db.share_mode if (hasattr(task_db, "share_mode") and task_db.share_mode) else ("move" if task_db.clear_files else "copy")
+
+            if share_mode == "direct":
+                logger.info(f"🔗 [直接分享模式] 正在为 {folder_name} (CID: {src_cid}) 创建分享链接...")
+                await asyncio.sleep(5)
+                share_link = await svc._share_fids_direct([src_cid])
+                if not share_link:
+                    raise RuntimeError("创建分享链接失败")
+                logger.info(f"✅ 生成定时分享链接成功: {share_link}")
             else:
-                logger.info(f"📤 [复制模式] 正在复制顶级项 {len(fids)} 个到 {new_folder_name} (CID: {new_cid})...")
-                copy_resp = await svc._api_call_with_timeout(
-                    svc.client.fs_copy_app, fids, pid=new_cid, async_=True,
+                # 6. 新建带时间戳的目标目录
+                timestamp = time.strftime('%Y%m%d_%H%M%S')
+                new_folder_name = f"{folder_name}_{timestamp}"
+                
+                logger.info(f"📁 新建复制目标文件夹: {new_folder_name}")
+                sub_dir_resp = await svc._api_call_with_timeout(
+                    svc.client.fs_makedirs_app, new_folder_name, pid=parent_cid, async_=True,
                     **svc._get_ios_ua_kwargs()
                 )
-                check_response(copy_resp)
-            
-            # 额外休眠以确保 115 后台任务有时间初始化
-            await asyncio.sleep(5)
-            
-            # 8. 模式升级后：如果是移动模式文件已在目标目录；如果是复制模式需要保留源文件。
-            # 因此，这里不再需要对原目录进行多余的删除清理操作。
+                from p115client import check_response
+                check_response(sub_dir_resp)
+                new_cid = int(sub_dir_resp.get("cid") or sub_dir_resp.get("id") or (sub_dir_resp.get("data") or {}).get("cid") or 0)
+                if not new_cid:
+                    raise RuntimeError("创建目标复制子目录失败")
+                    
+                # 7. 根据模式移动或复制顶级文件/目录到新目录
+                fids = list(top_ids)
+                if share_mode == "move":
+                    logger.info(f"📤 [移动模式] 正在移动顶级项 {len(fids)} 个到 {new_folder_name} (CID: {new_cid})...")
+                    move_resp = await svc._api_call_with_timeout(
+                        svc.client.fs_move_app, fids, pid=new_cid, async_=True,
+                        **svc._get_ios_ua_kwargs()
+                    )
+                    check_response(move_resp)
+                else:
+                    logger.info(f"📤 [复制模式] 正在复制顶级项 {len(fids)} 个到 {new_folder_name} (CID: {new_cid})...")
+                    copy_resp = await svc._api_call_with_timeout(
+                        svc.client.fs_copy_app, fids, pid=new_cid, async_=True,
+                        **svc._get_ios_ua_kwargs()
+                    )
+                    check_response(copy_resp)
                 
-            # 9. 对复制出来的新文件夹生成永久分享链接
-            logger.info(f"🔗 正在为 {new_folder_name} (CID: {new_cid}) 创建分享链接...")
-            await asyncio.sleep(5)
-            share_link = await svc._share_fids_direct([new_cid])
-            if not share_link:
-                raise RuntimeError("创建分享链接失败")
-            
-            logger.info(f"✅ 生成定时分享链接成功: {share_link}")
-        
-        # 10. 推送分享链接至 TG 频道
-        if task.target_channels:
-            from app.services.tg_bot import tg_service
-            logger.info(f"📢 正在推送至频道: {task.target_channels}")
-            
-            # 格式化顶级项结构信息（限 15 项）
-            max_show = 15
-            # 先文件夹后文件，按名称字母顺序升序排序
-            items_sorted = sorted(items, key=lambda x: (not x["is_dir"], x["name"].lower()))
-            shown_items = items_sorted[:max_show]
-            lines = []
-            for item in shown_items:
-                icon = "📁" if item["is_dir"] else "📄"
-                lines.append(f"  {icon} {item['name']}")
-            if len(items_sorted) > max_show:
-                lines.append(f"  ...等共 {len(items_sorted)} 个项目")
-            
-            items_str = "\n".join(lines)
-            full_text = f"📁 定时分享: {folder_name}\n"
-            if items_str:
-                full_text += f"📂 包含项目:\n{items_str}\n"
-            full_text += f"🔗 链接: {share_link}"
-            
-            metadata = {
-                "full_text": full_text,
-                "entities": [],
-                "photo_id": None
-            }
-            await tg_service.broadcast_to_channels(
-                {share_link: share_link},
-                metadata,
-                channel_ids=task.target_channels
-            )
-            
-        # 11. 清理掉复制出来的新目录 (删除 + 清空回收站)
-        if share_mode != "direct":
-            logger.info(f"🗑️ 正在删除新创建的临时复制目录 {new_folder_name} (CID: {new_cid})...")
-            del_copy_resp = await svc._api_call_with_timeout(
-                svc.client.fs_delete_app, [new_cid], async_=True,
-                **svc._get_ios_ua_kwargs()
-            )
-            check_response(del_copy_resp)
-            
-            # 额外休眠，以确保 115 后台有足够时间将删除 the folder completely
-            logger.info("⏳ 等待 5 秒以确保删除项完全移入回收站...")
-            await asyncio.sleep(5)
-            
-            logger.info("🗑️ 正在清空网盘回收站...")
-            await svc.cleanup_recycle_bin()
-        
-        # 12. 更新任务状态为成功
-        async with async_session() as session:
-            task_db = await session.get(ScheduledShareTask, task_id)
-            if task_db:
-                task_db.status = "success"
-                task_db.last_run_at = datetime.utcnow()
-                await session.commit()
-        logger.info(f"🎉 定时分享任务 [{task_id}] '{task.name}' 执行完毕！")
+                # 额外休眠以确保 115 后台任务有时间初始化
+                await asyncio.sleep(5)
                 
-    except Exception as e:
-        logger.error(f"❌ 定时分享任务 [{task_id}] 执行失败: {e}", exc_info=True)
-        async with async_session() as session:
-            task_db = await session.get(ScheduledShareTask, task_id)
-            if task_db:
-                task_db.status = f"failed: {str(e)[:100]}"
-                task_db.last_run_at = datetime.utcnow()
-                await session.commit()
+                # 8. 模式升级后：如果是移动模式文件已在目标目录；如果是复制模式需要保留源文件。
+                # 因此，这里不再需要对原目录进行多余 of deletions.
+                    
+                # 9. 对复制出来的新文件夹生成永久分享链接
+                logger.info(f"🔗 正在为 {new_folder_name} (CID: {new_cid}) 创建分享链接...")
+                await asyncio.sleep(5)
+                share_link = await svc._share_fids_direct([new_cid])
+                if not share_link:
+                    raise RuntimeError("创建分享链接失败")
+                
+                logger.info(f"✅ 生成定时分享链接成功: {share_link}")
+            
+            # 10. 推送分享链接至 TG 频道
+            if task_db.target_channels:
+                from app.services.tg_bot import tg_service
+                logger.info(f"📢 正在推送至频道: {task_db.target_channels}")
+                
+                # 格式化顶级项结构信息（限 15 项）
+                max_show = 15
+                # 先文件夹后文件，按名称字母顺序升序排序
+                items_sorted = sorted(items, key=lambda x: (not x["is_dir"], x["name"].lower()))
+                shown_items = items_sorted[:max_show]
+                lines = []
+                for item in shown_items:
+                    icon = "📁" if item["is_dir"] else "📄"
+                    lines.append(f"  {icon} {item['name']}")
+                if len(items_sorted) > max_show:
+                    lines.append(f"  ...等共 {len(items_sorted)} 个项目")
+                
+                items_str = "\n".join(lines)
+                full_text = f"📁 定时分享: {folder_name}\n"
+                if items_str:
+                    full_text += f"📂 包含项目:\n{items_str}\n"
+                full_text += f"🔗 链接: {share_link}"
+                
+                metadata = {
+                    "full_text": full_text,
+                    "entities": [],
+                    "photo_id": None
+                }
+                await tg_service.broadcast_to_channels(
+                    {share_link: share_link},
+                    metadata,
+                    channel_ids=task_db.target_channels
+                )
+                
+            # 11. 清理掉复制出来的新目录 (删除 + 清空回收站)
+            if share_mode != "direct":
+                logger.info(f"🗑️ 正在删除新创建的临时复制目录 {new_folder_name} (CID: {new_cid})...")
+                del_copy_resp = await svc._api_call_with_timeout(
+                    svc.client.fs_delete_app, [new_cid], async_=True,
+                    **svc._get_ios_ua_kwargs()
+                )
+                check_response(del_copy_resp)
+                
+                # 额外休眠，以确保 115 后台有足够时间将删除 the folder completely
+                logger.info("⏳ 等待 5 秒以确保删除项完全移入回收站...")
+                await asyncio.sleep(5)
+                
+                # 检测队列中是否还有其他排队的定时分享任务
+                has_more_scheduled = False
+                for item in svc._task_queue._queue:
+                    # item 格式为 (func, args, kwargs, future, task_type, is_batch)
+                    if "scheduled_share" in str(item[4]):
+                        has_more_scheduled = True
+                        break
+                
+                if has_more_scheduled:
+                    logger.info("⏭️ 队列中还有其他定时分享任务，暂不清空回收站，待最后一个任务完成时统一清空。")
+                else:
+                    logger.info("🗑️ 正在清空网盘回收站...")
+                    await svc.cleanup_recycle_bin()
+            
+            # 12. 更新任务状态为成功
+            async with async_session() as session:
+                task_db_succ = await session.get(ScheduledShareTask, task_id)
+                if task_db_succ:
+                    task_db_succ.status = "success"
+                    task_db_succ.last_run_at = datetime.utcnow()
+                    await session.commit()
+            logger.info(f"🎉 定时分享任务 [{task_id}] '{task_db.name}' 执行完毕！")
+                    
+        except Exception as e:
+            logger.error(f"❌ 定时分享任务 [{task_id}] 执行失败: {e}", exc_info=True)
+            async with async_session() as session:
+                task_db_err = await session.get(ScheduledShareTask, task_id)
+                if task_db_err:
+                    task_db_err.status = f"failed: {str(e)[:100]}"
+                    task_db_err.last_run_at = datetime.utcnow()
+                    await session.commit()
+
+    # 将任务整个逻辑放入队列中排队顺序执行
+    await svc._enqueue_op(f"scheduled_share_{task_id}", _execute_flow)
 
 
 class CleanupScheduler:
