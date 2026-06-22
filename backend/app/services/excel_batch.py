@@ -102,7 +102,7 @@ class ExcelBatchService:
             link_pattern = re.compile(r'https?://(?:115\.com|115cdn\.com)/s/([a-z0-9]+)(?:\?password=([a-z0-9]+))?', re.IGNORECASE)
             ed2k_pattern = re.compile(r'(ed2k://\|file\|[^\s]+)', re.IGNORECASE)
             magnet_pattern = re.compile(r'(magnet:\?[^\s]+)', re.IGNORECASE)
-            telegra_pattern = re.compile(r'(https?://telegra\.ph/[a-zA-Z0-9_-]+)', re.IGNORECASE)
+            telegra_pattern = re.compile(r'(https?://telegra\.ph/[^\s]+)', re.IGNORECASE)
             
             for msg in messages:
                 text_entities = msg.get('text_entities', [])
@@ -129,6 +129,35 @@ class ExcelBatchService:
                         
                     length = get_u16_len(entity_text)
                     
+                    # 1. Scan for any links in the text or href regardless of entity type
+                    urls_to_test = []
+                    if entity_type == 'text_link' and entity.get('href'):
+                        urls_to_test.append(entity.get('href'))
+                    urls_to_test.append(entity_text)
+                    
+                    for url_val in urls_to_test:
+                        # Check 115
+                        match = link_pattern.search(url_val)
+                        if match:
+                            links_info.append((current_offset, current_offset + length, url_val, match.group(2)))
+                            break
+                        # Check ed2k
+                        match_ed2k = ed2k_pattern.search(url_val)
+                        if match_ed2k:
+                            links_info.append((current_offset, current_offset + length, match_ed2k.group(1), None))
+                            break
+                        # Check magnet
+                        match_mag = magnet_pattern.search(url_val)
+                        if match_mag:
+                            links_info.append((current_offset, current_offset + length, match_mag.group(1), None))
+                            break
+                        # Check telegraph
+                        match_tel = telegra_pattern.search(url_val)
+                        if match_tel:
+                            links_info.append((current_offset, current_offset + length, match_tel.group(1), None))
+                            break
+                    
+                    # 2. Reconstruct entities for Telegram message format
                     # Mapping Telegram types to Aiogram types
                     tg_to_aio = {
                         'bold': 'bold',
@@ -157,48 +186,6 @@ class ExcelBatchService:
                         }
                         if entity_type == 'text_link':
                             ent_data["url"] = entity.get('href')
-                            # Check URL for 115 link
-                            match = link_pattern.search(ent_data["url"])
-                            if match:
-                                links_info.append((current_offset, current_offset + length, ent_data["url"], match.group(2)))
-                            else:
-                                match_ed2k = ed2k_pattern.search(ent_data["url"])
-                                if match_ed2k:
-                                    links_info.append((current_offset, current_offset + length, match_ed2k.group(1), None))
-                                else:
-                                    match_mag = magnet_pattern.search(ent_data["url"])
-                                    if match_mag:
-                                        links_info.append((current_offset, current_offset + length, match_mag.group(1), None))
-                                    else:
-                                        match_tel = telegra_pattern.search(ent_data["url"])
-                                        if match_tel:
-                                            links_info.append((current_offset, current_offset + length, match_tel.group(1), None))
-                        elif entity_type == 'link':
-                            # Check plain text URL for 115 link
-                            match = link_pattern.search(entity_text)
-                            if match:
-                                links_info.append((current_offset, current_offset + length, entity_text, match.group(2)))
-                            else:
-                                match_ed2k = ed2k_pattern.search(entity_text)
-                                if match_ed2k:
-                                    links_info.append((current_offset, current_offset + length, match_ed2k.group(1), None))
-                                else:
-                                    match_mag = magnet_pattern.search(entity_text)
-                                    if match_mag:
-                                        links_info.append((current_offset, current_offset + length, match_mag.group(1), None))
-                                    else:
-                                        match_tel = telegra_pattern.search(entity_text)
-                                        if match_tel:
-                                            links_info.append((current_offset, current_offset + length, match_tel.group(1), None))
-                        elif entity_type in ['pre', 'code']:
-                            match_ed2k = ed2k_pattern.search(entity_text)
-                            if match_ed2k:
-                                links_info.append((current_offset, current_offset + length, match_ed2k.group(1), None))
-                            else:
-                                match_mag = magnet_pattern.search(entity_text)
-                                if match_mag:
-                                    links_info.append((current_offset, current_offset + length, match_mag.group(1), None))
-                        
                         entities.append(ent_data)
                     
                     full_text += entity_text
