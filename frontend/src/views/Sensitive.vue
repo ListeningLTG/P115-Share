@@ -1,152 +1,215 @@
 <template>
   <div class="sensitive-container">
-    <a-typography-title :level="4" style="margin-bottom: 24px">敏感词库管理</a-typography-title>
+    <a-typography-title :level="4" style="margin-bottom: 24px">敏感词管理</a-typography-title>
 
-    <a-card title="TMDB 配置" style="margin-bottom: 24px">
-      <a-form :model="configForm" layout="vertical">
-        <a-form-item label="TMDB API Key">
-          <a-input-password
-            v-model:value="configForm.api_key"
-            placeholder="请输入 TMDB API Key"
+    <a-tabs v-model:activeKey="activeTab">
+      <!-- 选项卡 1：敏感词替换 -->
+      <a-tab-pane key="replace" tab="敏感词替换">
+        <div style="padding-top: 16px">
+          <a-alert
+            message="功能说明"
+            description="启用敏感词替换后，每次网盘创建转存分享（包括TG机器人接收、手动转存分享、定时分享任务中复制或移动模式）时，系统会自动在生成分享前递归遍历对应目录，将文件名和目录名中包含的匹配词替换为目标映射词。定时任务（复制模式）中仅重命名临时共享的文件，不影响您源文件库的名称。"
+            type="info"
+            show-icon
+            style="margin-bottom: 24px"
           />
-        </a-form-item>
 
-        <a-form-item label="关键词列表">
-          <template #extra>
-            <div style="font-size: 12px; color: #999; margin-top: 4px">
-              多个关键词用英文逗号分隔。系统会自动将关键词名称解析为 TMDB ID，然后精准拉取匹配电影。
-            </div>
-          </template>
-          <a-textarea
-            v-model:value="configForm.keywords"
-            placeholder="erotic movie,eroticism,softcore,sexual fantasy,unusual sexual practices,lesbian sex,gay sex,erotic thriller"
-            :rows="4"
-          />
-        </a-form-item>
+          <a-card title="替换规则配置">
+            <a-form layout="vertical">
+              <a-form-item label="启用敏感词替换">
+                <a-switch v-model:checked="replaceEnabled" />
+              </a-form-item>
 
-        <a-space>
-          <a-button type="primary" @click="saveConfig" :loading="savingConfig">
-            保存配置
-          </a-button>
-          <a-button @click="testConnection" :loading="testingConnection">
-            测试连接
-          </a-button>
-        </a-space>
-      </a-form>
-    </a-card>
+              <a-form-item label="启用中文名称替换为拼音首字母">
+                <template #extra>
+                  <div style="font-size: 12px; color: #999; margin-top: 4px">
+                    开启后，生成分享前对文件和目录的所有中文名称替换为拼音首字母。仅在启用敏感词替换时生效。
+                  </div>
+                </template>
+                <a-switch v-model:checked="replacePinyin" :disabled="!replaceEnabled" />
+              </a-form-item>
 
-    <a-card title="爬取控制" style="margin-bottom: 24px">
-      <a-space direction="vertical" style="width: 100%">
-        <a-alert
-          type="info"
-          show-icon
-          style="margin-bottom: 8px"
-          message="关键词精准模式：将先解析关键词 ID，再直接拉取匹配电影，并自动获取美国分级信息"
-        />
+              <a-form-item label="敏感词映射表 (JSON 格式)">
+                <template #extra>
+                  <div style="font-size: 12px; color: #999; margin-top: 4px">
+                    请输入一个标准的 JSON 对象格式的映射表。键为需要被替换的敏感词，值为替换后的词。
+                    <br />
+                    示例：<code>{"斗破苍穹": "dpcq", "凡人修仙传": "frxxz", "违规词": "xxx"}</code>
+                  </div>
+                </template>
+                <a-textarea
+                  v-model:value="replaceMappingStr"
+                  placeholder='{"斗破苍穹": "dpcq", "凡人修仙传": "frxxz"}'
+                  :rows="10"
+                  style="font-family: monospace; font-size: 13px"
+                />
+              </a-form-item>
 
-        <div style="font-size: 13px; color: #666; margin-bottom: 4px">
-          上次全量同步时间：
-          <b>{{ lastSyncAt || '从未同步' }}</b>
+              <a-space>
+                <a-button type="primary" @click="saveReplaceConfig" :loading="savingReplace">
+                  保存配置
+                </a-button>
+                <a-button @click="validateMappingJson">
+                  校验 JSON 格式
+                </a-button>
+              </a-space>
+            </a-form>
+          </a-card>
         </div>
+      </a-tab-pane>
 
-        <a-space>
-          <a-button
-            type="primary"
-            @click="startFetch"
-            :loading="fetchStatus.status === 'running'"
-            :disabled="fetchStatus.status === 'running'"
-          >
-            全量爬取
-          </a-button>
-          <a-tooltip title="按上映日期倒序拉取，遇到已有记录即停止，只新增未入库的电影">
-            <a-button
-              @click="startIncrementalSync"
-              :loading="fetchStatus.status === 'running'"
-              :disabled="fetchStatus.status === 'running'"
+      <!-- 选项卡 2：违规电影词库 -->
+      <a-tab-pane v-slot:tab v-if="false"></a-tab-pane>
+      <a-tab-pane v-if="false" key="tmdb" tab="违规电影词库">
+        <div style="padding-top: 16px">
+          <a-card title="TMDB 配置" style="margin-bottom: 24px">
+            <a-form :model="configForm" layout="vertical">
+              <a-form-item label="TMDB API Key">
+                <a-input-password
+                  v-model:value="configForm.api_key"
+                  placeholder="请输入 TMDB API Key"
+                />
+              </a-form-item>
+
+              <a-form-item label="关键词列表">
+                <template #extra>
+                  <div style="font-size: 12px; color: #999; margin-top: 4px">
+                    多个关键词用英文逗号分隔。系统会自动将关键词名称解析为 TMDB ID，然后精准拉取匹配电影。
+                  </div>
+                </template>
+                <a-textarea
+                  v-model:value="configForm.keywords"
+                  placeholder="erotic movie,eroticism,softcore,sexual fantasy,unusual sexual practices,lesbian sex,gay sex,erotic thriller"
+                  :rows="4"
+                />
+              </a-form-item>
+
+              <a-space>
+                <a-button type="primary" @click="saveConfig" :loading="savingConfig">
+                  保存配置
+                </a-button>
+                <a-button @click="testConnection" :loading="testingConnection">
+                  测试连接
+                </a-button>
+              </a-space>
+            </a-form>
+          </a-card>
+
+          <a-card title="爬取控制" style="margin-bottom: 24px">
+            <a-space direction="vertical" style="width: 100%">
+              <a-alert
+                type="info"
+                show-icon
+                style="margin-bottom: 8px"
+                message="关键词精准模式：将先解析关键词 ID，再直接拉取匹配电影，并自动获取美国分级信息"
+              />
+
+              <div style="font-size: 13px; color: #666; margin-bottom: 4px">
+                上次全量同步时间：
+                <b>{{ lastSyncAt || '从未同步' }}</b>
+              </div>
+
+              <a-space>
+                <a-button
+                  type="primary"
+                  @click="startFetch"
+                  :loading="fetchStatus.status === 'running'"
+                  :disabled="fetchStatus.status === 'running'"
+                >
+                  全量爬取
+                </a-button>
+                <a-tooltip title="按上映日期倒序拉取，遇到已有记录即停止，只新增未入库的电影">
+                  <a-button
+                    @click="startIncrementalSync"
+                    :loading="fetchStatus.status === 'running'"
+                    :disabled="fetchStatus.status === 'running'"
+                  >
+                    增量同步
+                  </a-button>
+                </a-tooltip>
+                <a-button
+                  danger
+                  @click="stopFetch"
+                  :disabled="fetchStatus.status !== 'running'"
+                >
+                  停止
+                </a-button>
+                <a-button @click="refreshStatus">刷新状态</a-button>
+              </a-space>
+
+              <div v-if="fetchStatus.status !== 'idle'">
+                <a-progress
+                  :percent="fetchProgress"
+                  :status="fetchStatus.status === 'error' ? 'exception' : fetchStatus.status === 'completed' || fetchStatus.status === 'stopped' ? 'success' : 'active'"
+                />
+                <div style="margin-top: 8px; color: #666; font-size: 13px">
+                  状态: <b>{{ fetchStatusText }}</b> | 已保存: {{ fetchStatus.current }}
+                  <span v-if="fetchStatus.total > 0"> / 共 {{ fetchStatus.total }}</span>
+                  <br />
+                  {{ fetchStatus.message }}
+                </div>
+              </div>
+            </a-space>
+          </a-card>
+
+          <a-card title="电影列表">
+            <template #extra>
+              <a-space>
+                <a-input-search
+                  v-model:value="searchText"
+                  placeholder="搜索名称或 TMDB ID"
+                  style="width: 220px"
+                  @search="handleSearch"
+                />
+                <a-popconfirm
+                  title="确定要清空所有数据吗？"
+                  ok-text="确定"
+                  cancel-text="取消"
+                  @confirm="clearAllMovies"
+                >
+                  <a-button danger>清空所有数据</a-button>
+                </a-popconfirm>
+              </a-space>
+            </template>
+
+            <a-table
+              :columns="columns"
+              :data-source="movies"
+              :loading="loadingMovies"
+              :pagination="pagination"
+              @change="handleTableChange"
+              row-key="id"
             >
-              增量同步
-            </a-button>
-          </a-tooltip>
-          <a-button
-            danger
-            @click="stopFetch"
-            :disabled="fetchStatus.status !== 'running'"
-          >
-            停止
-          </a-button>
-          <a-button @click="refreshStatus">刷新状态</a-button>
-        </a-space>
-
-        <div v-if="fetchStatus.status !== 'idle'">
-          <a-progress
-            :percent="fetchProgress"
-            :status="fetchStatus.status === 'error' ? 'exception' : fetchStatus.status === 'completed' || fetchStatus.status === 'stopped' ? 'success' : 'active'"
-          />
-          <div style="margin-top: 8px; color: #666; font-size: 13px">
-            状态: <b>{{ fetchStatusText }}</b> | 已保存: {{ fetchStatus.current }}
-            <span v-if="fetchStatus.total > 0"> / 共 {{ fetchStatus.total }}</span>
-            <br />
-            {{ fetchStatus.message }}
-          </div>
+              <template #bodyCell="{ column, record }">
+                <template v-if="column.key === 'tmdb_id'">
+                  <a
+                    :href="`https://www.themoviedb.org/movie/${record.tmdb_id}`"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >{{ record.tmdb_id }}</a>
+                </template>
+                <template v-else-if="column.key === 'keywords'">
+                  <a-tag v-for="(keyword, idx) in record.keywords.slice(0, 3)" :key="idx" color="blue" style="margin: 2px">
+                    {{ keyword }}
+                  </a-tag>
+                  <span v-if="record.keywords.length > 3">+{{ record.keywords.length - 3 }}</span>
+                </template>
+                <template v-else-if="column.key === 'action'">
+                  <a-popconfirm
+                    title="确定删除这部电影吗？"
+                    ok-text="确定"
+                    cancel-text="取消"
+                    @confirm="deleteMovie(record.id)"
+                  >
+                    <a-button type="link" danger size="small">删除</a-button>
+                  </a-popconfirm>
+                </template>
+              </template>
+            </a-table>
+          </a-card>
         </div>
-      </a-space>
-    </a-card>
-
-    <a-card title="电影列表">
-      <template #extra>
-        <a-space>
-          <a-input-search
-            v-model:value="searchText"
-            placeholder="搜索名称或 TMDB ID"
-            style="width: 220px"
-            @search="handleSearch"
-          />
-          <a-popconfirm
-            title="确定要清空所有数据吗？"
-            ok-text="确定"
-            cancel-text="取消"
-            @confirm="clearAllMovies"
-          >
-            <a-button danger>清空所有数据</a-button>
-          </a-popconfirm>
-        </a-space>
-      </template>
-
-      <a-table
-        :columns="columns"
-        :data-source="movies"
-        :loading="loadingMovies"
-        :pagination="pagination"
-        @change="handleTableChange"
-        row-key="id"
-      >
-        <template #bodyCell="{ column, record }">
-          <template v-if="column.key === 'tmdb_id'">
-            <a
-              :href="`https://www.themoviedb.org/movie/${record.tmdb_id}`"
-              target="_blank"
-              rel="noopener noreferrer"
-            >{{ record.tmdb_id }}</a>
-          </template>
-          <template v-else-if="column.key === 'keywords'">
-            <a-tag v-for="(keyword, idx) in record.keywords.slice(0, 3)" :key="idx" color="blue" style="margin: 2px">
-              {{ keyword }}
-            </a-tag>
-            <span v-if="record.keywords.length > 3">+{{ record.keywords.length - 3 }}</span>
-          </template>
-          <template v-else-if="column.key === 'action'">
-            <a-popconfirm
-              title="确定删除这部电影吗？"
-              ok-text="确定"
-              cancel-text="取消"
-              @confirm="deleteMovie(record.id)"
-            >
-              <a-button type="link" danger size="small">删除</a-button>
-            </a-popconfirm>
-          </template>
-        </template>
-      </a-table>
-    </a-card>
+      </a-tab-pane>
+    </a-tabs>
   </div>
 </template>
 
@@ -155,6 +218,16 @@ import { ref, reactive, onMounted, computed, onUnmounted } from 'vue';
 import axios from 'axios';
 import { message } from 'ant-design-vue';
 
+// Tab Key
+const activeTab = ref('replace');
+
+// Sensitive Replace State
+const replaceEnabled = ref(false);
+const replaceMappingStr = ref('{}');
+const replacePinyin = ref(false);
+const savingReplace = ref(false);
+
+// TMDB Crawl State
 const configForm = reactive({
   api_key: '',
   country: 'US',
@@ -253,6 +326,66 @@ const columns = [
   { title: '操作', key: 'action', width: 80 }
 ];
 
+// Load sensitive replace config
+const loadReplaceConfig = async () => {
+  try {
+    const res = await axios.get('/api/config/');
+    replaceEnabled.value = res.data.sensitive_replace_enabled || false;
+    replaceMappingStr.value = res.data.sensitive_replace_mapping || '{}';
+    replacePinyin.value = res.data.sensitive_replace_pinyin || false;
+  } catch (e) {
+    console.error('加载敏感词替换配置失败:', e);
+    message.error('加载替换配置失败');
+  }
+};
+
+// Validate JSON syntax and structure
+const validateMappingJson = () => {
+  try {
+    const parsed = JSON.parse(replaceMappingStr.value);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      message.error('映射表必须是一个 JSON 对象 (例如: {"敏感词": "替换词"})');
+      return false;
+    }
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof k !== 'string' || typeof v !== 'string') {
+        message.warning('映射表的键和值都应为字符串格式');
+        return true;
+      }
+    }
+    message.success('JSON 校验通过！格式正确。');
+    return true;
+  } catch (err: any) {
+    message.error(`JSON 语法解析错误: ${err.message}`);
+    return false;
+  }
+};
+
+// Save sensitive replace config
+const saveReplaceConfig = async () => {
+  if (!validateMappingJson()) {
+    return;
+  }
+  try {
+    savingReplace.value = true;
+    const res = await axios.post('/api/config/update', {
+      sensitive_replace_enabled: replaceEnabled.value,
+      sensitive_replace_mapping: replaceMappingStr.value,
+      sensitive_replace_pinyin: replacePinyin.value
+    });
+    if (res.data.status === 'success') {
+      message.success('替换配置已保存');
+    } else {
+      message.error(res.data.message || '保存失败');
+    }
+  } catch (e: any) {
+    message.error(e.response?.data?.detail || '保存失败');
+  } finally {
+    savingReplace.value = false;
+  }
+};
+
+// Load TMDB config
 const loadConfig = async () => {
   try {
     const res = await axios.get('/api/sensitive/config');
@@ -265,23 +398,22 @@ const loadConfig = async () => {
       lastSyncAt.value = res.data.data.last_sync_at || '';
     }
   } catch (e) {
-    console.error('加载配置失败:', e);
+    console.error('加载 TMDB 配置失败:', e);
   }
 };
 
+// Save TMDB config
 const saveConfig = async () => {
   if (!configForm.api_key) {
     message.warning('请输入 TMDB API Key');
     return;
   }
-
   try {
     savingConfig.value = true;
-    // Force keyword mode enabled
     const payload = { ...configForm, use_keyword_filter: true };
     const res = await axios.post('/api/sensitive/config', payload);
     if (res.data.status === 'success') {
-      message.success('配置已保存');
+      message.success('TMDB 配置已保存');
     } else {
       message.error(res.data.message || '保存失败');
     }
@@ -292,12 +424,12 @@ const saveConfig = async () => {
   }
 };
 
+// Test TMDB connection
 const testConnection = async () => {
   if (!configForm.api_key) {
     message.warning('请输入 TMDB API Key');
     return;
   }
-
   try {
     testingConnection.value = true;
     const res = await axios.post('/api/sensitive/test-connection', {
@@ -320,14 +452,13 @@ const startFetch = async () => {
     message.warning('请先配置并保存 TMDB API Key');
     return;
   }
-
   try {
     const res = await axios.post('/api/sensitive/fetch', {
       country: 'US',
       certifications: []
     });
     if (res.data.status === 'success') {
-      message.success('爬取任务已启动');
+      message.success('全量爬取任务已启动');
       startStatusPolling();
     } else {
       message.error(res.data.message);
@@ -342,7 +473,6 @@ const startIncrementalSync = async () => {
     message.warning('请先配置并保存 TMDB API Key');
     return;
   }
-
   try {
     const res = await axios.post('/api/sensitive/incremental-sync');
     if (res.data.status === 'success') {
@@ -372,7 +502,6 @@ const refreshStatus = async () => {
     const res = await axios.get('/api/sensitive/status');
     if (res.data.status === 'success') {
       fetchStatus.value = res.data.data;
-
       if (fetchStatus.value.status === 'running') {
         startStatusPolling();
       } else {
@@ -421,7 +550,7 @@ const loadMovies = async () => {
     }
   } catch (e) {
     console.error('加载电影列表失败:', e);
-    message.error('加载失败');
+    message.error('加载列表失败');
   } finally {
     loadingMovies.value = false;
   }
@@ -437,7 +566,6 @@ const handleTableChange = (pag: any, _filters: any, sorter: any) => {
   pagination.pageSize = pag.pageSize;
 
   if (sorter && sorter.field) {
-    // Map column dataIndex to backend sort field
     const fieldMap: Record<string, string> = {
       tmdb_id: 'tmdb_id',
       title: 'title',
@@ -448,7 +576,6 @@ const handleTableChange = (pag: any, _filters: any, sorter: any) => {
     sortField.value = fieldMap[sorter.field] || 'created_at';
     sortOrder.value = sorter.order === 'ascend' ? 'asc' : 'desc';
   }
-
   loadMovies();
 };
 
@@ -481,6 +608,7 @@ const clearAllMovies = async () => {
 };
 
 onMounted(async () => {
+  await loadReplaceConfig();
   await loadConfig();
   await loadMovies();
   await refreshStatus();

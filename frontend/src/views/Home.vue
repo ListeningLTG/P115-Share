@@ -36,10 +36,10 @@
           <template #icon><ClockCircleOutlined /></template>
           <span>定时分享管理</span>
         </a-menu-item>
-        <!-- <a-menu-item key="sensitive" @click="currentView = 'sensitive'">
+        <a-menu-item key="sensitive" @click="currentView = 'sensitive'">
           <template #icon><WarningOutlined /></template>
-          <span>敏感词库</span>
-        </a-menu-item> -->
+          <span>敏感词管理</span>
+        </a-menu-item>
         <a-menu-item key="settings" @click="currentView = 'settings'">
           <template #icon><SettingOutlined /></template>
           <span>系统配置</span>
@@ -85,10 +85,10 @@
           <template #icon><ClockCircleOutlined /></template>
           <span>定时分享管理</span>
         </a-menu-item>
-        <!-- <a-menu-item key="sensitive" @click="currentView = 'sensitive'">
+        <a-menu-item key="sensitive" @click="currentView = 'sensitive'">
           <template #icon><WarningOutlined /></template>
-          <span>敏感词库</span>
-        </a-menu-item> -->
+          <span>敏感词管理</span>
+        </a-menu-item>
         <a-menu-item key="settings" @click="currentView = 'settings'">
           <template #icon><SettingOutlined /></template>
           <span>系统配置</span>
@@ -214,7 +214,8 @@ import {
   FileExcelOutlined,
   ShareAltOutlined,
   CloudServerOutlined,
-  ClockCircleOutlined
+  ClockCircleOutlined,
+  WarningOutlined
 } from '@ant-design/icons-vue';
 import { Grid, message, theme } from 'ant-design-vue';
 import Dashboard from './Dashboard.vue';

@@ -592,6 +592,9 @@ class P115Service:
         async def _internal_flow():
             save_res = await self._save_share_link_internal(share_url, metadata, target_dir, skip_large_package, db_id=db_id, create_task_subdir=True)
             if save_res and save_res.get("status") == "success":
+                # If sensitive replace is enabled, perform replacement inside the task subdir
+                if settings.SENSITIVE_REPLACE_ENABLED:
+                    await self.replace_sensitive_words_in_dir(save_res["to_cid"])
                 share_res = await self.create_share_link(save_res)
                 if isinstance(share_res, str):
                     return {"status": "success", "share_link": share_res}
@@ -2370,6 +2373,192 @@ class P115Service:
         except Exception as e:
             logger.error("❌ 内部清空回收站失败: {}", e)
             return False
+
+    async def replace_sensitive_words_in_dir(self, cid: int):
+        """递归遍历指定目录并批量替换敏感词"""
+        if not settings.SENSITIVE_REPLACE_ENABLED:
+            return
+
+        if not self.fs:
+            logger.warning("⚠️ P115FileSystem 未初始化，跳过敏感词替换")
+            return
+
+        try:
+            mapping = json.loads(settings.SENSITIVE_REPLACE_MAPPING) if settings.SENSITIVE_REPLACE_MAPPING else {}
+        except Exception as e:
+            logger.error(f"❌ 解析敏感词映射表失败: {e}")
+            mapping = {}
+
+        # 若启用了拼音首字母替换，过滤掉映射表中已有的等价映射以避免重复逻辑判断
+        if settings.SENSITIVE_REPLACE_PINYIN:
+            try:
+                import pypinyin
+                filtered_mapping = {}
+                for k, v in mapping.items():
+                    k_pinyin = ''.join(pypinyin.lazy_pinyin(k, style=pypinyin.STYLE_FIRST_LETTER)).lower()
+                    if k_pinyin == v.lower():
+                        logger.info(f"ℹ️ 映射规则 [{k}] -> [{v}] 与拼音首字母一致，已自动跳过该映射规则判定")
+                        continue
+                    filtered_mapping[k] = v
+                mapping = filtered_mapping
+            except Exception as pe:
+                logger.error(f"❌ 过滤拼音冗余映射逻辑失败: {pe}")
+
+        if not mapping and not settings.SENSITIVE_REPLACE_PINYIN:
+            return
+
+        logger.info(f"🔍 开始对目录 (CID: {cid}) 执行敏感词替换...")
+
+        import re
+        pattern = None
+        mapping_lower = {}
+        if mapping:
+            try:
+                # 使用 re.IGNORECASE 进行大小写无关的匹配
+                mapping_lower = {k.lower(): v for k, v in mapping.items()}
+                pattern = re.compile("|".join(re.escape(k) for k in mapping.keys()), re.IGNORECASE)
+            except Exception as e:
+                logger.error(f"❌ 编译敏感词正则失败: {e}")
+                return
+
+        def get_new_name(old_name: str) -> str:
+            # 1. 优先使用敏感词映射表进行匹配替换
+            if pattern:
+                def replace_func(match):
+                    matched_str = match.group(0)
+                    return mapping_lower.get(matched_str.lower(), matched_str)
+                name_after_mapping = pattern.sub(replace_func, old_name)
+            else:
+                name_after_mapping = old_name
+
+            # 2. 若启用，再将其余的中文字符替换为拼音首字母 (同时保护 "第几集"、"第几季" 不被转换)
+            if settings.SENSITIVE_REPLACE_PINYIN:
+                try:
+                    import pypinyin
+                    # 使用正则匹配 "第几集" 或 "第几季"，保护它们不被转成拼音首字母
+                    # 支持阿拉伯数字、中文数字（如：第14集、第204集、第十四集、第 14 集、第一季）
+                    episode_pattern = re.compile(r"第\s*[0-9一二三四五六七八九十百千万]+\s*[集季]")
+                    placeholders = []
+                    
+                    def encode_episodes(match):
+                        placeholder = f"__EPISODE_HOLDER_{len(placeholders)}__"
+                        placeholders.append((placeholder, match.group(0)))
+                        return placeholder
+                    
+                    protected_name = episode_pattern.sub(encode_episodes, name_after_mapping)
+                    
+                    # 转换拼音首字母
+                    pinyin_name = ''.join(pypinyin.lazy_pinyin(protected_name, style=pypinyin.STYLE_FIRST_LETTER))
+                    
+                    # 还原被保护的 "第几集" / "第几季"
+                    for placeholder, original in placeholders:
+                        pinyin_name = pinyin_name.replace(placeholder, original)
+                        pinyin_name = pinyin_name.replace(placeholder.lower(), original)
+                        
+                    new_name = pinyin_name
+                except Exception:
+                    new_name = name_after_mapping
+            else:
+                new_name = name_after_mapping
+
+            return new_name
+
+        renamed_count = 0
+        try:
+            to_rename = []
+            
+            # 使用自定义异步 DFS 遍历，避免 p115client.fs.walk 在 async_=True 下迭代 coroutine 对象的 bug
+            visited = set()
+            async def walk_and_collect(current_cid: int):
+                if current_cid in visited:
+                    return
+                visited.add(current_cid)
+                
+                try:
+                    items = await self.fs.readdir(current_cid, async_=True, **self._get_ios_ua_kwargs())
+                except Exception as read_ex:
+                    logger.error(f"❌ 读取目录 (CID: {current_cid}) 失败: {read_ex}")
+                    return
+
+                dirs = [item for item in items if item.get("is_dir")]
+                files = [item for item in items if not item.get("is_dir")]
+
+                # 优先递归子目录 (自底向上/后序遍历)
+                for d in dirs:
+                    sub_cid = d.get("id")
+                    if sub_cid is not None:
+                        await walk_and_collect(sub_cid)
+
+                # 收集文件
+                for f in files:
+                    fid = f.get("id")
+                    old_name = f.get("name")
+                    if fid is not None and old_name:
+                        new_name = get_new_name(old_name)
+                        if new_name != old_name:
+                            to_rename.append((fid, new_name, old_name))
+
+                # 收集子目录本身
+                for d in dirs:
+                    did = d.get("id")
+                    old_name = d.get("name")
+                    if did is not None and old_name:
+                        new_name = get_new_name(old_name)
+                        if new_name != old_name:
+                            to_rename.append((did, new_name, old_name))
+
+            await walk_and_collect(cid)
+
+            if not to_rename:
+                logger.info(f"✅ 目录 (CID: {cid}) 内未检测到敏感词")
+                return
+
+            logger.info(f"📂 发现 {len(to_rename)} 个项目包含敏感词，开始重命名...")
+
+            # 批量重命名 (按照 100 个一组)
+            batch_size = 100
+            for i in range(0, len(to_rename), batch_size):
+                batch = to_rename[i:i+batch_size]
+                payload_items = [(item[0], item[1]) for item in batch]
+                try:
+                    logger.debug(f"📤 发送重命名批次 ({i//batch_size + 1}), 数量: {len(payload_items)}")
+                    resp = await self._api_call_with_timeout(
+                        self.client.fs_rename_app,
+                        payload_items,
+                        async_=True,
+                        **self._get_ios_ua_kwargs()
+                    )
+                    check_response(resp)
+                    renamed_count += len(payload_items)
+                    for item in batch:
+                        logger.info(f"✏️ 重命名成功: [{item[2]}] -> [{item[1]}]")
+                except Exception as ex:
+                    logger.error(f"❌ 批量重命名批次失败: {ex}，将尝试逐个重命名...")
+                    # 容错降级：单个重命名
+                    for item in batch:
+                        try:
+                            resp = await self._api_call_with_timeout(
+                                self.client.fs_rename_app,
+                                (item[0], item[1]),
+                                async_=True,
+                                **self._get_ios_ua_kwargs()
+                            )
+                            check_response(resp)
+                            renamed_count += 1
+                            logger.info(f"✏️ 单体容错重命名成功: [{item[2]}] -> [{item[1]}]")
+                        except Exception as single_ex:
+                            logger.error(f"❌ 容错重命名失败 [{item[2]}]: {single_ex}")
+
+                # 每次批量操作后，休眠 1.0 ~ 2.0 秒，降低风控概率
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+
+            logger.info(f"🎉 敏感词替换完成，共替换了 {renamed_count} 个项目")
+            # 等待 2 秒让网盘后台完成状态同步
+            await asyncio.sleep(2.0)
+
+        except Exception as e:
+            logger.error(f"❌ 执行敏感词替换时发生异常: {e}", exc_info=True)
+
 
     
 p115_service = P115Service()

@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     DIRECT_SAVE_ACCOUNT_ID: int = 0
     DIRECT_SAVE_DIR: str = "115-Save"
     TG_DEFAULT_COMMAND_MODE: str = "share"
+    
+    # Sensitive Word Replacement Configuration
+    SENSITIVE_REPLACE_ENABLED: bool = False
+    SENSITIVE_REPLACE_MAPPING: str = "{}"
+    SENSITIVE_REPLACE_PINYIN: bool = False
 
     
     # App
