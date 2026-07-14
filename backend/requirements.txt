@@ -20,5 +20,6 @@ pandas
 openpyxl
 xlrd
 p115client==0.0.9.0.2
+python-concurrenttools==0.1.4
 p115oss==0.1.0.1
 pypinyin
