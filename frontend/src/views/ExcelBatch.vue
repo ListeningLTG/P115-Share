@@ -297,6 +297,21 @@
                   </div>
                 </div>
 
+                <div class="form-row" v-if="taskStrategy === 'transfer'">
+                  <div class="form-item" style="flex: 1">
+                    <label>启用敏感词替换</label>
+                    <a-switch v-model:checked="sensitiveReplaceEnabled" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
+                  </div>
+                  <div class="form-item" style="flex: 1; margin-left: 24px" v-if="sensitiveReplaceEnabled">
+                    <label>启用中文名称替换为拼音首字母</label>
+                    <a-switch v-model:checked="sensitiveReplacePinyin" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
+                  </div>
+                  <div class="form-item" style="flex: 1; margin-left: 24px" v-if="sensitiveReplaceEnabled && isTmdbConfigured">
+                    <label>启用 TMDB 别名替换</label>
+                    <a-switch v-model:checked="sensitiveReplaceTmdb" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
+                  </div>
+                </div>
+
                 <div class="form-row" v-if="tgChannels.length > 0">
                    <div class="form-item" style="width: 100%">
                       <label>推送频道</label>
@@ -543,6 +558,10 @@ const accounts = ref<any[]>([]);
 const directSaveAccountId = ref<number | undefined>(undefined);
 const directSaveDir = ref('115-Save');
 const shareInterval = ref(0);
+const sensitiveReplaceEnabled = ref(false);
+const sensitiveReplacePinyin = ref(false);
+const sensitiveReplaceTmdb = ref(false);
+const isTmdbConfigured = ref(false);
 const isConfigCollapsed = ref(false);
 
 // Upload & Mapping
@@ -592,6 +611,7 @@ const fetchTasks = async () => {
 const fetchSettings = async () => {
   try {
     const res = await axios.get('/api/config/');
+    isTmdbConfigured.value = !!res.data.tmdb_api_key;
     if (res.data.p115_save_dir) {
       systemSaveDir.value = res.data.p115_save_dir;
     }
@@ -659,6 +679,9 @@ const fetchCurrentTask = async () => {
       if (updatedTask.target_account_id !== undefined) directSaveAccountId.value = updatedTask.target_account_id || (accounts.value.length > 0 ? accounts.value[0].id : undefined);
       if (updatedTask.target_dir !== undefined) directSaveDir.value = updatedTask.target_dir || '115-Save';
       if (updatedTask.share_interval !== undefined) shareInterval.value = updatedTask.share_interval || 0;
+      if (updatedTask.sensitive_replace_enabled !== undefined) sensitiveReplaceEnabled.value = updatedTask.sensitive_replace_enabled || false;
+      if (updatedTask.sensitive_replace_pinyin !== undefined) sensitiveReplacePinyin.value = updatedTask.sensitive_replace_pinyin || false;
+      if (updatedTask.sensitive_replace_tmdb !== undefined) sensitiveReplaceTmdb.value = updatedTask.sensitive_replace_tmdb || false;
     }
   } catch (e) {
     console.error('获取任务详情失败', e);
@@ -710,6 +733,9 @@ const selectTask = (id: number) => {
   directSaveAccountId.value = task?.target_account_id || (accounts.value.length > 0 ? accounts.value[0].id : undefined);
   directSaveDir.value = task?.target_dir || '115-Save';
   shareInterval.value = task?.share_interval || 0;
+  sensitiveReplaceEnabled.value = task?.sensitive_replace_enabled || false;
+  sensitiveReplacePinyin.value = task?.sensitive_replace_pinyin || false;
+  sensitiveReplaceTmdb.value = task?.sensitive_replace_tmdb || false;
   
   pagination.current = 1;
   pagination.pageSize = 50;
@@ -809,7 +835,10 @@ const handleStartTask = async (forceParam?: any) => {
       force: force,
       target_account_id: taskStrategy.value === 'direct_save' ? directSaveAccountId.value : null,
       target_dir: taskStrategy.value === 'direct_save' ? directSaveDir.value : null,
-      share_interval: taskStrategy.value === 'direct_save' ? shareInterval.value : 0
+      share_interval: taskStrategy.value === 'direct_save' ? shareInterval.value : 0,
+      sensitive_replace_enabled: sensitiveReplaceEnabled.value,
+      sensitive_replace_pinyin: sensitiveReplacePinyin.value,
+      sensitive_replace_tmdb: sensitiveReplaceTmdb.value
     });
     message.success(isResume ? '正在继续...' : '正在启动...');
     await fetchTasks();
@@ -1289,6 +1318,10 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 4px;
   flex: 1;
+}
+
+.form-item :deep(.ant-switch) {
+  align-self: flex-start;
 }
 
 .form-item label {

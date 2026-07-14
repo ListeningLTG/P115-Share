@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     SENSITIVE_REPLACE_ENABLED: bool = False
     SENSITIVE_REPLACE_MAPPING: str = "{}"
     SENSITIVE_REPLACE_PINYIN: bool = False
+    SENSITIVE_REPLACE_TMDB: bool = False
+    TMDB_API_KEY: str = ""
 
     
     # App

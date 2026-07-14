@@ -576,7 +576,10 @@ class ExcelBatchService:
                             "skip_large_package": task.skip_large_package,
                             "strategy": task.strategy,
                             "target_account_id": task.target_account_id,
-                            "target_dir": task.target_dir
+                            "target_dir": task.target_dir,
+                            "sensitive_replace_enabled": task.sensitive_replace_enabled,
+                            "sensitive_replace_pinyin": task.sensitive_replace_pinyin,
+                            "sensitive_replace_tmdb": task.sensitive_replace_tmdb
                         }
 
                         is_processed = await self._process_item(item_id, task_config, svc=svc, acct_mgr=acct_mgr)
@@ -692,6 +695,9 @@ class ExcelBatchService:
                     strategy = task_config.get("strategy", "transfer")
                     target_account_id = task_config.get("target_account_id")
                     target_dir = task_config.get("target_dir")
+                    sensitive_replace_enabled = task_config.get("sensitive_replace_enabled", False)
+                    sensitive_replace_pinyin = task_config.get("sensitive_replace_pinyin", False)
+                    sensitive_replace_tmdb = task_config.get("sensitive_replace_tmdb", False)
                 else:
                     task_result = await session.execute(
                         select(ExcelTask).where(ExcelTask.id == item.task_id)
@@ -704,6 +710,9 @@ class ExcelBatchService:
                     strategy = t_row.strategy
                     target_account_id = t_row.target_account_id
                     target_dir = t_row.target_dir
+                    sensitive_replace_enabled = t_row.sensitive_replace_enabled
+                    sensitive_replace_pinyin = t_row.sensitive_replace_pinyin
+                    sensitive_replace_tmdb = t_row.sensitive_replace_tmdb
             except Exception:
                 logger.error(f"Item {item_id} not found or task deleted")
                 return
@@ -869,7 +878,10 @@ class ExcelBatchService:
                     url_to_save,
                     metadata=metadata,
                     skip_large_package=True,
-                    is_batch=True
+                    is_batch=True,
+                    sensitive_replace_enabled=sensitive_replace_enabled,
+                    sensitive_replace_pinyin=sensitive_replace_pinyin,
+                    sensitive_replace_tmdb=sensitive_replace_tmdb
                 )
                 
                 if save_res:
@@ -1068,7 +1080,7 @@ class ExcelBatchService:
             await session.commit()
             logger.info("✅ [分批分享] 子批次处理完成，状态已重置")
 
-    async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False, strategy: str = "transfer", target_account_id: int = None, target_dir: str = None, share_interval: int = 0):
+    async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False, strategy: str = "transfer", target_account_id: int = None, target_dir: str = None, share_interval: int = 0, sensitive_replace_enabled: bool = False, sensitive_replace_pinyin: bool = False, sensitive_replace_tmdb: bool = False):
         async with async_session() as session:
             # Get currrent status
             result = await session.execute(select(ExcelTask).where(ExcelTask.id == task_id))
@@ -1104,6 +1116,9 @@ class ExcelBatchService:
             task.target_account_id = target_account_id
             task.target_dir = target_dir
             task.share_interval = share_interval
+            task.sensitive_replace_enabled = sensitive_replace_enabled
+            task.sensitive_replace_pinyin = sensitive_replace_pinyin
+            task.sensitive_replace_tmdb = sensitive_replace_tmdb
             
             if not is_resume:
                 self._audit_retry_rounds.pop(task_id, None)

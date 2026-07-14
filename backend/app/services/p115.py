@@ -11,7 +11,7 @@ import json
 import re
 import random
 from contextlib import asynccontextmanager
-from typing import Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from app.core.database import async_session
 from app.models.schema import PendingLink, LinkHistory
 from sqlalchemy import select, delete
@@ -30,6 +30,119 @@ IOS_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 115Life/8.7.0"
 )
+
+TMDB_ID_PATTERN = re.compile(r"(?i)(?:tmdbid|tmdb)\s*(?:=|:|[-_])?\s*(\d+)")
+SEASON_DIR_PATTERN = re.compile(r"(?i)^(?:season\s*0*\d{1,2}|s0*\d{1,2}|第\s*[0-9一二三四五六七八九十百千万]+\s*季)$")
+EPISODE_STRONG_PATTERN = re.compile(r"(?i)\bS\d{1,2}E\d{1,3}\b")
+EPISODE_MID_PATTERN = re.compile(r"(?i)\b(?:EP?|E)\s*0*\d{1,3}\b")
+EPISODE_CN_PATTERN = re.compile(r"第\s*[0-9一二三四五六七八九十百千万]+\s*集")
+WEAK_NUMBER_PATTERN = re.compile(r"(?:^|[\s._-])(\d{1,2})(?:[\s._-]|$)")
+
+
+def extract_tmdb_id_from_name(name: str) -> Optional[int]:
+    match = TMDB_ID_PATTERN.search(name or "")
+    return int(match.group(1)) if match else None
+
+
+def _strip_common_tags_for_media(name: str) -> str:
+    cleaned = re.sub(r"(?i)(?:tmdbid|tmdb)\s*(?:=|:|[-_])?\s*\d+", "", name or "")
+    cleaned = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", cleaned)
+    return cleaned
+
+
+def infer_media_hint_from_name(name: str) -> str:
+    name_clean = _strip_common_tags_for_media(name)
+    if EPISODE_STRONG_PATTERN.search(name_clean) or EPISODE_CN_PATTERN.search(name_clean):
+        return "tv"
+    if EPISODE_MID_PATTERN.search(name_clean):
+        return "tv"
+    return "unknown"
+
+
+def _collect_weak_episode_numbers(name: str) -> Tuple[str, Optional[int]]:
+    name_clean = _strip_common_tags_for_media(name)
+    if EPISODE_STRONG_PATTERN.search(name_clean) or EPISODE_MID_PATTERN.search(name_clean):
+        return "", None
+    matches = WEAK_NUMBER_PATTERN.findall(name_clean)
+    if not matches:
+        return "", None
+
+    nums = [int(x) for x in matches if x.isdigit() and 1 <= int(x) <= 39]
+    if not nums:
+        return "", None
+
+    ep_num = nums[-1]
+    base = re.sub(r"(?:^|[\s._-])\d{1,2}(?:[\s._-]|$)", " ", name_clean)
+    base = re.sub(r"\s+", " ", base).strip().lower()
+    return base, ep_num
+
+
+def infer_media_hint_from_items(items: List[Dict[str, Any]]) -> str:
+    tv_score = 0
+    weak_groups: Dict[str, set] = {}
+
+    for item in items:
+        item_name = (item.get("name") or "").strip()
+        if not item_name:
+            continue
+        if item.get("is_dir"):
+            if SEASON_DIR_PATTERN.search(item_name):
+                tv_score += 5
+            continue
+
+        hint = infer_media_hint_from_name(item_name)
+        if hint == "tv":
+            tv_score += 2
+
+        base, ep_num = _collect_weak_episode_numbers(item_name)
+        if base and ep_num is not None:
+            weak_groups.setdefault(base, set()).add(ep_num)
+
+    for nums in weak_groups.values():
+        if len(nums) >= 3:
+            tv_score += 3
+            break
+
+    return "tv" if tv_score >= 3 else "unknown"
+
+
+def extract_replacement_title_fragment(name: str) -> str:
+    """提取用于 TMDB 别名替换的标题片段，优先返回完整中文主标题块。"""
+    name_no_ext = (name or "")
+    if "." in name_no_ext:
+        name_no_ext = name_no_ext.rsplit(".", 1)[0]
+
+    # 先移除 tmdb 标记，避免干扰边界定位
+    cleaned = re.sub(r"(?i)(?:\{|\[|\()\s*(?:tmdbid|tmdb)\s*(?:=|:|[-_])?\s*\d+\s*(?:\}|\]|\))", "", name_no_ext)
+    cleaned = re.sub(r"(?i)\b(?:tmdbid|tmdb)\s*(?:=|:|[-_])?\s*\d+\b", "", cleaned)
+
+    boundary_patterns = [
+        r"\(\d{4}\)",
+        r"[._\-\s]\d{4}(?:[._\-\s]|$)",
+        r"\bS\d{1,2}E\d{1,3}\b",
+        r"\b(?:EP?|E)\s*\d{1,3}\b",
+        r"第\s*[0-9一二三四五六七八九十百千万]+\s*[集季]",
+        r"\b(?:720|1080|2160|4320)p\b",
+    ]
+
+    cut_pos = len(cleaned)
+    for p in boundary_patterns:
+        m = re.search(p, cleaned, flags=re.IGNORECASE)
+        if m:
+            cut_pos = min(cut_pos, m.start())
+
+    head = cleaned[:cut_pos].strip(" ._-—–:：")
+
+    # 若前缀中存在中文，优先用完整前缀（保留中文冒号结构，如 A：B）
+    if any('\u4e00' <= ch <= '\u9fff' for ch in head):
+        return head
+
+    # 回退到最长中文片段
+    chinese_segments = re.findall(r"[\u4e00-\u9fff]+", cleaned)
+    if chinese_segments:
+        return max(chinese_segments, key=len)
+
+    return ""
 
 
 class P115Service:
@@ -262,7 +375,7 @@ class P115Service:
 
     def init_client(self, cookie: str):
         try:
-            self.client = P115Client(cookie, check_for_relogin=True)
+            self.client = P115Client(cookie)
             self.fs = P115FileSystem(self.client)
             self.clear_save_dir_cache()
             
@@ -587,14 +700,18 @@ class P115Service:
             is_batch=is_batch
         )
 
-    async def save_and_share(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, db_id: Optional[int] = None, is_batch: bool = False):
+    async def save_and_share(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, db_id: Optional[int] = None, is_batch: bool = False, sensitive_replace_enabled: Optional[bool] = None, sensitive_replace_pinyin: Optional[bool] = None, sensitive_replace_tmdb: Optional[bool] = None):
         """通过队列进行转存并分享"""
         async def _internal_flow():
             save_res = await self._save_share_link_internal(share_url, metadata, target_dir, skip_large_package, db_id=db_id, create_task_subdir=True)
             if save_res and save_res.get("status") == "success":
+                # Determine configuration: local override or global fallback
+                should_replace = sensitive_replace_enabled if sensitive_replace_enabled is not None else settings.SENSITIVE_REPLACE_ENABLED
+                should_pinyin = sensitive_replace_pinyin if sensitive_replace_pinyin is not None else settings.SENSITIVE_REPLACE_PINYIN
+                should_tmdb = sensitive_replace_tmdb if sensitive_replace_tmdb is not None else settings.SENSITIVE_REPLACE_TMDB
                 # If sensitive replace is enabled, perform replacement inside the task subdir
-                if settings.SENSITIVE_REPLACE_ENABLED:
-                    await self.replace_sensitive_words_in_dir(save_res["to_cid"])
+                if should_replace:
+                    await self.replace_sensitive_words_in_dir(save_res["to_cid"], replace_enabled=should_replace, replace_pinyin=should_pinyin, replace_tmdb=should_tmdb)
                 share_res = await self.create_share_link(save_res)
                 if isinstance(share_res, str):
                     return {"status": "success", "share_link": share_res}
@@ -2374,9 +2491,10 @@ class P115Service:
             logger.error("❌ 内部清空回收站失败: {}", e)
             return False
 
-    async def replace_sensitive_words_in_dir(self, cid: int):
-        """递归遍历指定目录并批量替换敏感词"""
-        if not settings.SENSITIVE_REPLACE_ENABLED:
+    async def replace_sensitive_words_in_dir(self, cid: int, replace_enabled: Optional[bool] = None, replace_pinyin: Optional[bool] = None, replace_tmdb: Optional[bool] = None):
+        """递归遍历指定目录并批量替换敏感词/TMDB别名"""
+        should_replace = replace_enabled if replace_enabled is not None else settings.SENSITIVE_REPLACE_ENABLED
+        if not should_replace:
             return
 
         if not self.fs:
@@ -2389,8 +2507,11 @@ class P115Service:
             logger.error(f"❌ 解析敏感词映射表失败: {e}")
             mapping = {}
 
+        should_pinyin = replace_pinyin if replace_pinyin is not None else settings.SENSITIVE_REPLACE_PINYIN
+        should_tmdb = replace_tmdb if replace_tmdb is not None else settings.SENSITIVE_REPLACE_TMDB
+
         # 若启用了拼音首字母替换，过滤掉映射表中已有的等价映射以避免重复逻辑判断
-        if settings.SENSITIVE_REPLACE_PINYIN:
+        if should_pinyin:
             try:
                 import pypinyin
                 filtered_mapping = {}
@@ -2404,10 +2525,52 @@ class P115Service:
             except Exception as pe:
                 logger.error(f"❌ 过滤拼音冗余映射逻辑失败: {pe}")
 
-        if not mapping and not settings.SENSITIVE_REPLACE_PINYIN:
+        if not mapping and not should_pinyin and not should_tmdb:
             return
 
         logger.info(f"🔍 开始对目录 (CID: {cid}) 执行敏感词替换...")
+
+        # 等待转存文件写入目标目录并稳定 (处理异步转存的时滞)
+        try:
+            prev_total = -1
+            prev_size = ""
+            stable_count = 0
+            max_wait_attempts = 15
+            for attempt in range(1, max_wait_attempts + 1):
+                resp = await self._api_call_with_timeout(
+                    self.client.fs_category_get_app, cid,
+                    async_=True, timeout=10, max_retries=1, label="replace_words_poll",
+                    **self._get_ios_ua_kwargs()
+                )
+                if resp and not self._is_margin_response(resp):
+                    cur_file = int(resp.get("count", 0) or resp.get("file_count", 0))
+                    cur_folder = int(resp.get("folder_count", 0))
+                    cur_total = cur_file + cur_folder
+                    cur_size = str(resp.get("size", "0"))
+                    
+                    if cur_total > 0:
+                        if prev_total == -1:
+                            prev_total = cur_total
+                            prev_size = cur_size
+                        elif cur_total == prev_total and cur_size == prev_size:
+                            stable_count += 1
+                            if stable_count >= 1:
+                                break
+                        else:
+                            stable_count = 0
+                            prev_total = cur_total
+                            prev_size = cur_size
+                    else:
+                        stable_count = 0
+                        prev_total = 0
+                        prev_size = "0"
+                
+                if attempt < max_wait_attempts:
+                    await asyncio.sleep(1.5)
+                else:
+                    logger.warning(f"⚠️ 目标目录 (CID: {cid}) 在等待 22 秒后依然为空或未稳定，直接执行敏感词检测")
+        except Exception as e:
+            logger.warning(f"⚠️ 敏感词替换前等待目录稳定失败: {e}")
 
         import re
         pattern = None
@@ -2421,22 +2584,54 @@ class P115Service:
                 logger.error(f"❌ 编译敏感词正则失败: {e}")
                 return
 
-        def get_new_name(old_name: str) -> str:
-            # 1. 优先使用敏感词映射表进行匹配替换
-            if pattern:
-                def replace_func(match):
-                    matched_str = match.group(0)
-                    return mapping_lower.get(matched_str.lower(), matched_str)
-                name_after_mapping = pattern.sub(replace_func, old_name)
-            else:
-                name_after_mapping = old_name
+        from app.services.tmdb_service import tmdb_service
 
-            # 2. 若启用，再将其余的中文字符替换为拼音首字母 (同时保护 "第几集"、"第几季" 不被转换)
-            if settings.SENSITIVE_REPLACE_PINYIN:
+        def contains_chinese(text: str) -> bool:
+            return any('\u4e00' <= char <= '\u9fff' for char in text)
+
+        async def process_name(old_name: str, parent_replacements: list, media_hint: str) -> Tuple[str, list]:
+            new_replacements = list(parent_replacements) if parent_replacements else []
+            new_name = old_name
+            tmdb_success = False
+
+            # 1. 优先尝试 TMDB ID 别名匹配
+            if should_tmdb and contains_chinese(old_name):
+                tmdb_id = extract_tmdb_id_from_name(old_name)
+                if tmdb_id:
+                    preferred_media = media_hint if media_hint in ["tv", "movie"] else None
+                    alias = await tmdb_service.get_alias_by_id(tmdb_id, preferred_media=preferred_media)
+                    if alias:
+                        chinese_title = extract_replacement_title_fragment(old_name)
+                        if chinese_title:
+                            new_name = old_name.replace(chinese_title, alias, 1)
+                            if new_name != old_name:
+                                tmdb_success = True
+                                new_replacements.append((chinese_title, alias))
+                                logger.debug(
+                                    f"🎯 TMDB 替换命中: name=[{old_name}] tmdb_id={tmdb_id} media_hint={media_hint} alias=[{alias}]"
+                                )
+                    else:
+                        logger.debug(
+                            f"ℹ️ TMDB 未命中可用别名: name=[{old_name}] tmdb_id={tmdb_id} media_hint={media_hint}，将尝试后续策略"
+                        )
+
+            # 2. 如果 TMDB 失败或不适用，检查是否有父目录继承来的别名替换
+            if not tmdb_success and parent_replacements and contains_chinese(old_name):
+                for chinese_title, alias in parent_replacements:
+                    if chinese_title in old_name:
+                        new_name = old_name.replace(chinese_title, alias, 1)
+                        if new_name != old_name:
+                            tmdb_success = True
+                            break
+
+            if tmdb_success:
+                return new_name, new_replacements
+
+            # 3. 降级：拼音首字母替换
+            pinyin_success = False
+            if should_pinyin and contains_chinese(old_name):
                 try:
                     import pypinyin
-                    # 使用正则匹配 "第几集" 或 "第几季"，保护它们不被转成拼音首字母
-                    # 支持阿拉伯数字、中文数字（如：第14集、第204集、第十四集、第 14 集、第一季）
                     episode_pattern = re.compile(r"第\s*[0-9一二三四五六七八九十百千万]+\s*[集季]")
                     placeholders = []
                     
@@ -2445,31 +2640,51 @@ class P115Service:
                         placeholders.append((placeholder, match.group(0)))
                         return placeholder
                     
-                    protected_name = episode_pattern.sub(encode_episodes, name_after_mapping)
-                    
-                    # 转换拼音首字母
+                    protected_name = episode_pattern.sub(encode_episodes, old_name)
                     pinyin_name = ''.join(pypinyin.lazy_pinyin(protected_name, style=pypinyin.STYLE_FIRST_LETTER))
                     
-                    # 还原被保护的 "第几集" / "第几季"
                     for placeholder, original in placeholders:
                         pinyin_name = pinyin_name.replace(placeholder, original)
                         pinyin_name = pinyin_name.replace(placeholder.lower(), original)
                         
                     new_name = pinyin_name
-                except Exception:
-                    new_name = name_after_mapping
-            else:
-                new_name = name_after_mapping
+                    pinyin_success = True
+                except Exception as pe:
+                    logger.error(f"❌ 拼音首字母替换失败: {pe}")
+                    new_name = old_name
 
-            return new_name
+            if pinyin_success:
+                return new_name, new_replacements
+
+            # 4. 兜底：敏感词映射表
+            if pattern:
+                def replace_func(match):
+                    matched_str = match.group(0)
+                    return mapping_lower.get(matched_str.lower(), matched_str)
+                new_name = pattern.sub(replace_func, old_name)
+
+            return new_name, new_replacements
 
         renamed_count = 0
         try:
             to_rename = []
-            
-            # 使用自定义异步 DFS 遍历，避免 p115client.fs.walk 在 async_=True 下迭代 coroutine 对象的 bug
             visited = set()
-            async def walk_and_collect(current_cid: int):
+            dir_hint_cache: Dict[int, str] = {}
+
+            async def get_dir_hint(target_cid: int) -> str:
+                if target_cid in dir_hint_cache:
+                    return dir_hint_cache[target_cid]
+                try:
+                    sub_items = await self.fs.readdir(target_cid, async_=True, **self._get_ios_ua_kwargs())
+                    hint = infer_media_hint_from_items(sub_items)
+                except Exception:
+                    hint = "unknown"
+                dir_hint_cache[target_cid] = hint
+                return hint
+
+            async def walk_and_collect(current_cid: int, parent_replacements: list = None, inherited_hint: str = "unknown"):
+                if parent_replacements is None:
+                    parent_replacements = []
                 if current_cid in visited:
                     return
                 visited.add(current_cid)
@@ -2482,30 +2697,39 @@ class P115Service:
 
                 dirs = [item for item in items if item.get("is_dir")]
                 files = [item for item in items if not item.get("is_dir")]
+                dir_structure_hint = infer_media_hint_from_items(items)
+                current_hint = dir_structure_hint if dir_structure_hint != "unknown" else inherited_hint
 
-                # 优先递归子目录 (自底向上/后序遍历)
+                if dir_structure_hint != "unknown":
+                    logger.debug(f"🧭 目录媒体推断: CID={current_cid} hint={dir_structure_hint}")
+
+                # 优先递归子目录并收集重命名
                 for d in dirs:
                     sub_cid = d.get("id")
-                    if sub_cid is not None:
-                        await walk_and_collect(sub_cid)
+                    old_name = d.get("name")
+                    if sub_cid is not None and old_name:
+                        name_hint = infer_media_hint_from_name(old_name)
+                        child_structure_hint = await get_dir_hint(sub_cid)
+                        d_media_hint = (
+                            name_hint if name_hint != "unknown"
+                            else child_structure_hint if child_structure_hint != "unknown"
+                            else current_hint
+                        )
+                        d_new_name, d_replacements = await process_name(old_name, parent_replacements, d_media_hint)
+                        await walk_and_collect(sub_cid, d_replacements, d_media_hint)
+                        if d_new_name != old_name:
+                            to_rename.append((sub_cid, d_new_name, old_name))
 
-                # 收集文件
+                # 收集文件重命名
                 for f in files:
                     fid = f.get("id")
                     old_name = f.get("name")
                     if fid is not None and old_name:
-                        new_name = get_new_name(old_name)
-                        if new_name != old_name:
-                            to_rename.append((fid, new_name, old_name))
-
-                # 收集子目录本身
-                for d in dirs:
-                    did = d.get("id")
-                    old_name = d.get("name")
-                    if did is not None and old_name:
-                        new_name = get_new_name(old_name)
-                        if new_name != old_name:
-                            to_rename.append((did, new_name, old_name))
+                        file_hint = infer_media_hint_from_name(old_name)
+                        f_media_hint = file_hint if file_hint != "unknown" else current_hint
+                        f_new_name, _ = await process_name(old_name, parent_replacements, f_media_hint)
+                        if f_new_name != old_name:
+                            to_rename.append((fid, f_new_name, old_name))
 
             await walk_and_collect(cid)
 

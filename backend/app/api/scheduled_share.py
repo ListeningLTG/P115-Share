@@ -24,6 +24,9 @@ class ScheduledShareTaskCreate(BaseModel):
     min_size_unit: str = "GB"
     target_channels: List[str] = []
     enabled: bool = True
+    sensitive_replace_enabled: bool = False
+    sensitive_replace_pinyin: bool = False
+    sensitive_replace_tmdb: bool = False
 
     @field_validator('min_size', mode='before')
     @classmethod
@@ -44,6 +47,9 @@ class ScheduledShareTaskUpdate(BaseModel):
     min_size_unit: Optional[str] = None
     target_channels: Optional[List[str]] = None
     enabled: Optional[bool] = None
+    sensitive_replace_enabled: Optional[bool] = None
+    sensitive_replace_pinyin: Optional[bool] = None
+    sensitive_replace_tmdb: Optional[bool] = None
 
     @field_validator('min_size', mode='before')
     @classmethod
@@ -77,6 +83,9 @@ async def list_tasks(user=Depends(get_current_user)):
                     "status": t.status,
                     "last_run_at": t.last_run_at.isoformat() if t.last_run_at else None,
                     "created_at": t.created_at.isoformat() if t.created_at else None,
+                    "sensitive_replace_enabled": t.sensitive_replace_enabled,
+                    "sensitive_replace_pinyin": t.sensitive_replace_pinyin,
+                    "sensitive_replace_tmdb": t.sensitive_replace_tmdb,
                 }
                 for t in tasks
             ]
@@ -117,7 +126,10 @@ async def create_task(data: ScheduledShareTaskCreate, user=Depends(get_current_u
             min_size_unit=data.min_size_unit,
             target_channels=data.target_channels,
             enabled=data.enabled,
-            status="waiting" if data.enabled else "disabled"
+            status="waiting" if data.enabled else "disabled",
+            sensitive_replace_enabled=data.sensitive_replace_enabled,
+            sensitive_replace_pinyin=data.sensitive_replace_pinyin,
+            sensitive_replace_tmdb=data.sensitive_replace_tmdb
         )
         session.add(task)
         await session.commit()

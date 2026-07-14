@@ -45,6 +45,8 @@ class ConfigUpdate(BaseModel):
     sensitive_replace_enabled: Optional[bool] = None
     sensitive_replace_mapping: Optional[str] = None
     sensitive_replace_pinyin: Optional[bool] = None
+    sensitive_replace_tmdb: Optional[bool] = None
+    tmdb_api_key: Optional[str] = None
 
     @field_validator('p115_cleanup_dir_cron', 'p115_cleanup_trash_cron')
     @classmethod
@@ -169,6 +171,10 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
         await settings.save_setting("SENSITIVE_REPLACE_MAPPING", cfg.sensitive_replace_mapping)
     if "sensitive_replace_pinyin" in update_data:
         await settings.save_setting("SENSITIVE_REPLACE_PINYIN", cfg.sensitive_replace_pinyin)
+    if "sensitive_replace_tmdb" in update_data:
+        await settings.save_setting("SENSITIVE_REPLACE_TMDB", cfg.sensitive_replace_tmdb)
+    if "tmdb_api_key" in update_data:
+        await settings.save_setting("TMDB_API_KEY", cfg.tmdb_api_key)
     
     if capacity_changed:
         from app.services.scheduler import cleanup_scheduler
@@ -218,6 +224,8 @@ async def get_config(user=Depends(get_current_user)):
         "sensitive_replace_enabled": settings.SENSITIVE_REPLACE_ENABLED,
         "sensitive_replace_mapping": settings.SENSITIVE_REPLACE_MAPPING,
         "sensitive_replace_pinyin": settings.SENSITIVE_REPLACE_PINYIN,
+        "sensitive_replace_tmdb": settings.SENSITIVE_REPLACE_TMDB,
+        "tmdb_api_key": settings.TMDB_API_KEY,
         "version": VERSION
     }
 

@@ -177,6 +177,24 @@
         <a-form-item label="启用任务" name="enabled">
           <a-switch v-model:checked="formState.enabled" />
         </a-form-item>
+
+        <a-form-item label="启用敏感词替换" name="sensitive_replace_enabled">
+          <a-switch v-model:checked="formState.sensitive_replace_enabled" />
+        </a-form-item>
+
+        <a-form-item label="启用中文名称替换为拼音首字母" name="sensitive_replace_pinyin" v-if="formState.sensitive_replace_enabled">
+          <a-switch v-model:checked="formState.sensitive_replace_pinyin" />
+          <div style="font-size: 11px; color: #888; margin-top: 4px">
+            开启后，生成分享前对文件和目录的所有中文名称替换为拼音首字母。
+          </div>
+        </a-form-item>
+
+        <a-form-item label="启用 TMDB 别名替换" name="sensitive_replace_tmdb" v-if="formState.sensitive_replace_enabled && isTmdbConfigured">
+          <a-switch v-model:checked="formState.sensitive_replace_tmdb" />
+          <div style="font-size: 11px; color: #888; margin-top: 4px">
+            开启后，若中文名称的文件或目录具有 TMDB ID 标识，优先使用 TMDB 英文/原版别名替换其中文名称。
+          </div>
+        </a-form-item>
       </a-form>
       
       <div v-if="formState.share_mode === 'move' || formState.share_mode === 'copy'" style="margin-top: 12px">
@@ -208,6 +226,9 @@ interface Task {
   status: string;
   last_run_at: string | null;
   created_at: string;
+  sensitive_replace_enabled: boolean;
+  sensitive_replace_pinyin: boolean;
+  sensitive_replace_tmdb: boolean;
 }
 
 interface Account {
@@ -256,7 +277,12 @@ const formState = reactive({
   min_size_unit: 'GB',
   target_channels: [] as string[],
   enabled: true,
+  sensitive_replace_enabled: false,
+  sensitive_replace_pinyin: false,
+  sensitive_replace_tmdb: false,
 });
+
+const isTmdbConfigured = ref(false);
 
 const formRules = {
   name: [{ required: true, message: '请输入任务名称', trigger: 'blur' }],
@@ -337,6 +363,7 @@ const loadAccounts = async () => {
 const loadChannels = async () => {
   try {
     const res = await axios.get('/api/config/');
+    isTmdbConfigured.value = !!res.data.tmdb_api_key;
     if (res.data.tg_channels) {
       try {
         availableChannels.value = JSON.parse(res.data.tg_channels) || [];
@@ -362,6 +389,9 @@ const openCreateModal = () => {
   formState.min_size_unit = 'GB';
   formState.target_channels = [];
   formState.enabled = true;
+  formState.sensitive_replace_enabled = false;
+  formState.sensitive_replace_pinyin = false;
+  formState.sensitive_replace_tmdb = false;
   modalVisible.value = true;
 };
 
@@ -377,6 +407,9 @@ const openEditModal = (record: Task) => {
   formState.min_size_unit = record.min_size_unit ?? 'GB';
   formState.target_channels = [...(record.target_channels || [])];
   formState.enabled = record.enabled;
+  formState.sensitive_replace_enabled = record.sensitive_replace_enabled ?? false;
+  formState.sensitive_replace_pinyin = record.sensitive_replace_pinyin ?? false;
+  formState.sensitive_replace_tmdb = record.sensitive_replace_tmdb ?? false;
   modalVisible.value = true;
 };
 

@@ -25,6 +25,9 @@ class StartTaskRequest(BaseModel):
     target_account_id: Optional[int] = None
     target_dir: Optional[str] = None
     share_interval: Optional[int] = 0
+    sensitive_replace_enabled: Optional[bool] = False
+    sensitive_replace_pinyin: Optional[bool] = False
+    sensitive_replace_tmdb: Optional[bool] = False
 
 @router.post("/parse")
 async def parse_excel(
@@ -168,7 +171,10 @@ async def start_task(task_id: int, req: StartTaskRequest, current_user: dict = D
         req.strategy,
         req.target_account_id,
         req.target_dir,
-        req.share_interval
+        req.share_interval,
+        sensitive_replace_enabled=req.sensitive_replace_enabled,
+        sensitive_replace_pinyin=req.sensitive_replace_pinyin,
+        sensitive_replace_tmdb=req.sensitive_replace_tmdb
     )
     return {"status": "success"}
 

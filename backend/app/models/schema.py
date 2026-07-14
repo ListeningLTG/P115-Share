@@ -63,6 +63,9 @@ class ExcelTask(Base):
     share_interval: Mapped[int] = mapped_column(Integer, default=0)
     sub_batch_start_row: Mapped[int] = mapped_column(Integer, default=0)
     sub_batch_count: Mapped[int] = mapped_column(Integer, default=0)
+    sensitive_replace_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    sensitive_replace_pinyin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    sensitive_replace_tmdb: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 class P115Account(Base):
@@ -214,6 +217,9 @@ class ScheduledShareTask(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)                      # 任务是否启用
     status: Mapped[str] = mapped_column(String(50), default="waiting")               # 当前运行状态 (waiting, running, success, failed)
     last_run_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)           # 最近一次执行时间
+    sensitive_replace_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    sensitive_replace_pinyin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    sensitive_replace_tmdb: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

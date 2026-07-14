@@ -262,8 +262,13 @@ async def _run_scheduled_share_task(task_id: int):
                 # 因此，这里不再需要对原目录进行多余 of deletions.
                 
                 # 8.5 敏感词替换（若启用）
-                if settings.SENSITIVE_REPLACE_ENABLED:
-                    await svc.replace_sensitive_words_in_dir(new_cid)
+                if task_db.sensitive_replace_enabled:
+                    await svc.replace_sensitive_words_in_dir(
+                        new_cid,
+                        replace_enabled=task_db.sensitive_replace_enabled,
+                        replace_pinyin=task_db.sensitive_replace_pinyin,
+                        replace_tmdb=task_db.sensitive_replace_tmdb
+                    )
                     
                 # 9. 对复制出来的新文件夹生成永久分享链接
                 logger.info(f"🔗 正在为 {new_folder_name} (CID: {new_cid}) 创建分享链接...")

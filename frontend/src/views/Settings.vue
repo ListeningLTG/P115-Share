@@ -176,6 +176,18 @@
           <a-divider />
           <a-button type="primary" @click="onFinish('save')" :loading="loading" block>保存保存与行为配置</a-button>
         </a-collapse-panel>
+
+        <a-collapse-panel key="tmdb" header="TMDB 配置">
+          <a-form-item label="TMDB API Key" name="tmdb_api_key">
+            <template #extra>
+              <div style="font-size: 12px; color: #999; margin-top: 4px">用于解析影视剧名的 TMDB ID 并自动进行英文/原版别名替换。</div>
+            </template>
+            <a-input-password v-model:value="formState.tmdb_api_key" placeholder="请输入 TMDB API Key" />
+          </a-form-item>
+
+          <a-divider />
+          <a-button type="primary" @click="onFinish('tmdb')" :loading="loading" block>保存 TMDB 配置</a-button>
+        </a-collapse-panel>
       </a-collapse>
     </a-form>
   </div>
@@ -226,6 +238,7 @@ const formState = reactive({
   direct_save_account_id: 0,
   direct_save_dir: '115-Save',
   tg_default_command_mode: 'share',
+  tmdb_api_key: '',
 });
 
 const loadAccounts = async () => {
@@ -264,7 +277,8 @@ const rules = computed(() => ({
   tg_user_id: [{ required: true, message: '请输入 User ID', trigger: 'blur' }],
   tg_allow_chats: [{ required: true, message: '请输入 Chat ID 白名单', trigger: 'blur' }],
   proxy_host: [{ validator: validateProxyHost, trigger: 'change' }],
-  proxy_port: [{ validator: validateProxyPort, trigger: 'change' }]
+  proxy_port: [{ validator: validateProxyPort, trigger: 'change' }],
+  tmdb_api_key: []
 }));
 
 const loadConfig = async () => {
@@ -306,17 +320,19 @@ const loadConfig = async () => {
     formState.direct_save_account_id = res.data.direct_save_account_id !== undefined ? res.data.direct_save_account_id : 0;
     formState.direct_save_dir = res.data.direct_save_dir || '115-Save';
     formState.tg_default_command_mode = res.data.tg_default_command_mode || 'share';
+    formState.tmdb_api_key = res.data.tmdb_api_key || '';
   } catch (e) {
     console.error(e);
   }
 };
 
-const onFinish = async (section: 'tg' | 'proxy' | 'save' = 'tg') => {
+const onFinish = async (section: 'tg' | 'proxy' | 'save' | 'tmdb' = 'tg') => {
   try {
     const sectionFields: Record<string, string[]> = {
       tg: ['tg_bot_token', 'tg_user_id', 'tg_allow_chats', 'tg_skip_large_package'],
       proxy: ['proxy_enabled', 'proxy_host', 'proxy_port', 'proxy_user', 'proxy_pass', 'proxy_type'],
-      save: ['direct_save_account_id', 'direct_save_dir', 'tg_default_command_mode']
+      save: ['direct_save_account_id', 'direct_save_dir', 'tg_default_command_mode'],
+      tmdb: ['tmdb_api_key']
     };
 
     await formRef.value.validate(sectionFields[section]!);
@@ -347,7 +363,8 @@ const onFinish = async (section: 'tg' | 'proxy' | 'save' = 'tg') => {
     const res = await axios.post('/api/config/update', payload);
     message.success(
       section === 'tg' ? 'Telegram 配置已保存' :
-      section === 'proxy' ? '代理配置已保存' : '保存与行为配置已保存'
+      section === 'proxy' ? '代理配置已保存' :
+      section === 'tmdb' ? 'TMDB 配置已保存' : '保存与行为配置已保存'
     );
     if (res.data.bot_restarted) {
       message.info('机器人已根据新配置安全重启');
