@@ -66,12 +66,126 @@
           </a-card>
         </div>
       </a-tab-pane>
+
+      <a-tab-pane key="tmdb_cache" tab="TMDB别名库">
+        <div style="padding-top: 16px">
+          <a-alert
+            message="功能说明"
+            description="用于缓存和维护 TMDB 别名结果。命中缓存后会跳过实时 TMDB 请求以减少耗时和网络依赖。"
+            type="info"
+            show-icon
+            style="margin-bottom: 16px"
+          />
+
+          <a-card>
+            <a-space style="margin-bottom: 16px; width: 100%; justify-content: space-between">
+              <a-space>
+                <a-input-search
+                  v-model:value="cacheSearch"
+                  placeholder="搜索 tmdb_id/中文名/原名/别名"
+                  style="width: 320px"
+                  @search="fetchTmdbCache(1)"
+                />
+                <a-select v-model:value="cacheStatus" style="width: 140px" @change="fetchTmdbCache(1)">
+                  <a-select-option value="">全部状态</a-select-option>
+                  <a-select-option value="success">success</a-select-option>
+                  <a-select-option value="failed">failed</a-select-option>
+                </a-select>
+              </a-space>
+              <a-space>
+                <a-button @click="fetchTmdbCache(cachePage)">刷新</a-button>
+                <a-popconfirm title="确认删除选中的缓存记录？" ok-text="删除" cancel-text="取消" @confirm="batchDeleteCacheRecords">
+                  <a-button danger :disabled="selectedCacheRowKeys.length === 0">批量删除</a-button>
+                </a-popconfirm>
+                <a-button type="primary" @click="openCreateModal">新增记录</a-button>
+              </a-space>
+            </a-space>
+
+            <a-table
+              :columns="cacheColumns"
+              :data-source="cacheItems"
+              :loading="cacheLoading"
+              :pagination="false"
+              :row-selection="cacheRowSelection"
+              row-key="id"
+              size="small"
+            >
+              <template #bodyCell="{ column, record }">
+                <template v-if="column.key === 'status'">
+                  <a-tag :color="record.status === 'success' ? 'green' : 'orange'">{{ record.status || '-' }}</a-tag>
+                </template>
+                <template v-else-if="column.key === 'actions'">
+                  <a-button type="link" size="small" @click="openEditModal(record)">编辑</a-button>
+                  <a-popconfirm title="确认删除该缓存记录？" ok-text="删除" cancel-text="取消" @confirm="deleteCacheRecord(record)">
+                    <a-button type="link" size="small" danger>删除</a-button>
+                  </a-popconfirm>
+                </template>
+              </template>
+            </a-table>
+
+            <div style="margin-top: 16px; text-align: right">
+              <a-pagination
+                :current="cachePage"
+                :page-size="cachePageSize"
+                :total="cacheTotal"
+                :show-size-changer="true"
+                :page-size-options="['10', '20', '50', '100']"
+                @change="onCachePageChange"
+                @showSizeChange="onCachePageSizeChange"
+              />
+            </div>
+          </a-card>
+        </div>
+      </a-tab-pane>
     </a-tabs>
+
+    <a-modal
+      v-model:open="cacheModalVisible"
+      :title="cacheEditId ? '编辑 TMDB 缓存' : '新增 TMDB 缓存'"
+      :confirm-loading="cacheSaving"
+      @ok="saveCacheRecord"
+      ok-text="保存"
+      cancel-text="取消"
+    >
+      <a-form layout="vertical">
+        <a-form-item label="TMDB ID">
+          <a-input-number v-model:value="cacheForm.tmdb_id" :min="1" style="width: 100%" :disabled="!!cacheEditId" />
+        </a-form-item>
+        <a-form-item label="媒体类型">
+          <a-select v-model:value="cacheForm.media_type">
+            <a-select-option value="unknown">unknown</a-select-option>
+            <a-select-option value="movie">movie</a-select-option>
+            <a-select-option value="tv">tv</a-select-option>
+          </a-select>
+        </a-form-item>
+        <a-form-item label="中文名">
+          <a-input v-model:value="cacheForm.chinese_title" />
+        </a-form-item>
+        <a-form-item label="原名">
+          <a-input v-model:value="cacheForm.original_title" />
+        </a-form-item>
+        <a-form-item label="别名">
+          <a-input v-model:value="cacheForm.alias" />
+        </a-form-item>
+        <a-form-item label="来源">
+          <a-input v-model:value="cacheForm.source" />
+        </a-form-item>
+        <a-form-item label="状态">
+          <a-select v-model:value="cacheForm.status">
+            <a-select-option value="success">success</a-select-option>
+            <a-select-option value="failed">failed</a-select-option>
+          </a-select>
+        </a-form-item>
+        <a-form-item label="备注">
+          <a-textarea v-model:value="cacheForm.note" :rows="3" />
+        </a-form-item>
+      </a-form>
+    </a-modal>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { reactive, ref, onMounted } from 'vue';
 import axios from 'axios';
 import { message } from 'ant-design-vue';
 
@@ -85,6 +199,61 @@ const replacePinyin = ref(false);
 const replaceTmdb = ref(false);
 const savingReplace = ref(false);
 const isTmdbConfigured = ref(false);
+
+interface CacheItem {
+  id: number;
+  tmdb_id: number;
+  media_type: string;
+  chinese_title: string;
+  original_title: string;
+  alias: string;
+  source: string;
+  status: string;
+  note: string;
+  updated_at: string;
+}
+
+const cacheLoading = ref(false);
+const cacheSaving = ref(false);
+const cacheItems = ref<CacheItem[]>([]);
+const cacheTotal = ref(0);
+const cachePage = ref(1);
+const cachePageSize = ref(20);
+const cacheSearch = ref('');
+const cacheStatus = ref('');
+const cacheModalVisible = ref(false);
+const cacheEditId = ref<number | null>(null);
+const selectedCacheRowKeys = ref<number[]>([]);
+
+const cacheForm = reactive({
+  tmdb_id: undefined as number | undefined,
+  media_type: 'unknown',
+  chinese_title: '',
+  original_title: '',
+  alias: '',
+  source: 'manual',
+  status: 'success',
+  note: ''
+});
+
+const cacheColumns = [
+  { title: 'TMDB ID', dataIndex: 'tmdb_id', key: 'tmdb_id', width: 110 },
+  { title: '类型', dataIndex: 'media_type', key: 'media_type', width: 90 },
+  { title: '中文名', dataIndex: 'chinese_title', key: 'chinese_title', ellipsis: true },
+  { title: '原名', dataIndex: 'original_title', key: 'original_title', ellipsis: true },
+  { title: '别名', dataIndex: 'alias', key: 'alias', ellipsis: true },
+  { title: '来源', dataIndex: 'source', key: 'source', width: 120 },
+  { title: '状态', dataIndex: 'status', key: 'status', width: 100 },
+  { title: '更新时间', dataIndex: 'updated_at', key: 'updated_at', width: 180 },
+  { title: '操作', key: 'actions', width: 130 }
+];
+
+const cacheRowSelection = {
+  selectedRowKeys: selectedCacheRowKeys,
+  onChange: (keys: (string | number)[]) => {
+    selectedCacheRowKeys.value = keys.map((k) => Number(k));
+  }
+};
 
 // Load sensitive replace config
 const loadReplaceConfig = async () => {
@@ -148,8 +317,146 @@ const saveReplaceConfig = async () => {
   }
 };
 
+const fetchTmdbCache = async (page = cachePage.value) => {
+  try {
+    cacheLoading.value = true;
+    const res = await axios.get('/api/sensitive/tmdb-alias-cache', {
+      params: {
+        page,
+        page_size: cachePageSize.value,
+        search: cacheSearch.value,
+        status: cacheStatus.value
+      }
+    });
+    if (res.data?.state) {
+      cacheItems.value = res.data.items || [];
+      cacheTotal.value = res.data.total || 0;
+      cachePage.value = res.data.page || page;
+      const ids = new Set(cacheItems.value.map((item) => item.id));
+      selectedCacheRowKeys.value = selectedCacheRowKeys.value.filter((id) => ids.has(id));
+    }
+  } catch (e) {
+    console.error('加载 TMDB 缓存失败:', e);
+    message.error('加载 TMDB 缓存失败');
+  } finally {
+    cacheLoading.value = false;
+  }
+};
+
+const resetCacheForm = () => {
+  cacheForm.tmdb_id = undefined;
+  cacheForm.media_type = 'unknown';
+  cacheForm.chinese_title = '';
+  cacheForm.original_title = '';
+  cacheForm.alias = '';
+  cacheForm.source = 'manual';
+  cacheForm.status = 'success';
+  cacheForm.note = '';
+};
+
+const openCreateModal = () => {
+  cacheEditId.value = null;
+  resetCacheForm();
+  cacheModalVisible.value = true;
+};
+
+const openEditModal = (record: CacheItem) => {
+  cacheEditId.value = record.id;
+  cacheForm.tmdb_id = record.tmdb_id;
+  cacheForm.media_type = record.media_type || 'unknown';
+  cacheForm.chinese_title = record.chinese_title || '';
+  cacheForm.original_title = record.original_title || '';
+  cacheForm.alias = record.alias || '';
+  cacheForm.source = record.source || 'manual';
+  cacheForm.status = record.status || 'success';
+  cacheForm.note = record.note || '';
+  cacheModalVisible.value = true;
+};
+
+const saveCacheRecord = async () => {
+  if (!cacheForm.tmdb_id) {
+    message.warning('请填写 TMDB ID');
+    return;
+  }
+
+  const payload = {
+    tmdb_id: cacheForm.tmdb_id,
+    media_type: cacheForm.media_type,
+    chinese_title: cacheForm.chinese_title,
+    original_title: cacheForm.original_title,
+    alias: cacheForm.alias,
+    source: cacheForm.source,
+    status: cacheForm.status,
+    note: cacheForm.note
+  };
+
+  try {
+    cacheSaving.value = true;
+    if (cacheEditId.value) {
+      await axios.put(`/api/sensitive/tmdb-alias-cache/${cacheEditId.value}`, payload);
+    } else {
+      await axios.post('/api/sensitive/tmdb-alias-cache', payload);
+    }
+    message.success('保存成功');
+    cacheModalVisible.value = false;
+    await fetchTmdbCache(cachePage.value);
+  } catch (e: any) {
+    message.error(e.response?.data?.detail || '保存失败');
+  } finally {
+    cacheSaving.value = false;
+  }
+};
+
+const deleteCacheRecord = async (record: CacheItem) => {
+  try {
+    await axios.delete(`/api/sensitive/tmdb-alias-cache/${record.id}`);
+    message.success('删除成功');
+    selectedCacheRowKeys.value = selectedCacheRowKeys.value.filter((id) => id !== record.id);
+    const currentPageCount = cacheItems.value.length;
+    const targetPage = currentPageCount === 1 && cachePage.value > 1 ? cachePage.value - 1 : cachePage.value;
+    await fetchTmdbCache(targetPage);
+  } catch (e: any) {
+    message.error(e.response?.data?.detail || '删除失败');
+  }
+};
+
+const batchDeleteCacheRecords = async () => {
+  if (selectedCacheRowKeys.value.length === 0) {
+    message.warning('请先勾选要删除的记录');
+    return;
+  }
+
+  try {
+    const res = await axios.post('/api/sensitive/tmdb-alias-cache/batch-delete', {
+      ids: selectedCacheRowKeys.value
+    });
+    if (res.data?.state) {
+      message.success(`批量删除成功（${res.data.deleted || 0} 条）`);
+      selectedCacheRowKeys.value = [];
+      const shouldPrevPage = cacheItems.value.length === (res.data.deleted || 0) && cachePage.value > 1;
+      await fetchTmdbCache(shouldPrevPage ? cachePage.value - 1 : cachePage.value);
+    } else {
+      message.error(res.data?.message || '批量删除失败');
+    }
+  } catch (e: any) {
+    message.error(e.response?.data?.detail || '批量删除失败');
+  }
+};
+
+const onCachePageChange = async (page: number) => {
+  cachePage.value = page;
+  await fetchTmdbCache(page);
+};
+
+const onCachePageSizeChange = async (_current: number, size: number) => {
+  cachePageSize.value = size;
+  cachePage.value = 1;
+  await fetchTmdbCache(1);
+};
+
 onMounted(async () => {
   await loadReplaceConfig();
+  await fetchTmdbCache();
 });
 </script>
 

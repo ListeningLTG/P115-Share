@@ -179,6 +179,23 @@ class SensitiveMovie(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class TMDBAliasCache(Base):
+    """TMDB 别名缓存表（用于替换加速与人工校正）"""
+    __tablename__ = "tmdb_alias_cache"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tmdb_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    media_type: Mapped[str] = mapped_column(String(20), default="unknown")  # movie/tv/unknown
+    chinese_title: Mapped[str] = mapped_column(String(255), nullable=True)
+    original_title: Mapped[str] = mapped_column(String(255), nullable=True)
+    alias: Mapped[str] = mapped_column(String(255), nullable=True)
+    source: Mapped[str] = mapped_column(String(50), default="")  # cache/manual/original_english/english_alias
+    status: Mapped[str] = mapped_column(String(20), default="success")  # success/failed
+    note: Mapped[str] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class SharePushTask(Base):
     """分享链接推送任务表"""
     __tablename__ = "share_push_tasks"

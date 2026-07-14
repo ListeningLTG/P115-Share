@@ -2598,10 +2598,14 @@ class P115Service:
             if should_tmdb and contains_chinese(old_name):
                 tmdb_id = extract_tmdb_id_from_name(old_name)
                 if tmdb_id:
+                    chinese_title = extract_replacement_title_fragment(old_name)
                     preferred_media = media_hint if media_hint in ["tv", "movie"] else None
-                    alias = await tmdb_service.get_alias_by_id(tmdb_id, preferred_media=preferred_media)
+                    alias = await tmdb_service.get_alias_by_id(
+                        tmdb_id,
+                        preferred_media=preferred_media,
+                        chinese_title_hint=chinese_title,
+                    )
                     if alias:
-                        chinese_title = extract_replacement_title_fragment(old_name)
                         if chinese_title:
                             new_name = old_name.replace(chinese_title, alias, 1)
                             if new_name != old_name:

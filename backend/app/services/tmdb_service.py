@@ -1,11 +1,13 @@
 import asyncio
+from datetime import datetime
 import re
 from typing import Optional, List, Dict, Any
 from loguru import logger
 import aiohttp
 from sqlalchemy import select, delete, func
-from app.core.database import get_db
-from app.models.schema import TMDBConfig, SensitiveMovie
+from sqlalchemy.exc import OperationalError
+from app.core.database import get_db, async_session
+from app.models.schema import TMDBAliasCache, TMDBConfig, SensitiveMovie
 
 
 class TMDBService:
@@ -888,13 +890,22 @@ class TMDBService:
         # 未知类型时优先按剧集尝试，降低剧集误识别为电影的概率
         return ["tv", "movie"]
 
-    async def _fetch_english_alias(self, tmdb_id: int, media_type: str, params: Dict[str, Any]) -> Optional[str]:
+    async def _fetch_alias_titles(self, tmdb_id: int, media_type: str, params: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
         alt_url = f"{self.BASE_URL}/{media_type}/{tmdb_id}/alternative_titles"
         alt_data, alt_status = await self._request_with_retry(alt_url, params, max_retries=2)
         if not alt_data or alt_status != 200:
-            return None
+            return None, None
 
         titles = alt_data.get("titles", []) if media_type == "movie" else alt_data.get("results", [])
+
+        chinese_alias = None
+        for t in titles:
+            title = (t.get("title") or "").strip()
+            if not title:
+                continue
+            if t.get("iso_3166_1") in ["CN", "HK", "TW"] and self._contains_chinese(title):
+                chinese_alias = title
+                break
 
         # 第一优先级：US/GB 且包含英文字符
         for t in titles:
@@ -902,7 +913,7 @@ class TMDBService:
             if not title:
                 continue
             if t.get("iso_3166_1") in ["US", "GB"] and self._contains_english(title) and not self._contains_chinese(title):
-                return title
+                return title, chinese_alias
 
         # 第二优先级：任意非中文且包含英文字符
         for t in titles:
@@ -910,15 +921,107 @@ class TMDBService:
             if not title:
                 continue
             if self._contains_english(title) and not self._contains_chinese(title):
-                return title
+                return title, chinese_alias
 
-        return None
+        return None, chinese_alias
 
-    async def get_alias_by_id(self, tmdb_id: int, preferred_media: Optional[str] = None) -> Optional[str]:
+    async def _get_alias_cache(self, tmdb_id: int) -> Optional[TMDBAliasCache]:
+        try:
+            async with async_session() as session:
+                row = (
+                    (
+                        await session.execute(
+                            select(TMDBAliasCache).where(TMDBAliasCache.tmdb_id == tmdb_id)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                return row
+        except OperationalError as e:
+            logger.warning(f"⚠️ TMDB 别名缓存表不可用，跳过缓存读取: {e}")
+            return None
+
+    async def _save_alias_cache(
+        self,
+        tmdb_id: int,
+        media_type: str,
+        chinese_title: Optional[str],
+        original_title: Optional[str],
+        alias: Optional[str],
+        source: str,
+        status: str,
+        note: Optional[str] = None,
+    ) -> None:
+        try:
+            async with async_session() as session:
+                row = (
+                    (
+                        await session.execute(
+                            select(TMDBAliasCache).where(TMDBAliasCache.tmdb_id == tmdb_id)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if not row:
+                    row = TMDBAliasCache(tmdb_id=tmdb_id)
+                    session.add(row)
+
+                row.media_type = media_type or row.media_type or "unknown"
+                if chinese_title:
+                    row.chinese_title = chinese_title
+                if original_title:
+                    row.original_title = original_title
+                if alias is not None:
+                    row.alias = alias
+                row.source = source
+                row.status = status
+                row.note = note
+                row.updated_at = datetime.utcnow()
+
+                await session.commit()
+        except OperationalError as e:
+            logger.warning(f"⚠️ TMDB 别名缓存表不可用，跳过缓存写入: {e}")
+
+    async def get_alias_by_id(
+        self,
+        tmdb_id: int,
+        preferred_media: Optional[str] = None,
+        chinese_title_hint: Optional[str] = None,
+    ) -> Optional[str]:
         """根据 TMDB ID 获取替换名（支持媒体类型提示与 tv/movie 回退）。"""
+        cache_row = await self._get_alias_cache(tmdb_id)
+        if cache_row and cache_row.alias:
+            if (not cache_row.chinese_title) and chinese_title_hint and self._contains_chinese(chinese_title_hint):
+                await self._save_alias_cache(
+                    tmdb_id=tmdb_id,
+                    media_type=cache_row.media_type,
+                    chinese_title=chinese_title_hint,
+                    original_title=cache_row.original_title,
+                    alias=cache_row.alias,
+                    source=cache_row.source or "cache",
+                    status=cache_row.status or "success",
+                    note=cache_row.note,
+                )
+            logger.debug(
+                f"🗂️ 命中 TMDB 别名缓存: tmdb_id={tmdb_id} alias=[{cache_row.alias}] media={cache_row.media_type}"
+            )
+            return cache_row.alias
+
         api_key = await self._ensure_api_key()
         if not api_key:
             logger.warning("⚠️ TMDB API Key 未配置，跳过别名替换")
+            await self._save_alias_cache(
+                tmdb_id=tmdb_id,
+                media_type=preferred_media or "unknown",
+                chinese_title=cache_row.chinese_title if cache_row else None,
+                original_title=cache_row.original_title if cache_row else None,
+                alias=None,
+                source="runtime",
+                status="failed",
+                note="tmdb_api_key_not_configured",
+            )
             return None
 
         params = {"api_key": api_key}
@@ -940,10 +1043,30 @@ class TMDBService:
             logger.warning(
                 f"⚠️ 无法获取 TMDB ID {tmdb_id} 的详情 (preferred={preferred_media}, last_http={status})"
             )
+            await self._save_alias_cache(
+                tmdb_id=tmdb_id,
+                media_type=preferred_media or "unknown",
+                chinese_title=cache_row.chinese_title if cache_row else None,
+                original_title=cache_row.original_title if cache_row else None,
+                alias=None,
+                source="runtime",
+                status="failed",
+                note=f"detail_request_failed_http_{status}",
+            )
             return None
 
-        original_title = (detail.get("original_title") if detail_media == "movie" else detail.get("original_name") or "").strip()
-        english_alias = await self._fetch_english_alias(tmdb_id, detail_media, params)
+        original_title = ((detail.get("original_title") if detail_media == "movie" else detail.get("original_name")) or "").strip()
+        chinese_title = ""
+        display_title = ((detail.get("title") if detail_media == "movie" else detail.get("name")) or "").strip()
+        if self._contains_chinese(original_title):
+            chinese_title = original_title
+        elif self._contains_chinese(display_title):
+            chinese_title = display_title
+        english_alias, chinese_alt_alias = await self._fetch_alias_titles(tmdb_id, detail_media, params)
+        if (not chinese_title) and chinese_alt_alias:
+            chinese_title = chinese_alt_alias
+        if (not chinese_title) and chinese_title_hint and self._contains_chinese(chinese_title_hint):
+            chinese_title = chinese_title_hint
 
         # 名称策略：
         # 1) 原名本身英文 -> 直接使用原名
@@ -971,11 +1094,42 @@ class TMDBService:
             logger.warning(
                 f"⚠️ TMDB ID {tmdb_id} ({detail_media}) 原名 [{original_title}] 未能提取到可用英文名，交由上层兜底"
             )
+            await self._save_alias_cache(
+                tmdb_id=tmdb_id,
+                media_type=detail_media,
+                chinese_title=chinese_title or None,
+                original_title=original_title or None,
+                alias=None,
+                source="runtime",
+                status="failed",
+                note="no_usable_alias",
+            )
             return None
 
         if self._contains_chinese(alias):
             logger.warning(f"⚠️ TMDB ID {tmdb_id} 获取的别名 [{alias}] 含有中文字符，判定为替换失败")
+            await self._save_alias_cache(
+                tmdb_id=tmdb_id,
+                media_type=detail_media,
+                chinese_title=chinese_title or None,
+                original_title=original_title or None,
+                alias=None,
+                source="runtime",
+                status="failed",
+                note="alias_contains_chinese",
+            )
             return None
+
+        await self._save_alias_cache(
+            tmdb_id=tmdb_id,
+            media_type=detail_media,
+            chinese_title=chinese_title or None,
+            original_title=original_title or None,
+            alias=alias,
+            source=source,
+            status="success",
+            note=None,
+        )
 
         logger.info(
             f"🎉 成功获取 TMDB ID {tmdb_id} 的替换名: [{alias}] (media={detail_media}, source={source}, preferred={preferred_media})"
