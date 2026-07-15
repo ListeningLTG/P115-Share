@@ -1,9 +1,12 @@
 import os
 import json
+import asyncio
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import Optional, Any
 from loguru import logger
-from sqlalchemy import select, update
+from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from app.core.database import engine, async_session, Base
 from app.models.schema import User as UserModel, SystemSettings
 
@@ -195,23 +198,45 @@ class Settings(BaseSettings):
             self.P115_BATCH_YIELD_DURATION = 0
 
     async def save_setting(self, key: str, value: str):
-        """Save a single setting to database (Create or Update)"""
-        if not hasattr(self, key):
+        """Save a single setting to database (Create or Update)."""
+        return await self.save_settings_batch({key: value})
+
+    @staticmethod
+    def _is_sqlite_locked_error(exc: Exception) -> bool:
+        return "database is locked" in str(exc).lower()
+
+    async def save_settings_batch(self, updates: dict[str, Any], max_retries: int = 5) -> bool:
+        """Save multiple settings in a single transaction to reduce lock contention."""
+        valid_updates = {k: v for k, v in updates.items() if hasattr(self, k)}
+        if not valid_updates:
             return False
-            
-        async with async_session() as session:
-            # Check if key exists
-            result = await session.execute(select(SystemSettings).where(SystemSettings.key == key))
-            existing = result.scalar_one_or_none()
-            
-            if existing:
-                existing.value = str(value)
-            else:
-                session.add(SystemSettings(key=key, value=str(value)))
-                
-            await session.commit()
-            setattr(self, key, value)
-            return True
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with async_session() as session:
+                    for key, value in valid_updates.items():
+                        stmt = sqlite_insert(SystemSettings).values(key=key, value=str(value))
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=[SystemSettings.key],
+                            set_={"value": str(value)},
+                        )
+                        await session.execute(stmt)
+
+                    await session.commit()
+
+                for key, value in valid_updates.items():
+                    setattr(self, key, value)
+                return True
+            except OperationalError as exc:
+                if not self._is_sqlite_locked_error(exc) or attempt == max_retries:
+                    raise
+                delay = 0.1 * (2 ** (attempt - 1))
+                logger.warning(
+                    f"SQLite busy while saving settings (attempt {attempt}/{max_retries}), retrying in {delay:.2f}s"
+                )
+                await asyncio.sleep(delay)
+
+        return False
 
     class Config:
         env_file = ".env"

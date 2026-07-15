@@ -71,33 +71,39 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
     logger.info(f"⚙️ 收到配置更新请求，包含字段: {list(update_data.keys())}")
     need_restart_bot = False
     proxy_changed = False
+    capacity_changed = False
+    cleanup_dir_cron_changed = False
+    cleanup_trash_cron_changed = False
+
+    pending_updates = {}
+
+    def stage_setting(key: str, value):
+        pending_updates[key] = value
     
     # 1. Update TG settings
     if "tg_bot_token" in update_data and settings.TG_BOT_TOKEN != cfg.tg_bot_token:
-        await settings.save_setting("TG_BOT_TOKEN", cfg.tg_bot_token)
+        stage_setting("TG_BOT_TOKEN", cfg.tg_bot_token)
         need_restart_bot = True
         
-    if "tg_channel_id" in update_data:
-        await settings.save_setting("TG_CHANNEL_ID", cfg.tg_channel_id)
-    if "tg_user_id" in update_data:
-        await settings.save_setting("TG_USER_ID", cfg.tg_user_id)
-    if "tg_allow_chats" in update_data:
-        await settings.save_setting("TG_ALLOW_CHATS", cfg.tg_allow_chats)
-    if "tg_channels" in update_data:
-        await settings.save_setting("TG_CHANNELS", cfg.tg_channels)
-    if "tg_skip_large_package" in update_data:
-        await settings.save_setting("TG_SKIP_LARGE_PACKAGE", cfg.tg_skip_large_package)
+    if "tg_channel_id" in update_data and settings.TG_CHANNEL_ID != cfg.tg_channel_id:
+        stage_setting("TG_CHANNEL_ID", cfg.tg_channel_id)
+    if "tg_user_id" in update_data and settings.TG_USER_ID != cfg.tg_user_id:
+        stage_setting("TG_USER_ID", cfg.tg_user_id)
+    if "tg_allow_chats" in update_data and settings.TG_ALLOW_CHATS != cfg.tg_allow_chats:
+        stage_setting("TG_ALLOW_CHATS", cfg.tg_allow_chats)
+    if "tg_channels" in update_data and settings.TG_CHANNELS != cfg.tg_channels:
+        stage_setting("TG_CHANNELS", cfg.tg_channels)
+    if "tg_skip_large_package" in update_data and settings.TG_SKIP_LARGE_PACKAGE != cfg.tg_skip_large_package:
+        stage_setting("TG_SKIP_LARGE_PACKAGE", cfg.tg_skip_large_package)
     
     # 2. Update 115 settings
     if "p115_cookie" in update_data and settings.P115_COOKIE != cfg.p115_cookie:
-        await settings.save_setting("P115_COOKIE", cfg.p115_cookie)
-        p115_service.init_client(cfg.p115_cookie)
+        stage_setting("P115_COOKIE", cfg.p115_cookie)
         
     if "p115_save_dir" in update_data and settings.P115_SAVE_DIR != cfg.p115_save_dir:
-        await settings.save_setting("P115_SAVE_DIR", cfg.p115_save_dir)
-        p115_service.clear_save_dir_cache()
-    if "p115_recycle_password" in update_data:
-        await settings.save_setting("P115_RECYCLE_PASSWORD", cfg.p115_recycle_password)
+        stage_setting("P115_SAVE_DIR", cfg.p115_save_dir)
+    if "p115_recycle_password" in update_data and settings.P115_RECYCLE_PASSWORD != cfg.p115_recycle_password:
+        stage_setting("P115_RECYCLE_PASSWORD", cfg.p115_recycle_password)
     
     # 3. Update Proxy settings
     proxy_fields = ["proxy_enabled", "proxy_host", "proxy_port", "proxy_user", "proxy_pass", "proxy_type"]
@@ -106,31 +112,20 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
             current_val = getattr(settings, field.upper())
             new_val = getattr(cfg, field)
             if current_val != new_val:
-                await settings.save_setting(field.upper(), new_val)
+                stage_setting(field.upper(), new_val)
                 proxy_changed = True
-    
-    # Reinitialize services if proxy changed
-    if proxy_changed:
-        logger.info("🌐 代理设置内容已发生实质变化，重新初始化相关服务...")
-        if settings.P115_COOKIE:
-            p115_service.init_client(settings.P115_COOKIE)
-        if settings.TG_BOT_TOKEN:
-            need_restart_bot = True
     
     # 4. Update Cron tasks
     if "p115_cleanup_dir_cron" in update_data and settings.P115_CLEANUP_DIR_CRON != cfg.p115_cleanup_dir_cron:
-        await settings.save_setting("P115_CLEANUP_DIR_CRON", cfg.p115_cleanup_dir_cron)
-        from app.services.scheduler import cleanup_scheduler
-        cleanup_scheduler.update_cleanup_dir_job()
+        stage_setting("P115_CLEANUP_DIR_CRON", cfg.p115_cleanup_dir_cron)
+        cleanup_dir_cron_changed = True
         
     if "p115_cleanup_trash_cron" in update_data and settings.P115_CLEANUP_TRASH_CRON != cfg.p115_cleanup_trash_cron:
-        await settings.save_setting("P115_CLEANUP_TRASH_CRON", cfg.p115_cleanup_trash_cron)
-        from app.services.scheduler import cleanup_scheduler
-        cleanup_scheduler.update_cleanup_trash_job()
+        stage_setting("P115_CLEANUP_TRASH_CRON", cfg.p115_cleanup_trash_cron)
+        cleanup_trash_cron_changed = True
 
     # 4.5 Update Capacity Cleanup (Consolidated)
     capacity_fields = ["p115_cleanup_capacity_enabled", "p115_cleanup_capacity_limit", "p115_cleanup_capacity_unit", "p115_cleanup_capacity_type"]
-    capacity_changed = False
     for field in capacity_fields:
         if field in update_data:
             val = update_data[field]
@@ -141,26 +136,26 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
                 
             current_val = getattr(settings, field.upper())
             if current_val != val:
-                await settings.save_setting(field.upper(), val)
+                stage_setting(field.upper(), val)
                 capacity_changed = True
     
     # 4.6 Update Rate Limiting & Yielding
     limit_fields = ["p115_rate_limit_count", "p115_rate_limit_window", "p115_rate_limit_silent_duration", "p115_batch_yield_duration"]
     for field in limit_fields:
-        if field in update_data:
-            await settings.save_setting(field.upper(), update_data[field])
+        if field in update_data and getattr(settings, field.upper()) != update_data[field]:
+            stage_setting(field.upper(), update_data[field])
 
     # 4.7 Update Direct Save settings
-    if "direct_save_account_id" in update_data:
-        await settings.save_setting("DIRECT_SAVE_ACCOUNT_ID", cfg.direct_save_account_id)
-    if "direct_save_dir" in update_data:
-        await settings.save_setting("DIRECT_SAVE_DIR", cfg.direct_save_dir)
-    if "tg_default_command_mode" in update_data:
-        await settings.save_setting("TG_DEFAULT_COMMAND_MODE", cfg.tg_default_command_mode)
+    if "direct_save_account_id" in update_data and settings.DIRECT_SAVE_ACCOUNT_ID != cfg.direct_save_account_id:
+        stage_setting("DIRECT_SAVE_ACCOUNT_ID", cfg.direct_save_account_id)
+    if "direct_save_dir" in update_data and settings.DIRECT_SAVE_DIR != cfg.direct_save_dir:
+        stage_setting("DIRECT_SAVE_DIR", cfg.direct_save_dir)
+    if "tg_default_command_mode" in update_data and settings.TG_DEFAULT_COMMAND_MODE != cfg.tg_default_command_mode:
+        stage_setting("TG_DEFAULT_COMMAND_MODE", cfg.tg_default_command_mode)
     
     # 4.8 Update Sensitive Replace settings
-    if "sensitive_replace_enabled" in update_data:
-        await settings.save_setting("SENSITIVE_REPLACE_ENABLED", cfg.sensitive_replace_enabled)
+    if "sensitive_replace_enabled" in update_data and settings.SENSITIVE_REPLACE_ENABLED != cfg.sensitive_replace_enabled:
+        stage_setting("SENSITIVE_REPLACE_ENABLED", cfg.sensitive_replace_enabled)
     if "sensitive_replace_mapping" in update_data:
         import json
         from fastapi import HTTPException
@@ -168,13 +163,37 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
             json.loads(cfg.sensitive_replace_mapping)
         except Exception:
             raise HTTPException(status_code=400, detail="敏感词映射表不是有效的 JSON 格式")
-        await settings.save_setting("SENSITIVE_REPLACE_MAPPING", cfg.sensitive_replace_mapping)
-    if "sensitive_replace_pinyin" in update_data:
-        await settings.save_setting("SENSITIVE_REPLACE_PINYIN", cfg.sensitive_replace_pinyin)
-    if "sensitive_replace_tmdb" in update_data:
-        await settings.save_setting("SENSITIVE_REPLACE_TMDB", cfg.sensitive_replace_tmdb)
-    if "tmdb_api_key" in update_data:
-        await settings.save_setting("TMDB_API_KEY", cfg.tmdb_api_key)
+        if settings.SENSITIVE_REPLACE_MAPPING != cfg.sensitive_replace_mapping:
+            stage_setting("SENSITIVE_REPLACE_MAPPING", cfg.sensitive_replace_mapping)
+    if "sensitive_replace_pinyin" in update_data and settings.SENSITIVE_REPLACE_PINYIN != cfg.sensitive_replace_pinyin:
+        stage_setting("SENSITIVE_REPLACE_PINYIN", cfg.sensitive_replace_pinyin)
+    if "sensitive_replace_tmdb" in update_data and settings.SENSITIVE_REPLACE_TMDB != cfg.sensitive_replace_tmdb:
+        stage_setting("SENSITIVE_REPLACE_TMDB", cfg.sensitive_replace_tmdb)
+    if "tmdb_api_key" in update_data and settings.TMDB_API_KEY != cfg.tmdb_api_key:
+        stage_setting("TMDB_API_KEY", cfg.tmdb_api_key)
+
+    if pending_updates:
+        await settings.save_settings_batch(pending_updates)
+
+    # Reinitialize services if proxy changed
+    if proxy_changed:
+        logger.info("🌐 代理设置内容已发生实质变化，重新初始化相关服务...")
+        if settings.P115_COOKIE:
+            p115_service.init_client(settings.P115_COOKIE)
+        if settings.TG_BOT_TOKEN:
+            need_restart_bot = True
+
+    if "P115_COOKIE" in pending_updates:
+        p115_service.init_client(settings.P115_COOKIE)
+    if "P115_SAVE_DIR" in pending_updates:
+        p115_service.clear_save_dir_cache()
+
+    if cleanup_dir_cron_changed or cleanup_trash_cron_changed or capacity_changed:
+        from app.services.scheduler import cleanup_scheduler
+        if cleanup_dir_cron_changed:
+            cleanup_scheduler.update_cleanup_dir_job()
+        if cleanup_trash_cron_changed:
+            cleanup_scheduler.update_cleanup_trash_job()
     
     if capacity_changed:
         from app.services.scheduler import cleanup_scheduler
