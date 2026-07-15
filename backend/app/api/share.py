@@ -34,6 +34,7 @@ def format_size(size_bytes):
 def get_share_status(item: dict) -> dict:
     state = item.get("share_state")
     have_vio = item.get("have_vio_file", 0)
+    state_text = str(item.get("share_state_text", "") or "").strip()
 
     is_violated = False
     is_expired = False
@@ -52,7 +53,12 @@ def get_share_status(item: dict) -> dict:
     elif state == 7:
         status_text = "已过期"
         is_expired = True
-    elif state == 4:
+    elif state in (0, 4):
+        # 不同端点返回差异：webapi 常见 share_state=0 且 share_state_text=处理中
+        status_text = "审核中"
+        is_reviewing = True
+    elif state_text in ("处理中", "审核中"):
+        # 文本兜底，避免 share_state 枚举变动导致漏判
         status_text = "审核中"
         is_reviewing = True
     else:
