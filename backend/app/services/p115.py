@@ -1,6 +1,6 @@
 from p115client import P115Client, check_response
 from p115client.fs import P115FileSystem
-from p115client.util import share_extract_payload
+from p115client.util import share_extract_payload, complete_url
 from p115client.tool import share_iterdir_walk
 from app.core.config import settings
 from loguru import logger
@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from app.core.database import async_session
 from app.models.schema import PendingLink, LinkHistory
 from sqlalchemy import select, delete
+from pathlib import Path
+import tempfile
 
 # 默认 API 请求超时（秒）
 API_TIMEOUT = 60
@@ -176,6 +178,16 @@ class P115Service:
         # margin 限速重试队列：存放 (save_result, metadata) 元组
         self._margin_retry_queue: deque = deque()
         self._margin_poller_task: Optional[asyncio.Task] = None
+        
+        # 端点健康度监控（防 405）
+        self._endpoint_stats = {
+            "share_snap_app": {"success": 0, "fail": 0, "last_405": 0},
+            "share_snap_webapi": {"success": 0, "fail": 0, "last_405": 0},
+        }
+        
+        # Cookie 文件管理（用于自动恢复登录态）
+        self._cookie_file: Optional[Path] = None
+        self.cookies_str: str = ""  # 保存当前 cookie 用于检测更新
 
         if account is None and settings.P115_COOKIE:
             self.init_client(settings.P115_COOKIE)
@@ -305,6 +317,136 @@ class P115Service:
             "app": "ios"
         }
 
+    def _record_endpoint_result(self, endpoint: str, success: bool, is_405: bool = False):
+        """记录端点调用结果，用于监控与告警"""
+        stats = self._endpoint_stats.get(endpoint, {})
+        if success:
+            stats["success"] = stats.get("success", 0) + 1
+        else:
+            stats["fail"] = stats.get("fail", 0) + 1
+            if is_405:
+                stats["last_405"] = time.time()
+        
+        # 告警阈值：5分钟内连续出现 405
+        if is_405:
+            last_405_time = stats.get("last_405", 0)
+            if last_405_time > 0 and time.time() - last_405_time < 300:
+                fail_count = stats.get("fail", 0)
+                if fail_count > 3:  # 连续3次以上失败
+                    logger.error(f"🚨 端点 {endpoint} 持续被 405 风控 (失败{fail_count}次)，建议检查登录态")
+
+    def _check_cookie_freshness(self):
+        """检查并同步最新 cookie（如果文件被外部更新）"""
+        try:
+            if self._cookie_file and self._cookie_file.exists():
+                new_cookie = self._cookie_file.read_text(encoding="utf-8")
+                if new_cookie != self.cookies_str and new_cookie.strip():
+                    logger.info("🔄 检测到 cookie 更新，重新初始化客户端")
+                    self.cookies_str = new_cookie
+                    # 更新客户端 cookies
+                    if self.client:
+                        self.client.cookies = new_cookie
+                        logger.info("✅ Cookie 已同步更新")
+        except Exception as e:
+            logger.warning(f"检查 cookie 更新失败: {e}")
+
+    async def _share_snap_webapi(self, payload: dict, **kwargs) -> dict:
+        """
+        使用 webapi 的 share_snap（不需要 app 参数，更稳定）
+        用作 share_snap_app 的降级备用方案
+        """
+        api = complete_url("/share/snap", base_url="https://webapi.115.com")
+        payload = {"cid": 0, "limit": 32, "offset": 0, **payload}
+        
+        # 不传 app 参数，使用原生 cookies 请求
+        return await self._api_call_with_timeout(
+            lambda p, **kw: self.client.request(
+                url=api, 
+                params=p, 
+                async_=True, 
+                **kw
+            ),
+            payload,
+            timeout=30,
+            label="share_snap_webapi",
+            **{k: v for k, v in kwargs.items() if k != "app"}  # 过滤掉 app 参数
+        )
+
+    async def _share_snap_with_fallback(self, payload: dict, **kwargs) -> dict:
+        """
+        多端点容错的 share_snap 调用
+        策略：优先 app 接口（proapi），失败自动降级到 webapi
+        
+        :param payload: share_snap 请求参数
+        :return: API 响应字典
+        :raises: 所有端点都失败时抛出最后一个异常
+        """
+        endpoints = [
+            {
+                "name": "share_snap_app",
+                "func": lambda: self.client.share_snap_app(
+                    payload, 
+                    base_url="https://proapi.115.com",
+                    async_=True,
+                    **self._get_ios_ua_kwargs(),
+                    **kwargs
+                ),
+                "base_url": "https://proapi.115.com"
+            },
+            {
+                "name": "share_snap_webapi",
+                "func": lambda: self._share_snap_webapi(payload, **kwargs),
+                "base_url": "https://webapi.115.com"
+            },
+        ]
+        
+        last_error = None
+        for idx, endpoint_info in enumerate(endpoints, 1):
+            endpoint_name = endpoint_info["name"]
+            endpoint_func = endpoint_info["func"]
+            base_url = endpoint_info["base_url"]
+            
+            try:
+                resp = await asyncio.wait_for(endpoint_func(), timeout=30)
+                check_response(resp)
+                
+                # 记录成功
+                self._record_endpoint_result(endpoint_name, success=True, is_405=False)
+                
+                if idx > 1:
+                    logger.warning(f"⚠️ share_snap 主端点失败，使用备用端点 {endpoint_name} 成功")
+                
+                return resp
+                
+            except Exception as e:
+                error_msg = str(e)
+                last_error = e
+                is_405 = "405" in error_msg or "Method Not Allowed" in error_msg.lower()
+                
+                # 记录失败
+                self._record_endpoint_result(endpoint_name, success=False, is_405=is_405)
+                
+                # 405 或风控错误，尝试下一个端点
+                if is_405:
+                    logger.warning(f"⚠️ 端点 {endpoint_name} ({base_url}) 返回 405，切换到备用端点")
+                    if idx < len(endpoints):
+                        await asyncio.sleep(1)  # 冷却1秒
+                        continue
+                else:
+                    logger.warning(f"⚠️ 端点 {endpoint_name} ({base_url}) 失败: {error_msg}")
+                
+                # 如果不是最后一个端点，尝试下一个
+                if idx < len(endpoints):
+                    await asyncio.sleep(0.5)  # 短暂冷却
+                    continue
+                
+                # 最后一个端点也失败，抛出异常
+                break
+        
+        # 所有端点都失败
+        logger.error(f"❌ 所有 share_snap 端点均失败，最后错误: {last_error}")
+        raise last_error
+
 
     async def _task_worker(self):
         """后台任务处理 Worker"""
@@ -375,15 +517,28 @@ class P115Service:
 
     def init_client(self, cookie: str):
         try:
-            self.client = P115Client(cookie)
+            # 策略：通过文件路径初始化，支持 cookie 自动更新和持久化
+            # 当 p115client 触发重登后，新 cookie 会自动回写到文件
+            account_id = self.account.id if self.account else "default"
+            
+            # 使用临时目录存储 cookie 文件
+            cookie_dir = Path(tempfile.gettempdir()) / "p115share_cookies"
+            cookie_dir.mkdir(parents=True, exist_ok=True)
+            
+            self._cookie_file = cookie_dir / f"p115_cookies_{account_id}.txt"
+            self._cookie_file.write_text(cookie, encoding="utf-8")
+            self.cookies_str = cookie  # 保存副本用于检测更新
+            
+            # 使用文件路径初始化，支持 p115client 自动管理 cookie
+            self.client = P115Client(self._cookie_file)
             self.fs = P115FileSystem(self.client)
             self.clear_save_dir_cache()
             
-            logger.info("P115Client and FileSystem initialized successfully (direct, no proxy)")
+            logger.info(f"✅ P115Client 初始化成功 (账号ID: {account_id}, cookie文件: {self._cookie_file})")
             # Verify connection asynchronously
             asyncio.create_task(self.verify_connection())
         except Exception as e:
-            logger.error(f"Failed to initialize P115Client: {e}")
+            logger.error(f"❌ P115Client 初始化失败: {e}")
             self.client = None
             self.fs = None
             self.is_connected = False
@@ -927,12 +1082,8 @@ class P115Service:
             # 1. Extract share/receive codes
             payload = share_extract_payload(share_url)
             
-            # 2. Get share snapshot to get file IDs and names (带超时重试)
-            snap_resp = await self._api_call_with_timeout(
-                self.client.share_snap_app, payload, async_=True,
-                timeout=API_TIMEOUT, label="share_snap",
-                **self._get_ios_ua_kwargs()
-            )
+            # 2. Get share snapshot to get file IDs and names (使用多端点容错)
+            snap_resp = await self._share_snap_with_fallback(payload)
             check_response(snap_resp)
             logger.debug(f"📋 share_snap 响应数据: {snap_resp.get('data')}")
 
@@ -1568,11 +1719,8 @@ class P115Service:
         """
         try:
             payload = share_extract_payload(share_url)
-            snap_resp = await self._api_call_with_timeout(
-                self.client.share_snap_app, payload, async_=True,
-                timeout=API_TIMEOUT, label="share_snap(status)",
-                **self._get_ios_ua_kwargs()
-            )
+            # 使用多端点容错机制获取分享状态
+            snap_resp = await self._share_snap_with_fallback(payload)
             check_response(snap_resp)
             
             data = snap_resp.get("data", {})
