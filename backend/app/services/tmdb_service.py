@@ -887,8 +887,8 @@ class TMDBService:
             return ["tv", "movie"]
         if preferred_media == "movie":
             return ["movie", "tv"]
-        # 未知类型时优先按剧集尝试，降低剧集误识别为电影的概率
-        return ["tv", "movie"]
+        # 未知类型时优先按电影尝试：常见电影目录无分集特征，先查 tv 容易命中同 ID 的剧集条目。
+        return ["movie", "tv"]
 
     async def _fetch_alias_titles(self, tmdb_id: int, media_type: str, params: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
         alt_url = f"{self.BASE_URL}/{media_type}/{tmdb_id}/alternative_titles"
@@ -993,21 +993,35 @@ class TMDBService:
         """根据 TMDB ID 获取替换名（支持媒体类型提示与 tv/movie 回退）。"""
         cache_row = await self._get_alias_cache(tmdb_id)
         if cache_row and cache_row.alias:
-            if (not cache_row.chinese_title) and chinese_title_hint and self._contains_chinese(chinese_title_hint):
-                await self._save_alias_cache(
-                    tmdb_id=tmdb_id,
-                    media_type=cache_row.media_type,
-                    chinese_title=chinese_title_hint,
-                    original_title=cache_row.original_title,
-                    alias=cache_row.alias,
-                    source=cache_row.source or "cache",
-                    status=cache_row.status or "success",
-                    note=cache_row.note,
-                )
-            logger.debug(
-                f"🗂️ 命中 TMDB 别名缓存: tmdb_id={tmdb_id} alias=[{cache_row.alias}] media={cache_row.media_type}"
+            cache_media = (cache_row.media_type or "unknown").lower()
+            requested_media = (preferred_media or "").lower()
+
+            media_conflict = (
+                requested_media in ["movie", "tv"]
+                and cache_media in ["movie", "tv"]
+                and requested_media != cache_media
             )
-            return cache_row.alias
+
+            if media_conflict:
+                logger.warning(
+                    f"⚠️ TMDB 别名缓存媒体类型冲突: tmdb_id={tmdb_id} cache_media={cache_media} requested_media={requested_media}，跳过缓存并回源查询"
+                )
+            else:
+                if (not cache_row.chinese_title) and chinese_title_hint and self._contains_chinese(chinese_title_hint):
+                    await self._save_alias_cache(
+                        tmdb_id=tmdb_id,
+                        media_type=cache_row.media_type,
+                        chinese_title=chinese_title_hint,
+                        original_title=cache_row.original_title,
+                        alias=cache_row.alias,
+                        source=cache_row.source or "cache",
+                        status=cache_row.status or "success",
+                        note=cache_row.note,
+                    )
+                logger.debug(
+                    f"🗂️ 命中 TMDB 别名缓存: tmdb_id={tmdb_id} alias=[{cache_row.alias}] media={cache_row.media_type}"
+                )
+                return cache_row.alias
 
         api_key = await self._ensure_api_key()
         if not api_key:

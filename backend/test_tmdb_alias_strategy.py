@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 from app.services.tmdb_service import TMDBService
 
@@ -83,13 +84,38 @@ async def test_non_chinese_non_english_uses_original_when_no_alias():
 async def main():
     assert TMDBService._build_media_query_order("tv") == ["tv", "movie"]
     assert TMDBService._build_media_query_order("movie") == ["movie", "tv"]
-    assert TMDBService._build_media_query_order(None) == ["tv", "movie"]
+    assert TMDBService._build_media_query_order(None) == ["movie", "tv"]
 
     await test_tv_first_then_movie_fallback()
     await test_chinese_original_uses_english_alias()
     await test_chinese_original_without_english_alias_returns_none()
     await test_non_chinese_non_english_uses_original_when_no_alias()
+    await test_cache_media_conflict_bypasses_cache()
     print("All TMDB alias strategy tests passed")
+
+
+async def test_cache_media_conflict_bypasses_cache():
+    base = TMDBService.BASE_URL
+    responses = {
+        f"{base}/movie/4024": ({"original_title": "Last Year at Marienbad"}, 200),
+        f"{base}/movie/4024/alternative_titles": ({"titles": []}, 200),
+    }
+    svc = FakeTMDBService(responses)
+    svc._get_alias_cache = lambda tmdb_id: asyncio.sleep(0, result=SimpleNamespace(
+        tmdb_id=tmdb_id,
+        media_type="tv",
+        chinese_title="去年在马里昂巴德",
+        original_title="Invent This!",
+        alias="Invent This!",
+        source="original_english",
+        status="success",
+        note=None,
+    ))
+
+    alias = await svc.get_alias_by_id(4024, preferred_media="movie")
+
+    assert alias == "Last Year at Marienbad"
+    assert f"{base}/movie/4024" in svc.calls
 
 
 if __name__ == "__main__":

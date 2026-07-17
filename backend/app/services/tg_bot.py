@@ -698,9 +698,20 @@ class TGService:
         else:
             interval = 300
 
-        max_attempts = 36
+        # 根据配置的超时小时数动态计算 max_attempts
+        # 审核链接: 60s + 120s + N*300s = timeout_hours * 3600s
+        # N = (timeout_hours * 3600 - 180) / 300
+        timeout_seconds = settings.TG_POLL_TIMEOUT_HOURS * 3600
+        if reason == "auditing":
+            max_attempts = max(3, 2 + int((timeout_seconds - 180) / 300))
+        elif reason == "snapshotting":
+            max_attempts = max(2, int(timeout_seconds / 1800))
+        elif reason == "restricted":
+            max_attempts = max(2, int(timeout_seconds / 3600))
+        else:
+            max_attempts = 36  # 默认兜底
 
-        logger.info(f"⏳ 开始为链接启动轮询任务 (原因: {reason}, 间隔: {interval}s): {share_url}")
+        logger.info(f"⏳ 开始为链接启动轮询任务 (原因: {reason}, 间隔: {interval}s, 最大尝试: {max_attempts}次, 超时: {settings.TG_POLL_TIMEOUT_HOURS}小时): {share_url}")
 
         for attempt in range(1, max_attempts + 1):
             # 动态计算本次循环的等待时间 (针对审核中链接增加 1min, 2min 前置尝试)
@@ -857,8 +868,8 @@ class TGService:
                     await self._delete_pending_task(pending_info.get("db_id"))
                     return
         
-        logger.warning(f"⏰ 链接审核轮询超时 (3小时): {share_url}")
-        await message.reply(f"⏰ 链接审核轮询超时 (已持续 3 小时)，请稍后手动检查: {share_url}")
+        logger.warning(f"⏰ 链接审核轮询超时 ({settings.TG_POLL_TIMEOUT_HOURS}小时): {share_url}")
+        await message.reply(f"⏰ 链接审核轮询超时 (已持续 {settings.TG_POLL_TIMEOUT_HOURS} 小时)，请稍后手动检查: {share_url}")
         await self._delete_pending_task(pending_info.get("db_id"))
 
     def _slice_message(self, text: str, entities: list, start_u16: int, end_u16: int) -> tuple[str, list]:
