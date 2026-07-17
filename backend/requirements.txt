@@ -20,4 +20,8 @@ pandas
 openpyxl
 xlrd
 p115client==0.0.9.4
+python-asynctools==0.1.4
+python-iterutils==0.3.0
+python-concurrenttools==0.1.4
+iterdir==0.0.10
 pypinyin
