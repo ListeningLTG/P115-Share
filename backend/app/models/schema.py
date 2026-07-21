@@ -228,6 +228,7 @@ class ScheduledShareTask(Base):
     cron_expression: Mapped[str] = mapped_column(String(50))                         # cron定时表达式，如 0 3 * * *
     clear_files: Mapped[bool] = mapped_column(Boolean, default=True)                 # 定时执行模式：True为移动(剪切)，False为复制(保留)
     share_mode: Mapped[str] = mapped_column(String(20), default="move", server_default="move") # 分享模式：move(移动), copy(复制), direct(直接)
+    cleanup_temp_dir: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1") # 分享成功后删除临时目录并清空回收站
     min_size: Mapped[float] = mapped_column(Float, default=0.0)                      # 最小容量触发阈值，0表示不检测
     min_size_unit: Mapped[str] = mapped_column(String(10), default="GB")             # 容量触发阈值单位 (GB/TB)
     target_channels: Mapped[dict] = mapped_column(JSON, default=list)                # 要推送的TG频道列表，支持多选

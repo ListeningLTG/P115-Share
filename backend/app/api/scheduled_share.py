@@ -20,6 +20,7 @@ class ScheduledShareTaskCreate(BaseModel):
     cron_expression: str
     clear_files: bool = True
     share_mode: str = "move"
+    cleanup_temp_dir: bool = True
     min_size: float = 0.0
     min_size_unit: str = "GB"
     target_channels: List[str] = []
@@ -43,6 +44,7 @@ class ScheduledShareTaskUpdate(BaseModel):
     cron_expression: Optional[str] = None
     clear_files: Optional[bool] = None
     share_mode: Optional[str] = None
+    cleanup_temp_dir: Optional[bool] = None
     min_size: Optional[float] = None
     min_size_unit: Optional[str] = None
     target_channels: Optional[List[str]] = None
@@ -76,6 +78,7 @@ async def list_tasks(user=Depends(get_current_user)):
                     "cron_expression": t.cron_expression,
                     "clear_files": t.clear_files,
                     "share_mode": t.share_mode or ("move" if t.clear_files else "copy"),
+                    "cleanup_temp_dir": t.cleanup_temp_dir,
                     "min_size": t.min_size,
                     "min_size_unit": t.min_size_unit,
                     "target_channels": t.target_channels,
@@ -122,6 +125,7 @@ async def create_task(data: ScheduledShareTaskCreate, user=Depends(get_current_u
             cron_expression=data.cron_expression,
             clear_files=clear_files,
             share_mode=share_mode,
+            cleanup_temp_dir=data.cleanup_temp_dir,
             min_size=data.min_size,
             min_size_unit=data.min_size_unit,
             target_channels=data.target_channels,

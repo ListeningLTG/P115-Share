@@ -1870,11 +1870,12 @@ class P115Service:
             return "\n".join(f"链接 {idx}: {link}" for idx, link in enumerate(result_links, 1))
         return result_links[0]
 
-    async def _get_dir_items(self, cid: int) -> list:
+    async def _get_dir_items(self, cid: int, *, strict: bool = False) -> list:
         """获取目录中所有顶层文件/文件夹的详细信息，用于保存前后 diff 或目录树展示（自动翻页，避免 >1000 条时漏记）"""
         items = []
         offset = 0
         limit = 1000
+        seen_page_signatures = set()
         try:
             while True:
                 resp = await self._api_call_with_timeout(
@@ -1894,28 +1895,52 @@ class P115Service:
                 file_list = resp.get("data", [])
                 if isinstance(file_list, dict):
                     file_list = file_list.get("list", [])
+                if not file_list:
+                    break
+                page_signature = tuple(
+                    str(
+                        item.get("fid")
+                        or item.get("cid")
+                        or item.get("file_id")
+                        or item.get("category_id")
+                        or item.get("id")
+                        or ""
+                    )
+                    for item in file_list
+                )
+                if page_signature in seen_page_signatures:
+                    message = f"目录 {cid} 分页返回重复页面，offset={offset}"
+                    if strict:
+                        raise RuntimeError(message)
+                    logger.warning(message)
+                    break
+                seen_page_signatures.add(page_signature)
                 for item in file_list:
                     item_id = item.get("fid") or item.get("cid") or item.get("file_id") or item.get("category_id") or item.get("id")
                     item_name = item.get("n") or item.get("fn") or item.get("name") or item.get("file_name") or item.get("title") or item.get("category_name")
                     if item_id and item_name:
-                        # 文件夹通常不含 "fid" 字段，或者含 "cid"
-                        is_dir = "fid" not in item
+                        # 文件夹可能带空的 fid 字段，应按有效文件 ID 判断类型。
+                        is_dir = not bool(item.get("fid") or item.get("file_id"))
                         items.append({
                             "id": str(item_id),
                             "name": str(item_name),
                             "is_dir": is_dir
                         })
-                if len(file_list) < limit:
-                    break  # 已是最后一页
-                offset += limit
+                    elif strict:
+                        raise ValueError(f"目录 {cid} 返回缺少 ID 或名称的项目: {item}")
+                # 不以“本页少于 limit”作为结束条件：部分端点会使用低于请求值的页大小。
+                # 按实际返回数量推进，直到接口明确返回空页。
+                offset += len(file_list)
                 logger.debug(f"📄 快照目录 {cid} 翻页: offset={offset}, 已收集 {len(items)} 个项")
         except Exception as e:
             logger.warning(f"⚠️ 获取目录 {cid} 顶级项失败: {e}")
+            if strict:
+                raise
         return items
 
-    async def _snapshot_dir_ids(self, cid: int) -> set:
+    async def _snapshot_dir_ids(self, cid: int, *, strict: bool = False) -> set:
         """快照目录中所有顶层文件/文件夹的 ID，用于保存前后 diff 找新增项（自动翻页，避免 >1000 条时漏记）"""
-        items = await self._get_dir_items(cid)
+        items = await self._get_dir_items(cid, strict=strict)
         return {item["id"] for item in items}
 
 
@@ -2074,16 +2099,13 @@ class P115Service:
                 "message": "检测到即将对保存根目录发起分享，已安全拦截。请检查账号 Session 状态。"
             }
 
-        # 有时候外层分享根节点如果算数的话，可能有轻微误差（原分享有1个文件夹A包含了3个子文件夹，新转存的到C中只有这一棵树）
-        # 所以我们重点打印它，并允许极小误差
+        # 源分享规模是完成判定的硬基准，不能只依赖目标目录暂时稳定。
         logger.info(f"📊 [基准比对数据] 转存源分享规模: 大小 = {original_total_size} 字节, 文件数 = {original_file_count}, 文件夹数 = {original_folder_count}")
 
         try:
             logger.info(f"⏳ 等待文件深度属性写入子孙目录 (CID: {to_cid})...")
 
             new_fids = []
-            prev_total_count = -1
-            prev_size_str = ""
             stable_times = 0
             max_poll_attempts = 45 # 最多等待约 90s
             min_stable_required = 3 # 稳定不变的次数要求
@@ -2104,6 +2126,7 @@ class P115Service:
                     
                     # 🛡️ 检测 115 限速响应 {"margin": N}，不消耗轮询次数
                     if self._is_margin_response(resp):
+                        stable_times = 0
                         margin_hit_count += 1
                         margin_val = int(resp.get("margin", 5))
                         wait = max(margin_val, 3)
@@ -2116,7 +2139,7 @@ class P115Service:
                                 "message": "分享被限制（margin），已加入排队等待"
                             }
                         await asyncio.sleep(wait)
-                        continue  # 不递增 poll_attempt
+                        continue
                     
                     logger.info(f"📋 [深度属性 RAW API 完整响应] {resp}")
                     
@@ -2124,49 +2147,44 @@ class P115Service:
                     current_file_count = int(resp.get("count", 0) or resp.get("file_count", 0))
                     current_folder_count = int(resp.get("folder_count", 0))
                     current_total = current_file_count + current_folder_count
-                    current_size_str = str(resp.get("size", "0"))
+                    current_size = int(resp.get("size", 0) or 0)
 
-                    logger.info(f"⚖️ [比对进程] 当前挂载层级统计: 大小={current_size_str} (基准: {original_total_size} 字节), 文件数={current_file_count}, 文件夹数={current_folder_count}")
+                    logger.info(f"⚖️ [比对进程] 当前挂载层级统计: 大小={current_size} (基准: {original_total_size} 字节), 文件数={current_file_count}, 文件夹数={current_folder_count}")
 
                     # 3. 结合原先的顶部结构验证，确保外层骨架确实建好了
-                    current_ids = await self._snapshot_dir_ids(to_cid)
+                    current_items = await self._get_dir_items(to_cid, strict=True)
+                    stats_match = (
+                        current_size == int(original_total_size or 0)
+                        and current_file_count == int(original_file_count or 0)
+                        and current_folder_count == int(original_folder_count or 0)
+                    )
+                    # 敏感词处理可能已修改顶层名称，因此普通分享按顶层数量精确匹配。
+                    # 定时移动/复制流程会在改名前执行更严格的名称/ID匹配。
+                    top_match = len(current_items) == len(names)
 
-                    # 判断规则：只要检测到当前有合并节点（current_total > 0）
-                    if current_total > 0:
-                        if current_total == prev_total_count and current_size_str == prev_size_str:
-                            stable_times += 1
-                            logger.info(f"🔄 目标目录总项数 ({current_total}) 和大小 ({current_size_str}) 保持不变... (连续稳固 {stable_times}/{min_stable_required} 次)")
-                            if stable_times >= min_stable_required:
-                                logger.info(f"✅ 录像稳定！后台大目录深层挂载确认已彻底完成！最终合集项数: {current_total}")
-                                final_ids = await self._snapshot_dir_ids(to_cid)
-                                new_fids = list(final_ids)
-                                break
-                        else:
-                            # 数量或层级大小有变化，表示还在激烈复制挂载
-                            logger.info(f"📈 目录树深度挂载中... （项数变化 {prev_total_count} -> {current_total}, 尺寸 {prev_size_str} -> {current_size_str}）")
-                            stable_times = 0
+                    if stats_match and top_match:
+                        stable_times += 1
+                        logger.info(
+                            f"🔄 目标目录规模及顶层结构与源分享一致 "
+                            f"(连续稳固 {stable_times}/{min_stable_required} 次)"
+                        )
+                        if stable_times >= min_stable_required:
+                            logger.info(f"✅ 目标目录与源分享基准连续一致，确认转存完成")
+                            new_fids = [item["id"] for item in current_items]
+                            break
                     else:
-                        # Fallback：深度属性接口失效（被115缓存卡在 0 了），这时候靠最外层的 fallback 检测机制！
-                        if current_ids and len(current_ids) >= len(names):
-                            if current_total == prev_total_count: # (即 0 == 0)
-                                stable_times += 1
-                                logger.info(f"⚠️ 深度属性(大小)因 115 缓存一直为 0。但顶层目录已就绪，当前进入强制平稳期等待... ({stable_times}/{min_stable_required})")
-                                if stable_times >= min_stable_required:
-                                    logger.info(f"✅ 录稳期结束。为防止深层未挂载，安全追加 10 秒死等...")
-                                    await asyncio.sleep(10)
-                                    new_fids = list(current_ids)
-                                    break
-                        else:
-                            logger.warning(f"⚠️ 顶层子目录仍为空...")
-                            stable_times = 0
-
-                    prev_total_count = current_total
-                    prev_size_str = current_size_str
+                        logger.info(
+                            "📈 目标目录尚未达到源分享基准: "
+                            f"统计匹配={stats_match}, 顶层结构匹配={top_match}, "
+                            f"当前总项数={current_total}"
+                        )
+                        stable_times = 0
                     
                     if poll_attempt < max_poll_attempts:
                         await asyncio.sleep(2)
 
                 except Exception as e:
+                    stable_times = 0
                     logger.error(f"⚠️ 检索目录内容或属性失败 (第 {poll_attempt} 次): {e}", exc_info=True)
                     if poll_attempt < max_poll_attempts:
                         await asyncio.sleep(5)
@@ -2658,21 +2676,6 @@ class P115Service:
         should_pinyin = replace_pinyin if replace_pinyin is not None else settings.SENSITIVE_REPLACE_PINYIN
         should_tmdb = replace_tmdb if replace_tmdb is not None else settings.SENSITIVE_REPLACE_TMDB
 
-        # 若启用了拼音首字母替换，过滤掉映射表中已有的等价映射以避免重复逻辑判断
-        if should_pinyin:
-            try:
-                import pypinyin
-                filtered_mapping = {}
-                for k, v in mapping.items():
-                    k_pinyin = ''.join(pypinyin.lazy_pinyin(k, style=pypinyin.STYLE_FIRST_LETTER)).lower()
-                    if k_pinyin == v.lower():
-                        logger.info(f"ℹ️ 映射规则 [{k}] -> [{v}] 与拼音首字母一致，已自动跳过该映射规则判定")
-                        continue
-                    filtered_mapping[k] = v
-                mapping = filtered_mapping
-            except Exception as pe:
-                logger.error(f"❌ 过滤拼音冗余映射逻辑失败: {pe}")
-
         if not mapping and not should_pinyin and not should_tmdb:
             return
 
@@ -2740,9 +2743,18 @@ class P115Service:
         async def process_name(old_name: str, parent_replacements: list, media_hint: str) -> Tuple[str, list]:
             new_replacements = list(parent_replacements) if parent_replacements else []
             new_name = old_name
-            tmdb_success = False
 
-            # 1. 优先尝试 TMDB ID 别名匹配
+            # 1. 优先：敏感词映射表
+            if pattern:
+                def replace_func(match):
+                    matched_str = match.group(0)
+                    return mapping_lower.get(matched_str.lower(), matched_str)
+                mapped_name = pattern.sub(replace_func, old_name)
+                if mapped_name != old_name:
+                    return mapped_name, new_replacements
+
+            # 2. 降级：TMDB ID 别名匹配
+            tmdb_success = False
             if should_tmdb and contains_chinese(old_name):
                 tmdb_id = extract_tmdb_id_from_name(old_name)
                 if tmdb_id:
@@ -2767,7 +2779,7 @@ class P115Service:
                             f"ℹ️ TMDB 未命中可用别名: name=[{old_name}] tmdb_id={tmdb_id} media_hint={media_hint}，将尝试后续策略"
                         )
 
-            # 2. 如果 TMDB 失败或不适用，检查是否有父目录继承来的别名替换
+            # 2.5 如果 TMDB 失败或不适用，检查是否有父目录继承来的别名替换
             if not tmdb_success and parent_replacements and contains_chinese(old_name):
                 for chinese_title, alias in parent_replacements:
                     if chinese_title in old_name:
@@ -2779,43 +2791,45 @@ class P115Service:
             if tmdb_success:
                 return new_name, new_replacements
 
-            # 3. 降级：拼音首字母替换
-            pinyin_success = False
+            # 3. 兜底：拼音全拼替换（仅转换连续中文段，保留英文/扩展名等）
             if should_pinyin and contains_chinese(old_name):
                 try:
                     import pypinyin
                     episode_pattern = re.compile(r"第\s*[0-9一二三四五六七八九十百千万]+\s*[集季]")
                     placeholders = []
-                    
+
                     def encode_episodes(match):
                         placeholder = f"__EPISODE_HOLDER_{len(placeholders)}__"
                         placeholders.append((placeholder, match.group(0)))
                         return placeholder
-                    
+
                     protected_name = episode_pattern.sub(encode_episodes, old_name)
-                    pinyin_name = ''.join(pypinyin.lazy_pinyin(protected_name, style=pypinyin.STYLE_FIRST_LETTER))
-                    
+                    segments = re.findall(r"[\u4e00-\u9fff]+|[^\u4e00-\u9fff]+", protected_name)
+                    out_parts = []
+                    for idx, seg in enumerate(segments):
+                        if re.fullmatch(r"[\u4e00-\u9fff]+", seg):
+                            py = " ".join(
+                                p.capitalize()
+                                for p in pypinyin.lazy_pinyin(seg, style=pypinyin.Style.NORMAL)
+                            )
+                            if out_parts and re.search(r"[A-Za-z0-9]$", out_parts[-1]):
+                                py = " " + py
+                            if idx + 1 < len(segments) and re.match(r"^[A-Za-z0-9]", segments[idx + 1]):
+                                py = py + " "
+                            out_parts.append(py)
+                        else:
+                            out_parts.append(seg)
+                    pinyin_name = "".join(out_parts)
+
                     for placeholder, original in placeholders:
                         pinyin_name = pinyin_name.replace(placeholder, original)
                         pinyin_name = pinyin_name.replace(placeholder.lower(), original)
-                        
-                    new_name = pinyin_name
-                    pinyin_success = True
+
+                    return pinyin_name, new_replacements
                 except Exception as pe:
-                    logger.error(f"❌ 拼音首字母替换失败: {pe}")
-                    new_name = old_name
+                    logger.error(f"❌ 拼音全拼替换失败: {pe}")
 
-            if pinyin_success:
-                return new_name, new_replacements
-
-            # 4. 兜底：敏感词映射表
-            if pattern:
-                def replace_func(match):
-                    matched_str = match.group(0)
-                    return mapping_lower.get(matched_str.lower(), matched_str)
-                new_name = pattern.sub(replace_func, old_name)
-
-            return new_name, new_replacements
+            return old_name, new_replacements
 
         renamed_count = 0
         try:

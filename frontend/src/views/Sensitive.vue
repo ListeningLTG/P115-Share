@@ -8,7 +8,7 @@
         <div style="padding-top: 16px">
           <a-alert
             message="功能说明"
-            description="此处开关仅对 TG 机器人接收并自动转存分享的链接生效。对于定时分享任务或批量转存分享任务，请在各自任务的配置中单独开启和设置敏感词替换与拼音首字母替换规则。这里的敏感词映射表是全局共享的，所有启用敏感词替换的任务都会使用本映射表。"
+            description="此处开关仅对 TG 机器人接收并自动转存分享的链接生效。对于定时分享任务或批量转存分享任务，请在各自任务的配置中单独开启和设置敏感词替换与拼音全拼替换规则。这里的敏感词映射表是全局共享的，所有启用敏感词替换的任务都会使用本映射表。"
             type="info"
             show-icon
             style="margin-bottom: 24px"
@@ -20,28 +20,35 @@
                 <a-switch v-model:checked="replaceEnabled" />
               </a-form-item>
 
-              <a-form-item label="启用中文名称替换为拼音首字母">
+              <a-form-item label="启用中文名称替换为拼音全拼">
                 <template #extra>
                   <div style="font-size: 12px; color: #999; margin-top: 4px">
-                    开启后，生成分享前对文件和目录的所有中文名称替换为拼音首字母。仅在启用敏感词替换时生效。
+                    开启后，生成分享前将文件和目录名中的中文替换为拼音全拼（如「斗破苍穹」→「Duo Po Cang Qiong」）。优先级最低（映射表、TMDB 均未命中时才生效）。仅在启用敏感词替换时生效。
                   </div>
                 </template>
                 <a-switch v-model:checked="replacePinyin" :disabled="!replaceEnabled" />
               </a-form-item>
 
-              <a-form-item label="启用 TMDB 别名替换" v-if="isTmdbConfigured">
+              <a-form-item label="启用 TMDB 别名替换">
                 <template #extra>
                   <div style="font-size: 12px; color: #999; margin-top: 4px">
-                    开启后，若中文名称的文件或目录具有 TMDB ID 标识，优先使用 TMDB 英文/原版别名替换其中文名称。仅在启用敏感词替换时生效。
+                    开启后，若中文名称的文件或目录具有 TMDB ID 标识，使用 TMDB 英文/原版别名替换其中文名称。优先级次于敏感词映射表。仅在启用敏感词替换时生效。
                   </div>
                 </template>
-                <a-switch v-model:checked="replaceTmdb" :disabled="!replaceEnabled" />
+                <a-tooltip :title="tmdbDisabledTip">
+                  <span style="display: inline-block">
+                    <a-switch
+                      v-model:checked="replaceTmdb"
+                      :disabled="!replaceEnabled || !isTmdbConfigured"
+                    />
+                  </span>
+                </a-tooltip>
               </a-form-item>
 
               <a-form-item label="敏感词映射表 (JSON 格式)">
                 <template #extra>
                   <div style="font-size: 12px; color: #999; margin-top: 4px">
-                    请输入一个标准的 JSON 对象格式的映射表。键为需要被替换的敏感词，值为替换后的词。
+                    请输入一个标准的 JSON 对象格式的映射表。键为需要被替换的敏感词，值为替换后的词。命中映射表时优先级最高，不再走 TMDB / 拼音替换。
                     <br />
                     示例：<code>{"斗破苍穹": "dpcq", "凡人修仙传": "frxxz", "违规词": "xxx"}</code>
                   </div>
@@ -185,7 +192,7 @@
 </template>
 
 <script setup lang="ts">
-import { reactive, ref, onMounted } from 'vue';
+import { reactive, ref, computed, onMounted } from 'vue';
 import axios from 'axios';
 import { message } from 'ant-design-vue';
 
@@ -199,6 +206,15 @@ const replacePinyin = ref(false);
 const replaceTmdb = ref(false);
 const savingReplace = ref(false);
 const isTmdbConfigured = ref(false);
+const tmdbDisabledTip = computed(() => {
+  if (!isTmdbConfigured.value) {
+    return '请先在系统配置中填写 TMDB API Key';
+  }
+  if (!replaceEnabled.value) {
+    return '请先启用敏感词替换';
+  }
+  return '';
+});
 
 interface CacheItem {
   id: number;
@@ -262,8 +278,8 @@ const loadReplaceConfig = async () => {
     replaceEnabled.value = res.data.sensitive_replace_enabled || false;
     replaceMappingStr.value = res.data.sensitive_replace_mapping || '{}';
     replacePinyin.value = res.data.sensitive_replace_pinyin || false;
-    replaceTmdb.value = res.data.sensitive_replace_tmdb || false;
     isTmdbConfigured.value = !!res.data.tmdb_api_key;
+    replaceTmdb.value = isTmdbConfigured.value ? (res.data.sensitive_replace_tmdb || false) : false;
   } catch (e) {
     console.error('加载敏感词替换配置失败:', e);
     message.error('加载替换配置失败');
@@ -303,7 +319,7 @@ const saveReplaceConfig = async () => {
       sensitive_replace_enabled: replaceEnabled.value,
       sensitive_replace_mapping: replaceMappingStr.value,
       sensitive_replace_pinyin: replacePinyin.value,
-      sensitive_replace_tmdb: replaceTmdb.value
+      sensitive_replace_tmdb: isTmdbConfigured.value ? replaceTmdb.value : false
     });
     if (res.data.status === 'success') {
       message.success('替换配置已保存');

@@ -41,6 +41,11 @@
             {{ getShareModeText(record.share_mode) }}
           </a-tag>
         </template>
+        <template v-if="column.key === 'cleanup_temp_dir'">
+          <a-tag :color="record.share_mode === 'direct' ? 'default' : (record.cleanup_temp_dir ? 'red' : 'default')">
+            {{ record.share_mode === 'direct' ? '不适用' : (record.cleanup_temp_dir ? '清理并清空回收站' : '保留') }}
+          </a-tag>
+        </template>
         <template v-if="column.key === 'min_size'">
           <a-tag :color="record.min_size > 0 ? 'purple' : 'default'">
             {{ record.min_size > 0 ? `≥ ${record.min_size} ${record.min_size_unit}` : '不检测' }}
@@ -139,6 +144,17 @@
           </a-select>
         </a-form-item>
 
+        <a-form-item
+          v-if="formState.share_mode === 'move' || formState.share_mode === 'copy'"
+          label="清理临时目录"
+          name="cleanup_temp_dir"
+        >
+          <a-switch v-model:checked="formState.cleanup_temp_dir" />
+          <div style="font-size: 12px; color: #999; margin-top: 4px">
+            开启后，分享创建并推送成功后会删除本次临时目录，并清空该 115 账号的整个回收站；关闭则保留临时目录且不清空回收站。
+          </div>
+        </a-form-item>
+
         <a-form-item label="最小容量触发阈值" name="min_size">
           <template #extra>
             <div style="font-size: 12px; color: #999; margin-top: 4px">
@@ -182,23 +198,30 @@
           <a-switch v-model:checked="formState.sensitive_replace_enabled" />
         </a-form-item>
 
-        <a-form-item label="启用中文名称替换为拼音首字母" name="sensitive_replace_pinyin" v-if="formState.sensitive_replace_enabled">
+        <a-form-item label="启用中文名称替换为拼音全拼" name="sensitive_replace_pinyin" v-if="formState.sensitive_replace_enabled">
           <a-switch v-model:checked="formState.sensitive_replace_pinyin" />
           <div style="font-size: 11px; color: #888; margin-top: 4px">
-            开启后，生成分享前对文件和目录的所有中文名称替换为拼音首字母。
+            开启后，将中文名替换为拼音全拼，如「斗破苍穹」→「Duo Po Cang Qiong」（映射表、TMDB 均未命中时才生效）。
           </div>
         </a-form-item>
 
-        <a-form-item label="启用 TMDB 别名替换" name="sensitive_replace_tmdb" v-if="formState.sensitive_replace_enabled && isTmdbConfigured">
-          <a-switch v-model:checked="formState.sensitive_replace_tmdb" />
+        <a-form-item label="启用 TMDB 别名替换" name="sensitive_replace_tmdb" v-if="formState.sensitive_replace_enabled">
+          <a-tooltip :title="!isTmdbConfigured ? '请先在系统配置中填写 TMDB API Key' : ''">
+            <span style="display: inline-block">
+              <a-switch
+                v-model:checked="formState.sensitive_replace_tmdb"
+                :disabled="!isTmdbConfigured"
+              />
+            </span>
+          </a-tooltip>
           <div style="font-size: 11px; color: #888; margin-top: 4px">
-            开启后，若中文名称的文件或目录具有 TMDB ID 标识，优先使用 TMDB 英文/原版别名替换其中文名称。
+            开启后，若中文名称的文件或目录具有 TMDB ID 标识，使用 TMDB 英文/原版别名替换其中文名称（优先级次于敏感词映射表）。
           </div>
         </a-form-item>
       </a-form>
       
-      <div v-if="formState.share_mode === 'move' || formState.share_mode === 'copy'" style="margin-top: 12px">
-        <a-alert message="安全警示" description="此任务在执行后会清空 115 账号下的回收站，以彻底删除复制生成的临时文件夹。请确保回收站内没有其他需要保留的文件！" type="warning" show-icon />
+      <div v-if="(formState.share_mode === 'move' || formState.share_mode === 'copy') && formState.cleanup_temp_dir" style="margin-top: 12px">
+        <a-alert message="安全警示" description="此任务会在分享成功后删除临时目录，并清空该 115 账号的整个回收站。请确保回收站中没有需要保留的文件。" type="warning" show-icon />
       </div>
     </a-modal>
   </div>
@@ -219,6 +242,7 @@ interface Task {
   cron_expression: string;
   clear_files: boolean;
   share_mode: string;
+  cleanup_temp_dir: boolean;
   min_size: number;
   min_size_unit: string;
   target_channels: string[];
@@ -249,6 +273,7 @@ const columns = [
   { title: 'Cron表达式', key: 'cron_expression', dataIndex: 'cron_expression' },
   { title: '推送频道', key: 'target_channels', dataIndex: 'target_channels' },
   { title: '文件处理模式', key: 'share_mode', dataIndex: 'share_mode' },
+  { title: '临时目录', key: 'cleanup_temp_dir', dataIndex: 'cleanup_temp_dir' },
   { title: '容量检测阈值', key: 'min_size', dataIndex: 'min_size' },
   { title: '运行状态', key: 'status', dataIndex: 'status' },
   { title: '启用', key: 'enabled', dataIndex: 'enabled' },
@@ -273,6 +298,7 @@ const formState = reactive({
   cron_expression: '',
   clear_files: true,
   share_mode: 'move',
+  cleanup_temp_dir: true,
   min_size: 0.0,
   min_size_unit: 'GB',
   target_channels: [] as string[],
@@ -364,6 +390,9 @@ const loadChannels = async () => {
   try {
     const res = await axios.get('/api/config/');
     isTmdbConfigured.value = !!res.data.tmdb_api_key;
+    if (!isTmdbConfigured.value) {
+      formState.sensitive_replace_tmdb = false;
+    }
     if (res.data.tg_channels) {
       try {
         availableChannels.value = JSON.parse(res.data.tg_channels) || [];
@@ -385,6 +414,7 @@ const openCreateModal = () => {
   formState.cron_expression = '0 3 * * *';
   formState.clear_files = true;
   formState.share_mode = 'move';
+  formState.cleanup_temp_dir = true;
   formState.min_size = 0.0;
   formState.min_size_unit = 'GB';
   formState.target_channels = [];
@@ -403,13 +433,16 @@ const openEditModal = (record: Task) => {
   formState.cron_expression = record.cron_expression;
   formState.clear_files = record.clear_files;
   formState.share_mode = record.share_mode || (record.clear_files ? 'move' : 'copy');
+  formState.cleanup_temp_dir = record.cleanup_temp_dir ?? true;
   formState.min_size = record.min_size ?? 0.0;
   formState.min_size_unit = record.min_size_unit ?? 'GB';
   formState.target_channels = [...(record.target_channels || [])];
   formState.enabled = record.enabled;
   formState.sensitive_replace_enabled = record.sensitive_replace_enabled ?? false;
   formState.sensitive_replace_pinyin = record.sensitive_replace_pinyin ?? false;
-  formState.sensitive_replace_tmdb = record.sensitive_replace_tmdb ?? false;
+  formState.sensitive_replace_tmdb = isTmdbConfigured.value
+    ? (record.sensitive_replace_tmdb ?? false)
+    : false;
   modalVisible.value = true;
 };
 
@@ -419,6 +452,9 @@ const handleModalOk = async () => {
     modalSubmitting.value = true;
     
     const payload = { ...formState };
+    if (!isTmdbConfigured.value) {
+      payload.sensitive_replace_tmdb = false;
+    }
     if (payload.min_size === null || payload.min_size === undefined || (payload.min_size as any) === '') {
       payload.min_size = 0.0;
     }

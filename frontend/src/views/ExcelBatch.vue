@@ -303,12 +303,19 @@
                     <a-switch v-model:checked="sensitiveReplaceEnabled" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
                   </div>
                   <div class="form-item" style="flex: 1; margin-left: 24px" v-if="sensitiveReplaceEnabled">
-                    <label>启用中文名称替换为拼音首字母</label>
+                    <label>启用中文名称替换为拼音全拼</label>
                     <a-switch v-model:checked="sensitiveReplacePinyin" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
                   </div>
-                  <div class="form-item" style="flex: 1; margin-left: 24px" v-if="sensitiveReplaceEnabled && isTmdbConfigured">
+                  <div class="form-item" style="flex: 1; margin-left: 24px" v-if="sensitiveReplaceEnabled">
                     <label>启用 TMDB 别名替换</label>
-                    <a-switch v-model:checked="sensitiveReplaceTmdb" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
+                    <a-tooltip :title="!isTmdbConfigured ? '请先在系统配置中填写 TMDB API Key' : ''">
+                      <span style="display: inline-block">
+                        <a-switch
+                          v-model:checked="sensitiveReplaceTmdb"
+                          :disabled="!isTmdbConfigured || ['running', 'pausing', 'cancelling'].includes(currentTask?.status)"
+                        />
+                      </span>
+                    </a-tooltip>
                   </div>
                 </div>
 
@@ -612,6 +619,9 @@ const fetchSettings = async () => {
   try {
     const res = await axios.get('/api/config/');
     isTmdbConfigured.value = !!res.data.tmdb_api_key;
+    if (!isTmdbConfigured.value) {
+      sensitiveReplaceTmdb.value = false;
+    }
     if (res.data.p115_save_dir) {
       systemSaveDir.value = res.data.p115_save_dir;
     }
@@ -681,7 +691,9 @@ const fetchCurrentTask = async () => {
       if (updatedTask.share_interval !== undefined) shareInterval.value = updatedTask.share_interval || 0;
       if (updatedTask.sensitive_replace_enabled !== undefined) sensitiveReplaceEnabled.value = updatedTask.sensitive_replace_enabled || false;
       if (updatedTask.sensitive_replace_pinyin !== undefined) sensitiveReplacePinyin.value = updatedTask.sensitive_replace_pinyin || false;
-      if (updatedTask.sensitive_replace_tmdb !== undefined) sensitiveReplaceTmdb.value = updatedTask.sensitive_replace_tmdb || false;
+      if (updatedTask.sensitive_replace_tmdb !== undefined) {
+        sensitiveReplaceTmdb.value = isTmdbConfigured.value ? (updatedTask.sensitive_replace_tmdb || false) : false;
+      }
     }
   } catch (e) {
     console.error('获取任务详情失败', e);
@@ -735,7 +747,7 @@ const selectTask = (id: number) => {
   shareInterval.value = task?.share_interval || 0;
   sensitiveReplaceEnabled.value = task?.sensitive_replace_enabled || false;
   sensitiveReplacePinyin.value = task?.sensitive_replace_pinyin || false;
-  sensitiveReplaceTmdb.value = task?.sensitive_replace_tmdb || false;
+  sensitiveReplaceTmdb.value = isTmdbConfigured.value ? (task?.sensitive_replace_tmdb || false) : false;
   
   pagination.current = 1;
   pagination.pageSize = 50;
@@ -838,7 +850,7 @@ const handleStartTask = async (forceParam?: any) => {
       share_interval: taskStrategy.value === 'direct_save' ? shareInterval.value : 0,
       sensitive_replace_enabled: sensitiveReplaceEnabled.value,
       sensitive_replace_pinyin: sensitiveReplacePinyin.value,
-      sensitive_replace_tmdb: sensitiveReplaceTmdb.value
+      sensitive_replace_tmdb: isTmdbConfigured.value ? sensitiveReplaceTmdb.value : false
     });
     message.success(isResume ? '正在继续...' : '正在启动...');
     await fetchTasks();
