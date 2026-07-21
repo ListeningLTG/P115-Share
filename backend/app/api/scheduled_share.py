@@ -84,7 +84,7 @@ async def list_tasks(user=Depends(get_current_user)):
                     "target_channels": t.target_channels,
                     "enabled": t.enabled,
                     "status": t.status,
-                    "last_run_at": t.last_run_at.isoformat() if t.last_run_at else None,
+                    "last_run_at": (t.last_run_at.isoformat() + "Z") if t.last_run_at else None,
                     "created_at": t.created_at.isoformat() if t.created_at else None,
                     "sensitive_replace_enabled": t.sensitive_replace_enabled,
                     "sensitive_replace_pinyin": t.sensitive_replace_pinyin,

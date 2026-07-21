@@ -358,17 +358,33 @@ class AccountManager:
         return True
 
     async def test_account_connection(self, account_id: int) -> dict:
-        """测试账号连接（验证 Cookie 有效性）"""
+        """测试账号连接（验证 Cookie 有效性）。禁用账号也可测试，不纳入调度池。"""
+        from app.services.p115 import P115Service
+
         svc = self._services.get(account_id)
+        temporary = False
         if not svc:
-            return {"success": False, "message": "账号不存在或未启用"}
+            async with async_session() as session:
+                result = await session.execute(
+                    select(P115Account).where(P115Account.id == account_id)
+                )
+                acc = result.scalar_one_or_none()
+            if not acc:
+                return {"success": False, "message": "账号不存在"}
+            svc = P115Service(account=acc)
+            if acc.cookie:
+                svc.init_client(acc.cookie)
+            temporary = True
+
         if not svc.client:
             return {"success": False, "message": "客户端未初始化，请检查 Cookie"}
         ok = await svc.verify_connection()
         if ok:
+            # 仅启用账号才进入调度池；禁用账号只做连通性验证
+            if temporary and svc.account.enabled:
+                self._services[account_id] = svc
             return {"success": True, "message": "连接成功，Cookie 有效"}
-        else:
-            return {"success": False, "message": "连接失败，请检查 Cookie 是否过期"}
+        return {"success": False, "message": "连接失败，请检查 Cookie 是否过期"}
 
     # ─────────────────────────────────────────────
     # 全局配置

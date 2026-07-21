@@ -60,13 +60,12 @@
           扫描中: {{ scannedCount }} / {{ statsTotal }} ({{ statsTotal > 0 ? (scannedCount / statsTotal * 100).toFixed(2) : 0 }}%)
         </div>
 
-        <!-- 搜索和筛选：仅在有分析结果时显示 -->
-        <template v-if="statsTotal > 0">
+        <!-- 搜索和筛选：有扫描进度或分析结果时即可用 -->
+        <template v-if="statsTotal > 0 || scannedCount > 0">
           <a-input-search
             v-model:value="searchText"
             placeholder="搜索分享名称..."
             style="width: 260px"
-            :disabled="isAnalyzing"
             @search="onSearch"
           />
           <div class="filter-box">
@@ -74,7 +73,6 @@
             <a-select
               v-model:value="statusFilter"
               style="width: 130px"
-              :disabled="isAnalyzing"
               @change="onFilterChange"
             >
               <a-select-option value="all">全部</a-select-option>
@@ -116,7 +114,11 @@
       </template>
       <template #bodyCell="{ column, record }">
         <template v-if="column.key === 'share_title'">
-          <a :href="record.share_url" target="_blank">{{ record.share_title }}</a>
+          <a
+            class="share-title-copy"
+            title="点击复制分享名称"
+            @click.prevent="copyShareTitle(record.share_title)"
+          >{{ record.share_title }}</a>
         </template>
         <template v-if="column.key === 'status_text'">
           <a-tag :color="getStatusColor(record)">
@@ -412,11 +414,8 @@ const onAccountChange = async () => {
   statsInvalid.value = 0; statsExpired.value = 0; statsReviewing.value = 0; scannedCount.value = 0;
   lastUpdated.value = ''; shareData.value = [];
   pagination.value.total = 0;
-  // 加载新账号的状态
+  // 加载新账号状态（扫描中也会拉取已入库数据）
   await pollAnalysisStatus();
-  if (!isAnalyzing.value && statsTotal.value > 0) {
-    fetchShares(1, pagination.value.pageSize);
-  }
 };
 
 const columns = [
@@ -444,8 +443,8 @@ const getStatusColor = (record: any) => {
   return 'success';
 };
 
-const fetchShares = async (page = 1, pageSize = 10) => {
-  loading.value = true;
+const fetchShares = async (page = 1, pageSize = 10, silent = false) => {
+  if (!silent) loading.value = true;
   try {
     let orderField = sortField.value;
     if (sortField.value === 'status_text') orderField = 'share_state';
@@ -473,7 +472,7 @@ const fetchShares = async (page = 1, pageSize = 10) => {
   } catch (error) {
     message.error('加载本地分析结果失败');
   } finally {
-    loading.value = false;
+    if (!silent) loading.value = false;
   }
 };
 
@@ -501,6 +500,9 @@ const pollAnalysisStatus = async () => {
         message.success('全量分析完成');
       }
       fetchShares(pagination.value.current, pagination.value.pageSize);
+    } else if (data.scanned > 0) {
+      // 扫描中静默刷新，支持实时查看/筛选已入库数据
+      fetchShares(pagination.value.current, pagination.value.pageSize, true);
     }
   } catch (error) {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
@@ -519,6 +521,8 @@ const startFullAnalysis = async () => {
       scannedCount.value = 0;
       statsNormal.value = 0; statsViolated.value = 0;
       statsExpired.value = 0; statsReviewing.value = 0;
+      shareData.value = [];
+      pagination.value.total = 0;
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = setInterval(pollAnalysisStatus, 2000);
       message.info('分析任务已在后台启动');
@@ -644,9 +648,26 @@ const cancelInvalidExpired = async () => {
   });
 };
 
+const copyShareTitle = async (title: string) => {
+  if (!title) return;
+  try {
+    await navigator.clipboard.writeText(title);
+    message.success('已复制分享名称');
+  } catch {
+    message.error('复制失败');
+  }
+};
+
 const openLink = (record: any) => {
   const url = record.receive_code ? `${record.share_url}?password=${record.receive_code}` : record.share_url;
-  window.open(url, '_blank');
+  // 用 <a> 打开，避免 window.open 被目标站 window.close() 自动关掉
+  const a = document.createElement('a');
+  a.href = url;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
 };
 
 const handleExport = async ({ key }: { key: string }) => {
@@ -912,5 +933,9 @@ onUnmounted(() => {
   align-items: center;
   flex-wrap: wrap;
   gap: 4px;
+}
+
+.share-title-copy {
+  cursor: pointer;
 }
 </style>

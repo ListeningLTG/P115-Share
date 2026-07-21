@@ -361,7 +361,9 @@ const getStatusText = (status: string) => {
 
 const formatDate = (dateStr: string | null) => {
   if (!dateStr) return '暂未运行';
-  return dayjs(dateStr).format('YYYY-MM-DD HH:mm:ss');
+  // 后端存 UTC 无时区标记；补 Z 后由 dayjs 转成本地时间显示
+  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(dateStr) ? dateStr : `${dateStr}Z`;
+  return dayjs(normalized).format('YYYY-MM-DD HH:mm:ss');
 };
 
 const loadTasks = async () => {
