@@ -47,6 +47,27 @@ def _is_plaintext_share_url(url: str) -> bool:
 
 
 _decrypt_lock = asyncio.Lock()
+# RT 密文 → 明文缓存，避免同进程重复解密，也方便日志/TG 展示
+_rt_decrypt_cache: dict[str, str] = {}
+
+
+def get_cached_plaintext_url(url: str) -> Optional[str]:
+    """若已解密过该 RT 链接，返回缓存的明文；否则返回 None。"""
+    if not url:
+        return None
+    if not is_rt_encrypted_url(url):
+        return url
+    return _rt_decrypt_cache.get(url)
+
+
+def resolve_display_share_url(url: str, save_res: Optional[dict] = None) -> str:
+    """优先取处理结果中的明文链接，其次缓存，最后回退原始 URL。"""
+    if isinstance(save_res, dict):
+        candidate = save_res.get("share_url") or save_res.get("display_url")
+        if candidate and not is_rt_encrypted_url(candidate):
+            return candidate
+    cached = get_cached_plaintext_url(url)
+    return cached or url
 
 
 async def _get_drive115_account_id() -> Optional[str]:
@@ -113,6 +134,9 @@ async def decrypt_rt_share_url(url: str, poll_interval: float = 2.0, max_wait: i
         raise MHDecryptError("MediaHelper 用户名或密码未配置，无法解密 RT 加密链接")
 
     async with _decrypt_lock:
+        if url in _rt_decrypt_cache:
+            return _rt_decrypt_cache[url]
+
         account_id = await _get_drive115_account_id()
         if not account_id:
             raise MHDecryptError("MediaHelper 中未配置可用的 115 网盘账号")
@@ -187,6 +211,7 @@ async def decrypt_rt_share_url(url: str, poll_interval: float = 2.0, max_wait: i
         if not parsed.scheme or not parsed.netloc:
             raise MHDecryptError(f"MH 返回的明文链接无效: {plaintext}")
 
+        _rt_decrypt_cache[url] = plaintext
         return plaintext
 
 

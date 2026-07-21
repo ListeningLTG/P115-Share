@@ -5,6 +5,7 @@ from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiohttp_socks import ProxyConnector
 from app.core.config import settings
 from app.services.p115 import p115_service
+from app.services.mh_decrypt import resolve_display_share_url
 from loguru import logger
 import asyncio
 import re
@@ -328,8 +329,9 @@ class TGService:
                     if history_share_link:
                         logger.info(f"✨ [{index}/{total_links}] 发现历史记录: {share_url}")
                         processed_links[share_url] = history_share_link
+                        display_url = resolve_display_share_url(share_url)
                         await message.reply(f"✅ 处理成功！\n长期分享链接：\n{history_share_link}")
-                        await message.reply(f"🔔 链接保存成功！\n原链接: {share_url}\n新分享: {history_share_link}")
+                        await message.reply(f"🔔 链接保存成功！\n原链接: {display_url}\n新分享: {history_share_link}")
                         return True, history_share_link
 
                 # 1. Check restriction & queue status
@@ -373,9 +375,10 @@ class TGService:
                             acc_name = save_svc.account.name if save_svc.account else "默认账号"
                             names = save_res.get("names", [])
                             names_str = ", ".join(names[:3]) + ("..." if len(names) > 3 else "")
+                            display_url = resolve_display_share_url(share_url, save_res)
                             await message.reply(
                                 f"✅ 直接保存成功！\n"
-                                f"原链接: {share_url}\n"
+                                f"原链接: {display_url}\n"
                                 f"保存账号: {acc_name}\n"
                                 f"保存路径: {settings.DIRECT_SAVE_DIR}\n"
                                 f"包含项目: {names_str}"
@@ -386,10 +389,11 @@ class TGService:
                             return "skipped", None
                         elif save_res.get("status") == "pending":
                             reason = save_res.get("reason", "auditing")
+                            display_url = resolve_display_share_url(share_url, save_res)
                             if reason == "restricted":
-                                logger.info(f"🚫 账号受限排队中: {share_url}")
+                                logger.info(f"🚫 账号受限排队中: {display_url}")
                             else:
-                                logger.info(f"🔍 分享链接正在审核中: {share_url}")
+                                logger.info(f"🔍 分享链接正在审核中: {display_url}")
                             
                             asyncio.create_task(self.poll_pending_link(message, save_res))
                             return save_res, None
@@ -423,8 +427,9 @@ class TGService:
                                 await message.reply(f"📦 递归保存中产生的中间链接：\n{links_text}")
 
                             # Send detailed success messages to sender
+                            display_url = resolve_display_share_url(share_url, save_res)
                             await message.reply(f"✅ 处理成功！\n长期分享链接：\n{share_link}")
-                            await message.reply(f"🔔 链接保存成功！\n原链接: {share_url}\n新分享: {share_link}")
+                            await message.reply(f"🔔 链接保存成功！\n原链接: {display_url}\n新分享: {share_link}")
                             return True, share_link
                     elif save_res.get("status") == "skipped":
                         msg_text = "⚠️ 此分享链接为大包，已跳过处理"
@@ -433,18 +438,20 @@ class TGService:
                     elif save_res.get("status") == "pending":
                         # Handle different pending reasons
                         reason = save_res.get("reason", "auditing")
+                        display_url = resolve_display_share_url(share_url, save_res)
                         if reason == "restricted":
-                            logger.info(f"🚫 账号受限排队中: {share_url}")
+                            logger.info(f"🚫 账号受限排队中: {display_url}")
                         else:
-                            logger.info(f"🔍 分享链接正在审核中: {share_url}")
+                            logger.info(f"🔍 分享链接正在审核中: {display_url}")
                         
                         asyncio.create_task(self.poll_pending_link(message, save_res))
                         return save_res, None
                     elif save_res.get("status") == "margin_limited":
-                        logger.info(f"⏳ 分享被限制 (margin)，已加入排队: {share_url}")
+                        display_url = resolve_display_share_url(share_url, save_res)
+                        logger.info(f"⏳ 分享排队 (限速/405)，已加入排队: {display_url}")
                         await message.reply(
-                            f"⏳ 分享被限制，文件已转存成功。\n"
-                            f"系统将在检测到解除限制后，自动继续创建分享并推送。\n"
+                            f"⏳ 分享暂受限或接口风控，文件已转存成功。\n"
+                            f"系统将每 5 分钟自动补推分享链接（最多约 2.5 小时）。\n"
                             f"📋 当前排队: {svc.margin_queue_size} 个任务"
                         )
                         return save_res, None
@@ -781,11 +788,12 @@ class TGService:
                 if command_mode == "save":
                     save_res = await save_svc.save_share_link(share_url, metadata=metadata, target_dir=settings.DIRECT_SAVE_DIR, db_id=pending_info.get("db_id"))
                     if save_res and save_res.get("status") == "success":
-                        logger.info(f"✅ 审核通过后直接保存成功: {share_url}")
+                        display_url = resolve_display_share_url(share_url, save_res)
+                        logger.info(f"✅ 审核通过后直接保存成功: {display_url}")
                         acc_name = save_svc.account.name if save_svc.account else "默认账号"
                         names = save_res.get("names", [])
                         names_str = ", ".join(names[:3]) + ("..." if len(names) > 3 else "")
-                        success_text = f"✅ 直接保存成功！\n原链接: {share_url}\n保存账号: {acc_name}\n保存路径: {settings.DIRECT_SAVE_DIR}\n包含项目: {names_str}"
+                        success_text = f"✅ 直接保存成功！\n原链接: {display_url}\n保存账号: {acc_name}\n保存路径: {settings.DIRECT_SAVE_DIR}\n包含项目: {names_str}"
                         if not silent:
                             await message.reply(success_text)
                         
@@ -801,11 +809,13 @@ class TGService:
                         return
                     elif save_res and save_res.get("status") == "pending":
                         new_reason = save_res.get("reason", reason)
-                        logger.warning(f"⚠️ 尝试直接保存时再次返回排队状态(原因: {new_reason})，维持轮询: {share_url}")
+                        display_url = resolve_display_share_url(share_url, save_res)
+                        logger.warning(f"⚠️ 尝试直接保存时再次返回排队状态(原因: {new_reason})，维持轮询: {display_url}")
                         reason = new_reason
                         continue
                     else:
-                        logger.error(f"❌ 审核通过后直接保存仍然失败: {share_url}")
+                        display_url = resolve_display_share_url(share_url, save_res if isinstance(save_res, dict) else None)
+                        logger.error(f"❌ 审核通过后直接保存仍然失败: {display_url}")
                         error_msg = "自动直接保存失败，请手动尝试"
                         if isinstance(save_res, dict) and save_res.get("message"):
                             error_msg = save_res.get("message")
@@ -818,7 +828,8 @@ class TGService:
                 save_res = await svc.save_and_share(share_url, metadata=metadata, db_id=pending_info.get("db_id"))
                 
                 if save_res and save_res.get("status") == "success":
-                    logger.info(f"✅ 审核通过后转存成功: {share_url}")
+                    display_url = resolve_display_share_url(share_url, save_res)
+                    logger.info(f"✅ 审核通过后转存成功: {display_url}")
                     share_link = save_res.get("share_link")
                     
                     if share_link:
@@ -827,7 +838,7 @@ class TGService:
                         await self.broadcast_to_channels({share_url: share_link}, metadata)
                         
                         # Use the title if available or a generic success msg
-                        success_text = f"✅ 处理完成！\n原链接: {share_url}\n新分享: {share_link}"
+                        success_text = f"✅ 处理完成！\n原链接: {display_url}\n新分享: {share_link}"
                         
                         # 管理员通知不受 silent 影响（除非 chat ID 本身就是管理员）
                         is_admin_chat = settings.TG_USER_ID and str(message.chat.id) == str(settings.TG_USER_ID)
@@ -851,11 +862,25 @@ class TGService:
                     return 
                 elif save_res and save_res.get("status") == "pending":
                     new_reason = save_res.get("reason", reason)
-                    logger.warning(f"⚠️ 尝试转存时再次返回排队状态(原因: {new_reason})，维持轮询: {share_url}")
+                    display_url = resolve_display_share_url(share_url, save_res)
+                    logger.warning(f"⚠️ 尝试转存时再次返回排队状态(原因: {new_reason})，维持轮询: {display_url}")
                     reason = new_reason
                     continue
+                elif save_res and save_res.get("status") == "margin_limited":
+                    display_url = resolve_display_share_url(share_url, save_res)
+                    logger.info(f"⏳ 审核通过后分享排队 (限速/405): {display_url}")
+                    if not silent:
+                        await message.reply(
+                            f"⏳ 链接审核已通过，文件已转存成功。\n"
+                            f"分享暂受限或接口风控，系统将每 5 分钟自动补推分享链接（最多约 2.5 小时）。\n"
+                            f"原链接: {share_url}\n"
+                            f"📋 当前排队: {svc.margin_queue_size} 个任务"
+                        )
+                    await self._delete_pending_task(pending_info.get("db_id"))
+                    return
                 else:
-                    logger.error(f"❌ 审核通过后转存仍然失败: {share_url}")
+                    display_url = resolve_display_share_url(share_url, save_res if isinstance(save_res, dict) else None)
+                    logger.error(f"❌ 审核通过后转存仍然失败: {display_url}")
                     error_msg = "自动转存失败，请手动尝试"
                     if isinstance(save_res, dict):
                         if save_res.get("error_type") == "violated":

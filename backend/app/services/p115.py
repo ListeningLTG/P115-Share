@@ -87,6 +87,56 @@ def extract_tmdb_id_from_name(name: str) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
+def format_tmdb_tag(tmdb_id: int) -> str:
+    return f" {{tmdbid={tmdb_id}}}"
+
+
+def append_tmdb_tag_to_filename(name: str, tmdb_id: int) -> str:
+    """在扩展名前插入 {tmdbid=N}；已有 tmdb 标记则原样返回。"""
+    if not name or tmdb_id is None:
+        return name
+    if extract_tmdb_id_from_name(name) is not None:
+        return name
+    tag = format_tmdb_tag(tmdb_id)
+    if "." in name:
+        stem, ext = name.rsplit(".", 1)
+        if re.fullmatch(r"[A-Za-z0-9]{2,5}", ext):
+            return f"{stem.rstrip()}{tag}.{ext}"
+    return f"{name.rstrip()}{tag}"
+
+
+def alias_already_in_name(name: str, alias: str) -> bool:
+    """忽略大小写，按词边界/常见分隔符判断别名是否已出现在文件名中。"""
+    if not name or not alias:
+        return False
+    parts = [p for p in re.split(r"[\s._-]+", alias.strip()) if p]
+    if not parts:
+        return False
+    # 短别名（单字符）要求严格边界，降低误伤
+    if len(alias.strip()) <= 1:
+        return False
+    inner = r"[\s._-]+".join(re.escape(p) for p in parts)
+    pattern = rf"(?<![A-Za-z0-9]){inner}(?![A-Za-z0-9])"
+    return bool(re.search(pattern, name, flags=re.IGNORECASE))
+
+
+def strip_chinese_title(name: str, chinese_title: str) -> str:
+    """删除中文标题及紧邻分隔符，避免残留双点/双分隔符。"""
+    if not name or not chinese_title or chinese_title not in name:
+        return name
+    idx = name.find(chinese_title)
+    before = name[:idx]
+    after = name[idx + len(chinese_title):]
+    if after and after[0] in " ._-":
+        after = after[1:]
+    elif before and before[-1] in " ._-":
+        before = before[:-1]
+    result = before + after
+    result = re.sub(r"[._\-]{2,}", lambda m: m.group(0)[0], result)
+    result = re.sub(r"\s{2,}", " ", result)
+    return result
+
+
 def _strip_common_tags_for_media(name: str) -> str:
     cleaned = re.sub(r"(?i)(?:tmdbid|tmdb)\s*(?:=|:|[-_])?\s*\d+", "", name or "")
     cleaned = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", cleaned)
@@ -347,6 +397,21 @@ class P115Service:
             and "state" not in resp
             and "count" not in resp
         )
+
+    @staticmethod
+    def _is_405_error(exc) -> bool:
+        """检测是否为 115 API HTTP 405 / Method Not Allowed 风控。"""
+        msg = str(exc)
+        return "405" in msg or "method not allowed" in msg.lower()
+
+    @staticmethod
+    def _margin_limited_payload(save_result: dict, message: str, limit_reason: str = "margin") -> dict:
+        return {
+            "status": "margin_limited",
+            "save_result": save_result,
+            "message": message,
+            "limit_reason": limit_reason,
+        }
 
     def _get_ios_ua_kwargs(self):
         """获取 iOS 用户代理相关的参数"""
@@ -909,28 +974,42 @@ class P115Service:
                 if should_replace:
                     await self.replace_sensitive_words_in_dir(save_res["to_cid"], replace_enabled=should_replace, replace_pinyin=should_pinyin, replace_tmdb=should_tmdb)
                 share_res = await self.create_share_link(save_res)
+                result_share_url = save_res.get("share_url") or share_url
                 if isinstance(share_res, str):
-                    return {"status": "success", "share_link": share_res}
+                    return {
+                        "status": "success",
+                        "share_link": share_res,
+                        "share_url": result_share_url,
+                    }
                 elif isinstance(share_res, dict) and share_res.get("status") == "margin_limited":
-                    # margin 限速 → 入队等待
-                    self._enqueue_margin_retry(share_res.get("save_result"), metadata)
+                    # margin / 405 风控 → 入队，每 5 分钟补分享
+                    limit_reason = share_res.get("limit_reason", "margin")
+                    self._enqueue_margin_retry(
+                        share_res.get("save_result"),
+                        metadata,
+                        limit_reason=limit_reason,
+                    )
                     return {
                         "status": "margin_limited",
-                        "message": "分享被限制，将在检测到解除限制后继续分享",
-                        "share_url": share_url,
-                        "metadata": metadata or {}
+                        "message": share_res.get("message")
+                        or "分享暂受限或接口风控，文件已转存，将自动补推",
+                        "share_url": result_share_url,
+                        "metadata": metadata or {},
+                        "limit_reason": limit_reason,
                     }
                 elif isinstance(share_res, dict) and share_res.get("status") == "error":
                     # 将创建分享时的特定错误映射回转存结果
                     return {
                         "status": "error",
                         "error_type": share_res.get("error_type", "share_failed"),
-                        "message": share_res.get("message", "生成分享链接失败")
+                        "message": share_res.get("message", "生成分享链接失败"),
+                        "share_url": result_share_url,
                     }
                 return {
                     "status": "error",
                     "error_type": "share_failed",
-                    "message": "转存成功但生成分享链接失败"
+                    "message": "转存成功但生成分享链接失败",
+                    "share_url": result_share_url,
                 }
             return save_res
 
@@ -938,32 +1017,45 @@ class P115Service:
 
     # ── margin 限速排队重试机制 ────────────────────────────────
 
-    def _enqueue_margin_retry(self, save_result: dict, metadata: dict = None):
-        """将 margin 限速的任务加入排队队列，并启动后台轮询器"""
+    def _enqueue_margin_retry(self, save_result: dict, metadata: dict = None, limit_reason: str = "margin"):
+        """将 margin/405 限速任务加入排队队列，并启动后台轮询器（每 5 分钟，最多 30 次）"""
+        share_url = (save_result or {}).get("share_url", "")
         self._margin_retry_queue.append({
             "save_result": save_result,
             "metadata": metadata or {},
-            "share_url": save_result.get("share_url", ""),
-            "enqueue_time": time.time()
+            "share_url": share_url,
+            "enqueue_time": time.time(),
+            "attempt": 0,
+            "max_attempts": 30,
+            "limit_reason": limit_reason or "margin",
         })
         queue_len = len(self._margin_retry_queue)
-        logger.info(f"📋 margin 排队: {save_result.get('share_url', '?')} (队列长度: {queue_len})")
+        logger.info(
+            f"📋 分享排队({limit_reason or 'margin'}): {share_url or '?'} "
+            f"(队列长度: {queue_len}，间隔 5 分钟，最多 30 次)"
+        )
         self._ensure_margin_poller()
 
     def _ensure_margin_poller(self):
         """确保 margin 轮询器正在运行"""
         if self._margin_poller_task is None or self._margin_poller_task.done():
             self._margin_poller_task = asyncio.create_task(self._margin_retry_poller())
-            logger.info("🔄 margin 排队轮询器已启动")
+            logger.info("🔄 分享排队轮询器已启动（限速/405，间隔 5 分钟）")
 
     @property
     def margin_queue_size(self) -> int:
         return len(self._margin_retry_queue)
 
+    def _bump_margin_attempt(self, item: dict) -> tuple[int, int]:
+        """递增排队任务探测次数，返回 (attempt, max_attempts)。"""
+        item["attempt"] = int(item.get("attempt", 0) or 0) + 1
+        max_attempts = int(item.get("max_attempts", 30) or 30)
+        return item["attempt"], max_attempts
+
     async def _margin_retry_poller(self):
-        """后台每 5 分钟用队列头部任务探测限速是否解除，解除后逐个处理队列"""
+        """后台每 5 分钟用队列头部任务探测限速/405 是否解除，单任务最多 30 次。"""
         POLL_INTERVAL = 300  # 5 分钟
-        logger.info(f"⏰ margin 轮询器开始运行，队列中有 {len(self._margin_retry_queue)} 个任务")
+        logger.info(f"⏰ 分享排队轮询器开始运行，队列中有 {len(self._margin_retry_queue)} 个任务")
 
         while self._margin_retry_queue:
             await asyncio.sleep(POLL_INTERVAL)
@@ -974,58 +1066,72 @@ class P115Service:
             # 用队列第一个任务探测
             probe_item = self._margin_retry_queue[0]
             probe_url = probe_item.get("share_url", "?")
-            logger.info(f"🔍 margin 探测: 尝试为 {probe_url} 创建分享链接...")
+            logger.info(f"🔍 分享排队探测: 尝试为 {probe_url} 创建分享链接...")
 
             try:
                 result = await self.create_share_link(probe_item["save_result"])
             except Exception as e:
-                logger.error(f"❌ margin 探测异常: {e}")
+                logger.error(f"❌ 分享排队探测异常: {e}")
                 result = None
 
             # 判断探测结果
             if isinstance(result, str):
-                # 成功！限速已解除，处理这个任务并继续处理队列
-                logger.info(f"✅ margin 限速已解除！探测任务成功: {probe_url}")
+                # 成功！限制已解除，处理这个任务并继续处理队列
+                logger.info(f"✅ 分享排队限制已解除！探测任务成功: {probe_url}")
                 self._margin_retry_queue.popleft()
                 await self._margin_task_success(probe_item, result)
 
-                # 通知用户限速解除
                 try:
                     from app.services.tg_bot import tg_service
                     if tg_service:
                         remaining = len(self._margin_retry_queue)
                         await tg_service.send_admin_msg(
-                            f"🔓 115 分享限速已解除！\n"
+                            f"🔓 115 分享排队（限速/405）已恢复！\n"
                             f"✅ 已完成: {probe_url}\n"
                             f"📋 队列中还有 {remaining} 个待处理任务，正在逐个处理..."
                         )
                 except Exception as e:
-                    logger.warning(f"发送限速解除通知失败: {e}")
+                    logger.warning(f"发送分享排队恢复通知失败: {e}")
 
                 # 逐个处理剩余队列
                 while self._margin_retry_queue:
                     item = self._margin_retry_queue[0]
                     item_url = item.get("share_url", "?")
-                    logger.info(f"📤 margin 队列处理: {item_url}")
+                    logger.info(f"📤 分享排队处理: {item_url}")
                     try:
                         item_result = await self.create_share_link(item["save_result"])
                     except Exception as e:
-                        logger.error(f"❌ margin 队列处理异常: {item_url}: {e}")
+                        logger.error(f"❌ 分享排队处理异常: {item_url}: {e}")
                         item_result = None
 
                     if isinstance(item_result, str):
                         self._margin_retry_queue.popleft()
                         await self._margin_task_success(item, item_result)
                     elif isinstance(item_result, dict) and item_result.get("status") == "margin_limited":
-                        # 又被限速了，停止处理，等下一轮探测
-                        logger.warning(f"⚠️ 处理队列时再次触发 margin 限速，暂停处理")
+                        attempt, max_attempts = self._bump_margin_attempt(item)
+                        if attempt >= max_attempts:
+                            self._margin_retry_queue.popleft()
+                            logger.warning(
+                                f"⚠️ 分享排队已重试 {attempt}/{max_attempts} 次仍失败，跳过: {item_url}"
+                            )
+                            await self._margin_task_failed(item, {
+                                "message": (
+                                    f"分享排队（限速/405）已重试 {attempt} 次"
+                                    f"（约 {attempt * 5 / 60:.1f} 小时）仍失败"
+                                )
+                            })
+                            continue
+                        logger.warning(
+                            f"⚠️ 处理队列时再次触发分享限制 ({attempt}/{max_attempts})，暂停处理"
+                        )
                         try:
                             from app.services.tg_bot import tg_service
                             if tg_service:
                                 remaining = len(self._margin_retry_queue)
                                 await tg_service.send_admin_msg(
-                                    f"⚠️ 处理排队任务时再次触发分享限速，暂停处理。\n"
-                                    f"📋 剩余 {remaining} 个任务，将在 5 分钟后继续探测。"
+                                    f"⚠️ 处理排队任务时再次触发分享限制（限速/405），暂停处理。\n"
+                                    f"📋 剩余 {remaining} 个任务，将在 5 分钟后继续探测"
+                                    f"（当前头任务 {attempt}/{max_attempts}）。"
                                 )
                         except Exception:
                             pass
@@ -1033,23 +1139,39 @@ class P115Service:
                     else:
                         # 其他错误，跳过该任务
                         self._margin_retry_queue.popleft()
-                        logger.warning(f"⚠️ margin 队列任务失败，已跳过: {item_url}, 结果: {item_result}")
+                        logger.warning(f"⚠️ 分享排队任务失败，已跳过: {item_url}, 结果: {item_result}")
                         await self._margin_task_failed(item, item_result)
 
             elif isinstance(result, dict) and result.get("status") == "margin_limited":
-                # 仍然被限速，继续等待
+                attempt, max_attempts = self._bump_margin_attempt(probe_item)
                 remaining = len(self._margin_retry_queue)
-                logger.info(f"⏳ margin 探测: 仍在限速中，{remaining} 个任务排队等待，{POLL_INTERVAL}s 后再试")
+                if attempt >= max_attempts:
+                    self._margin_retry_queue.popleft()
+                    logger.warning(
+                        f"⚠️ 分享排队已重试 {attempt}/{max_attempts} 次"
+                        f"（约 {attempt * 5 / 60:.1f} 小时）仍失败，跳过: {probe_url}"
+                    )
+                    await self._margin_task_failed(probe_item, {
+                        "message": (
+                            f"分享排队（限速/405）已重试 {attempt} 次"
+                            f"（约 {attempt * 5 / 60:.1f} 小时）仍失败"
+                        )
+                    })
+                else:
+                    logger.info(
+                        f"⏳ 分享排队探测: 仍受限 ({attempt}/{max_attempts})，"
+                        f"{remaining} 个任务等待，{POLL_INTERVAL}s 后再试"
+                    )
             else:
-                # 探测返回其他错误（非 margin），跳过这个任务
+                # 探测返回其他错误（非 margin/405），跳过这个任务
                 self._margin_retry_queue.popleft()
-                logger.warning(f"⚠️ margin 探测返回非 margin 错误，跳过: {probe_url}, 结果: {result}")
+                logger.warning(f"⚠️ 分享排队探测返回非限速错误，跳过: {probe_url}, 结果: {result}")
                 await self._margin_task_failed(probe_item, result)
 
-        logger.info("✅ margin 排队队列已清空，轮询器退出")
+        logger.info("✅ 分享排队队列已清空，轮询器退出")
 
     async def _margin_task_success(self, item: dict, share_link: str):
-        """margin 排队任务成功后：保存历史 + 推送 TG"""
+        """分享排队任务成功后：保存历史 + 推送 TG"""
         share_url = item.get("share_url", "")
         metadata = item.get("metadata", {})
         try:
@@ -1060,23 +1182,23 @@ class P115Service:
         try:
             from app.services.tg_bot import tg_service
             if tg_service:
-                # 发送给管理员
                 await tg_service.send_admin_msg(
-                    f"✅ 限速排队任务已完成！\n"
+                    f"✅ 分享排队任务已完成！\n"
                     f"原链接: {share_url}\n"
                     f"新分享: {share_link}"
                 )
-                # 推送到频道
                 await tg_service.broadcast_to_channels(
                     {share_url: share_link},
                     metadata
                 )
         except Exception as e:
-            logger.warning(f"margin 成功回调通知失败: {e}")
+            logger.warning(f"分享排队成功回调通知失败: {e}")
 
     async def _margin_task_failed(self, item: dict, result):
-        """margin 排队任务最终失败的通知"""
+        """分享排队任务最终失败的通知"""
         share_url = item.get("share_url", "")
+        attempt = int(item.get("attempt", 0) or 0)
+        limit_reason = item.get("limit_reason", "margin")
         error_msg = ""
         if isinstance(result, dict):
             error_msg = result.get("message", str(result))
@@ -1086,12 +1208,13 @@ class P115Service:
             from app.services.tg_bot import tg_service
             if tg_service:
                 await tg_service.send_admin_msg(
-                    f"❌ 限速排队任务失败\n"
+                    f"❌ 分享排队任务失败（{limit_reason}）\n"
                     f"原链接: {share_url}\n"
+                    f"重试次数: {attempt}/30\n"
                     f"错误: {error_msg}"
                 )
         except Exception as e:
-            logger.warning(f"margin 失败回调通知失败: {e}")
+            logger.warning(f"分享排队失败回调通知失败: {e}")
 
     async def _save_share_link_internal(
         self,
@@ -1120,13 +1243,15 @@ class P115Service:
         
         logger.info(f"📥 开始处理分享链接: {share_url}")
         try:
-            # 0. RT 加密链接先经 MediaHelper 解密为明文（历史/回传仍用原始 URL）
+            # 0. RT 加密链接先经 MediaHelper 解密为明文
+            # 解密成功后统一用明文做后续日志/回传展示；历史匹配仍由调用方用原始 URL
             from app.services.mh_decrypt import is_rt_encrypted_url, decrypt_rt_share_url, MHDecryptError
             working_url = share_url
             if is_rt_encrypted_url(share_url):
                 try:
                     working_url = await decrypt_rt_share_url(share_url)
                     logger.info(f"🔓 RT 链接已解密: {share_url[:80]}... -> {working_url}")
+                    share_url = working_url
                 except MHDecryptError as e:
                     logger.error(f"❌ RT 链接解密失败: {e}")
                     return {
@@ -1780,7 +1905,8 @@ class P115Service:
             if is_rt_encrypted_url(share_url):
                 try:
                     working_url = await decrypt_rt_share_url(share_url)
-                    logger.info(f"🔓 状态检查前 RT 链接已解密: {working_url}")
+                    logger.info(f"🔓 状态检查前 RT 链接已解密: {share_url[:80]}... -> {working_url}")
+                    share_url = working_url
                 except MHDecryptError as e:
                     logger.error(f"❌ 状态检查时 RT 解密失败: {e}")
                     return None
@@ -2000,7 +2126,10 @@ class P115Service:
                 offset += len(file_list)
                 logger.debug(f"📄 快照目录 {cid} 翻页: offset={offset}, 已收集 {len(items)} 个项")
         except Exception as e:
-            logger.warning(f"⚠️ 获取目录 {cid} 顶级项失败: {e}")
+            if self._is_405_error(e):
+                logger.warning(f"⚠️ 获取目录 {cid} 顶级项失败 (405 风控): {e}")
+            else:
+                logger.warning(f"⚠️ 获取目录 {cid} 顶级项失败: {e}")
             if strict:
                 raise
         return items
@@ -2179,6 +2308,7 @@ class P115Service:
 
             margin_hit_count = 0  # margin 限速不消耗轮询次数，单独计数
             max_margin_hits = 30  # margin 最多容忍 30 次（约 2.5 分钟）
+            saw_405 = False
 
             for poll_attempt in range(1, max_poll_attempts + 1):
                 try:
@@ -2199,12 +2329,12 @@ class P115Service:
                         wait = max(margin_val, 3)
                         logger.warning(f"⚠️ fs_category_get 触发 115 限速 (margin={margin_val})，等待 {wait}s 后重试 (margin 第 {margin_hit_count}/{max_margin_hits} 次)")
                         if margin_hit_count >= max_margin_hits:
-                            logger.warning(f"🚫 轮询阶段 margin 限速持续过久 ({margin_hit_count} 次)，转入 margin 排队")
-                            return {
-                                "status": "margin_limited",
-                                "save_result": save_result,
-                                "message": "分享被限制（margin），已加入排队等待"
-                            }
+                            logger.warning(f"🚫 轮询阶段 margin 限速持续过久 ({margin_hit_count} 次)，转入分享排队")
+                            return self._margin_limited_payload(
+                                save_result,
+                                "分享被限制（margin），已加入排队等待",
+                                limit_reason="margin",
+                            )
                         await asyncio.sleep(wait)
                         continue
                     
@@ -2260,11 +2390,31 @@ class P115Service:
 
                 except Exception as e:
                     stable_times = 0
+                    if self._is_405_error(e):
+                        saw_405 = True
+                        logger.warning(
+                            f"🚫 检索目录内容或属性触发 405 风控 (第 {poll_attempt} 次)，"
+                            f"立即转入分享排队（每 5 分钟重试，最多 30 次）: {e}"
+                        )
+                        return self._margin_limited_payload(
+                            save_result,
+                            "目录查询被风控(405)，已加入排队，每5分钟重试",
+                            limit_reason="405",
+                        )
                     logger.error(f"⚠️ 检索目录内容或属性失败 (第 {poll_attempt} 次): {e}", exc_info=True)
                     if poll_attempt < max_poll_attempts:
                         await asyncio.sleep(5)
 
             if not new_fids:
+                if saw_405:
+                    logger.warning(
+                        f"⚠️ 子目录 {to_cid} 轮询结束仍无文件列表，且曾触发 405，转入分享排队"
+                    )
+                    return self._margin_limited_payload(
+                        save_result,
+                        "目录查询被风控(405)，已加入排队，每5分钟重试",
+                        limit_reason="405",
+                    )
                 logger.warning(f"⚠️ 子目录 {to_cid} 中最终未检测到任何文件，可能 115 处理延迟或转存失败")
                 return None
 
@@ -2299,12 +2449,12 @@ class P115Service:
                                 continue
                             else:
                                 # 3 次都 margin，返回 margin_limited 状态进入排队
-                                logger.warning(f"🚫 分享创建阶段 margin 限速 {max_share_retries} 次，转入 margin 排队")
-                                return {
-                                    "status": "margin_limited",
-                                    "save_result": save_result,
-                                    "message": "分享被限制（margin），已加入排队等待"
-                                }
+                                logger.warning(f"🚫 分享创建阶段 margin 限速 {max_share_retries} 次，转入分享排队")
+                                return self._margin_limited_payload(
+                                    save_result,
+                                    "分享被限制（margin），已加入排队等待",
+                                    limit_reason="margin",
+                                )
                         
                         check_response(send_resp)
                         logger.debug(f"📋 share_send 响应: {send_resp}")
@@ -2326,6 +2476,13 @@ class P115Service:
                         
                     except Exception as share_error:
                         error_msg = str(share_error)
+                        if self._is_405_error(share_error):
+                            logger.warning(f"🚫 创建分享分卷 {batch_idx} 触发 405 风控，转入分享排队: {share_error}")
+                            return self._margin_limited_payload(
+                                save_result,
+                                "目录查询被风控(405)，已加入排队，每5分钟重试",
+                                limit_reason="405",
+                            )
                         if "99" in error_msg or "请重新登录" in error_msg:
                             self.is_connected = False
                             self._last_verify_failed = True
@@ -2417,16 +2574,24 @@ class P115Service:
                 missing_key = e.args[0] if e.args else "unknown"
                 # margin 类 KeyError 转为 margin_limited 排队
                 if missing_key == "margin":
-                    return {
-                        "status": "margin_limited",
-                        "save_result": save_result,
-                        "message": "分享被限制（margin），已加入排队等待"
-                    }
+                    return self._margin_limited_payload(
+                        save_result,
+                        "分享被限制（margin），已加入排队等待",
+                        limit_reason="margin",
+                    )
                 return {
                     "status": "error",
                     "error_type": "share_response_parse_error",
                     "message": f"创建分享接口响应缺少关键字段: {missing_key}"
                 }
+
+            if self._is_405_error(e):
+                logger.warning(f"🚫 创建分享阶段触发 405 风控，转入分享排队: {e}")
+                return self._margin_limited_payload(
+                    save_result,
+                    "目录查询被风控(405)，已加入排队，每5分钟重试",
+                    limit_reason="405",
+                )
 
             if isinstance(error_info, dict) and error_info:
                 api_msg = error_info.get("error") or error_info.get("msg") or error_info.get("message") or str(e)
@@ -2763,7 +2928,10 @@ class P115Service:
                 else:
                     logger.warning(f"⚠️ 目标目录 (CID: {cid}) 在等待 22 秒后依然为空或未稳定，直接执行敏感词检测")
         except Exception as e:
-            logger.warning(f"⚠️ 敏感词替换前等待目录稳定失败: {e}")
+            if self._is_405_error(e):
+                logger.warning(f"⚠️ 敏感词替换前等待目录稳定失败 (405 风控): {e}")
+            else:
+                logger.warning(f"⚠️ 敏感词替换前等待目录稳定失败: {e}")
 
         import re
         pattern = None
@@ -2782,9 +2950,42 @@ class P115Service:
         def contains_chinese(text: str) -> bool:
             return any('\u4e00' <= char <= '\u9fff' for char in text)
 
-        async def process_name(old_name: str, parent_replacements: list, media_hint: str) -> Tuple[str, list]:
+        def apply_chinese_alias(name: str, chinese_title: str, alias: str) -> Tuple[str, Optional[str]]:
+            """别名已存在则删中文，否则中文替换为别名。返回 (新名, 动作 strip/replace/None)。"""
+            if not chinese_title or chinese_title not in name:
+                return name, None
+            if alias_already_in_name(name, alias):
+                stripped = strip_chinese_title(name, chinese_title)
+                if stripped != name:
+                    return stripped, "strip"
+                return name, None
+            replaced = name.replace(chinese_title, alias, 1)
+            if replaced != name:
+                return replaced, "replace"
+            return name, None
+
+        async def process_name(
+            old_name: str,
+            parent_replacements: list,
+            media_hint: str,
+            inherited_tmdb_id: Optional[int] = None,
+            is_file: bool = False,
+        ) -> Tuple[str, list]:
             new_replacements = list(parent_replacements) if parent_replacements else []
-            new_name = old_name
+            work_name = old_name
+
+            def finalize(name: str) -> Tuple[str, list]:
+                final = name
+                if is_file:
+                    effective_id = extract_tmdb_id_from_name(final) or inherited_tmdb_id
+                    if effective_id and extract_tmdb_id_from_name(final) is None:
+                        appended = append_tmdb_tag_to_filename(final, effective_id)
+                        if appended != final:
+                            logger.info(
+                                f"🏷️ 继承补全 TMDB 标记: [{final}] -> [{appended}] (tmdb_id={effective_id})"
+                            )
+                            final = appended
+                return final, new_replacements
 
             # 1. 优先：敏感词映射表
             if pattern:
@@ -2793,14 +2994,14 @@ class P115Service:
                     return mapping_lower.get(matched_str.lower(), matched_str)
                 mapped_name = pattern.sub(replace_func, old_name)
                 if mapped_name != old_name:
-                    return mapped_name, new_replacements
+                    return finalize(mapped_name)
 
             # 2. 降级：TMDB ID 别名匹配
             tmdb_success = False
-            if should_tmdb and contains_chinese(old_name):
-                tmdb_id = extract_tmdb_id_from_name(old_name)
+            if should_tmdb and contains_chinese(work_name):
+                tmdb_id = extract_tmdb_id_from_name(work_name)
                 if tmdb_id:
-                    chinese_title = extract_replacement_title_fragment(old_name)
+                    chinese_title = extract_replacement_title_fragment(work_name)
                     preferred_media = media_hint if media_hint in ["tv", "movie"] else None
                     alias = await tmdb_service.get_alias_by_id(
                         tmdb_id,
@@ -2809,32 +3010,41 @@ class P115Service:
                     )
                     if alias:
                         if chinese_title:
-                            new_name = old_name.replace(chinese_title, alias, 1)
-                            if new_name != old_name:
+                            updated, action = apply_chinese_alias(work_name, chinese_title, alias)
+                            if action:
+                                work_name = updated
                                 tmdb_success = True
                                 new_replacements.append((chinese_title, alias))
-                                logger.debug(
-                                    f"🎯 TMDB 替换命中: name=[{old_name}] tmdb_id={tmdb_id} media_hint={media_hint} alias=[{alias}]"
-                                )
+                                if action == "strip":
+                                    logger.debug(
+                                        f"🎯 TMDB 别名已存在，删除中文: name=[{old_name}] -> [{work_name}] "
+                                        f"tmdb_id={tmdb_id} alias=[{alias}]"
+                                    )
+                                else:
+                                    logger.debug(
+                                        f"🎯 TMDB 替换命中: name=[{old_name}] tmdb_id={tmdb_id} "
+                                        f"media_hint={media_hint} alias=[{alias}]"
+                                    )
                     else:
                         logger.debug(
                             f"ℹ️ TMDB 未命中可用别名: name=[{old_name}] tmdb_id={tmdb_id} media_hint={media_hint}，将尝试后续策略"
                         )
 
             # 2.5 如果 TMDB 失败或不适用，检查是否有父目录继承来的别名替换
-            if not tmdb_success and parent_replacements and contains_chinese(old_name):
+            if not tmdb_success and parent_replacements and contains_chinese(work_name):
                 for chinese_title, alias in parent_replacements:
-                    if chinese_title in old_name:
-                        new_name = old_name.replace(chinese_title, alias, 1)
-                        if new_name != old_name:
-                            tmdb_success = True
-                            break
-
-            if tmdb_success:
-                return new_name, new_replacements
+                    updated, action = apply_chinese_alias(work_name, chinese_title, alias)
+                    if action:
+                        work_name = updated
+                        tmdb_success = True
+                        if action == "strip":
+                            logger.debug(
+                                f"🎯 继承别名已存在，删除中文: name=[{old_name}] -> [{work_name}] alias=[{alias}]"
+                            )
+                        break
 
             # 3. 兜底：拼音全拼替换（仅转换连续中文段，保留英文/扩展名等）
-            if should_pinyin and contains_chinese(old_name):
+            if not tmdb_success and should_pinyin and contains_chinese(work_name):
                 try:
                     import pypinyin
                     episode_pattern = re.compile(r"第\s*[0-9一二三四五六七八九十百千万]+\s*[集季]")
@@ -2845,7 +3055,7 @@ class P115Service:
                         placeholders.append((placeholder, match.group(0)))
                         return placeholder
 
-                    protected_name = episode_pattern.sub(encode_episodes, old_name)
+                    protected_name = episode_pattern.sub(encode_episodes, work_name)
                     segments = re.findall(r"[\u4e00-\u9fff]+|[^\u4e00-\u9fff]+", protected_name)
                     out_parts = []
                     for idx, seg in enumerate(segments):
@@ -2867,11 +3077,11 @@ class P115Service:
                         pinyin_name = pinyin_name.replace(placeholder, original)
                         pinyin_name = pinyin_name.replace(placeholder.lower(), original)
 
-                    return pinyin_name, new_replacements
+                    work_name = pinyin_name
                 except Exception as pe:
                     logger.error(f"❌ 拼音全拼替换失败: {pe}")
 
-            return old_name, new_replacements
+            return finalize(work_name)
 
         renamed_count = 0
         try:
@@ -2890,7 +3100,12 @@ class P115Service:
                 dir_hint_cache[target_cid] = hint
                 return hint
 
-            async def walk_and_collect(current_cid: int, parent_replacements: list = None, inherited_hint: str = "unknown"):
+            async def walk_and_collect(
+                current_cid: int,
+                parent_replacements: list = None,
+                inherited_hint: str = "unknown",
+                inherited_tmdb_id: Optional[int] = None,
+            ):
                 if parent_replacements is None:
                     parent_replacements = []
                 if current_cid in visited:
@@ -2900,7 +3115,12 @@ class P115Service:
                 try:
                     items = await self.fs.readdir(current_cid, async_=True, **self._get_ios_ua_kwargs())
                 except Exception as read_ex:
-                    logger.error(f"❌ 读取目录 (CID: {current_cid}) 失败: {read_ex}")
+                    if self._is_405_error(read_ex):
+                        logger.error(
+                            f"❌ 读取目录 (CID: {current_cid}) 失败 (405 风控，跳过敏感词本轮): {read_ex}"
+                        )
+                    else:
+                        logger.error(f"❌ 读取目录 (CID: {current_cid}) 失败: {read_ex}")
                     return
 
                 dirs = [item for item in items if item.get("is_dir")]
@@ -2923,8 +3143,18 @@ class P115Service:
                             else child_structure_hint if child_structure_hint != "unknown"
                             else current_hint
                         )
-                        d_new_name, d_replacements = await process_name(old_name, parent_replacements, d_media_hint)
-                        await walk_and_collect(sub_cid, d_replacements, d_media_hint)
+                        own_tmdb = extract_tmdb_id_from_name(old_name)
+                        child_tmdb = own_tmdb if own_tmdb is not None else inherited_tmdb_id
+                        d_new_name, d_replacements = await process_name(
+                            old_name,
+                            parent_replacements,
+                            d_media_hint,
+                            inherited_tmdb_id=child_tmdb,
+                            is_file=False,
+                        )
+                        # Season 等中间目录只透传 tmdb，不强制写入目录名
+                        pass_tmdb = extract_tmdb_id_from_name(d_new_name) or child_tmdb
+                        await walk_and_collect(sub_cid, d_replacements, d_media_hint, pass_tmdb)
                         if d_new_name != old_name:
                             to_rename.append((sub_cid, d_new_name, old_name))
 
@@ -2935,7 +3165,15 @@ class P115Service:
                     if fid is not None and old_name:
                         file_hint = infer_media_hint_from_name(old_name)
                         f_media_hint = file_hint if file_hint != "unknown" else current_hint
-                        f_new_name, _ = await process_name(old_name, parent_replacements, f_media_hint)
+                        own_tmdb = extract_tmdb_id_from_name(old_name)
+                        file_tmdb = own_tmdb if own_tmdb is not None else inherited_tmdb_id
+                        f_new_name, _ = await process_name(
+                            old_name,
+                            parent_replacements,
+                            f_media_hint,
+                            inherited_tmdb_id=file_tmdb,
+                            is_file=True,
+                        )
                         if f_new_name != old_name:
                             to_rename.append((fid, f_new_name, old_name))
 
