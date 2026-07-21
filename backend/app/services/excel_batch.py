@@ -99,7 +99,7 @@ class ExcelBatchService:
             extracted_data = []
             
             # Regex patterns for links
-            link_pattern = re.compile(r'https?://(?:115\.com|115cdn\.com)/s/([a-z0-9]+)(?:\?password=([a-z0-9]+))?', re.IGNORECASE)
+            link_pattern = re.compile(r'https?://(?:115\.com|115cdn\.com)/s/([a-zA-Z0-9]+)(?:\?password=([a-zA-Z0-9]+))?', re.IGNORECASE)
             ed2k_pattern = re.compile(r'(ed2k://\|file\|[^\s]+)', re.IGNORECASE)
             magnet_pattern = re.compile(r'(magnet:\?[^\s]+)', re.IGNORECASE)
             telegra_pattern = re.compile(r'(https?://telegra\.ph/[^\s]+)', re.IGNORECASE)

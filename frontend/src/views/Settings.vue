@@ -201,6 +201,32 @@
           <a-divider />
           <a-button type="primary" @click="onFinish('tmdb')" :loading="loading" block>保存 TMDB 配置</a-button>
         </a-collapse-panel>
+
+        <a-collapse-panel key="mh" header="MediaHelper 配置">
+          <a-form-item label="服务地址" name="mh_address">
+            <template #extra>
+              <div style="font-size: 12px; color: #999; margin-top: 4px">用于解密 115 RT 加密分享链接。留空则禁用该功能。</div>
+            </template>
+            <a-input v-model:value="formState.mh_address" placeholder="例如 http://192.168.100.163:3300" />
+          </a-form-item>
+          <a-row :gutter="16">
+            <a-col :span="12">
+              <a-form-item label="用户名" name="mh_username">
+                <a-input v-model:value="formState.mh_username" placeholder="MediaHelper 用户名" />
+              </a-form-item>
+            </a-col>
+            <a-col :span="12">
+              <a-form-item label="密码" name="mh_password">
+                <a-input-password v-model:value="formState.mh_password" placeholder="MediaHelper 密码" />
+              </a-form-item>
+            </a-col>
+          </a-row>
+          <div style="margin-bottom: 16px">
+            <a-button @click="testMh" :loading="testingMh">测试连接</a-button>
+          </div>
+          <a-divider />
+          <a-button type="primary" @click="onFinish('mh')" :loading="loading" block>保存 MediaHelper 配置</a-button>
+        </a-collapse-panel>
       </a-collapse>
     </a-form>
   </div>
@@ -214,6 +240,7 @@ import { SearchOutlined, PlusOutlined, DeleteOutlined } from '@ant-design/icons-
 
 const loading = ref(false);
 const testingProxy = ref(false);
+const testingMh = ref(false);
 const detecting = ref(false);
 const formRef = ref();
 
@@ -253,6 +280,9 @@ const formState = reactive({
   direct_save_dir: '115-Save',
   tg_default_command_mode: 'share',
   tmdb_api_key: '',
+  mh_address: '',
+  mh_username: '',
+  mh_password: '',
 });
 
 const loadAccounts = async () => {
@@ -336,18 +366,22 @@ const loadConfig = async () => {
     formState.direct_save_dir = res.data.direct_save_dir || '115-Save';
     formState.tg_default_command_mode = res.data.tg_default_command_mode || 'share';
     formState.tmdb_api_key = res.data.tmdb_api_key || '';
+    formState.mh_address = res.data.mh_address || '';
+    formState.mh_username = res.data.mh_username || '';
+    formState.mh_password = res.data.mh_password || '';
   } catch (e) {
     console.error(e);
   }
 };
 
-const onFinish = async (section: 'tg' | 'proxy' | 'save' | 'tmdb' = 'tg') => {
+const onFinish = async (section: 'tg' | 'proxy' | 'save' | 'tmdb' | 'mh' = 'tg') => {
   try {
     const sectionFields: Record<string, string[]> = {
       tg: ['tg_bot_token', 'tg_user_id', 'tg_allow_chats', 'tg_skip_large_package', 'tg_poll_timeout_hours'],
       proxy: ['proxy_enabled', 'proxy_host', 'proxy_port', 'proxy_user', 'proxy_pass', 'proxy_type'],
       save: ['direct_save_account_id', 'direct_save_dir', 'tg_default_command_mode'],
-      tmdb: ['tmdb_api_key']
+      tmdb: ['tmdb_api_key'],
+      mh: ['mh_address', 'mh_username', 'mh_password']
     };
 
     await formRef.value.validate(sectionFields[section]!);
@@ -379,7 +413,8 @@ const onFinish = async (section: 'tg' | 'proxy' | 'save' | 'tmdb' = 'tg') => {
     message.success(
       section === 'tg' ? 'Telegram 配置已保存' :
       section === 'proxy' ? '代理配置已保存' :
-      section === 'tmdb' ? 'TMDB 配置已保存' : '保存与行为配置已保存'
+      section === 'tmdb' ? 'TMDB 配置已保存' :
+      section === 'mh' ? 'MediaHelper 配置已保存' : '保存与行为配置已保存'
     );
     if (res.data.bot_restarted) {
       message.info('机器人已根据新配置安全重启');
@@ -409,6 +444,30 @@ const testProxy = async () => {
     message.error(e.response?.data?.detail || '测试失败');
   } finally {
     testingProxy.value = false;
+  }
+};
+
+const testMh = async () => {
+  if (!formState.mh_address?.trim()) {
+    message.warning('请先填写 MediaHelper 服务地址');
+    return;
+  }
+  try {
+    testingMh.value = true;
+    const res = await axios.post('/api/config/test-mh', {
+      mh_address: formState.mh_address,
+      mh_username: formState.mh_username,
+      mh_password: formState.mh_password,
+    });
+    if (res.data.status === 'success') {
+      message.success(res.data.message);
+    } else {
+      message.error(res.data.message);
+    }
+  } catch (e: any) {
+    message.error(e.response?.data?.detail || '测试失败');
+  } finally {
+    testingMh.value = false;
   }
 };
 

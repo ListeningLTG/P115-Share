@@ -47,7 +47,10 @@ class ConfigUpdate(BaseModel):
     sensitive_replace_pinyin: Optional[bool] = None
     sensitive_replace_tmdb: Optional[bool] = None
     tmdb_api_key: Optional[str] = None
-
+    mh_address: Optional[str] = None
+    mh_username: Optional[str] = None
+    mh_password: Optional[str] = None
+    
     @field_validator('p115_cleanup_dir_cron', 'p115_cleanup_trash_cron')
     @classmethod
     def validate_cron(cls, v: Optional[str]):
@@ -172,6 +175,13 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
     if "tmdb_api_key" in update_data and settings.TMDB_API_KEY != cfg.tmdb_api_key:
         stage_setting("TMDB_API_KEY", cfg.tmdb_api_key)
 
+    # 4.9 Update MediaHelper settings
+    mh_changed = False
+    for field in ("mh_address", "mh_username", "mh_password"):
+        if field in update_data and getattr(settings, field.upper()) != getattr(cfg, field):
+            stage_setting(field.upper(), getattr(cfg, field))
+            mh_changed = True
+
     if pending_updates:
         await settings.save_settings_batch(pending_updates)
 
@@ -199,6 +209,11 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
         from app.services.scheduler import cleanup_scheduler
         cleanup_scheduler.update_cleanup_capacity_job()
     
+    if mh_changed:
+        from app.services.mh_client import mh_client
+        mh_client.clear()
+        logger.info("🔄 MediaHelper 配置已更新，已清除 token 缓存")
+
     # 5. Unified restart bot polling
     if need_restart_bot:
         asyncio.create_task(tg_service.restart_polling())
@@ -245,8 +260,58 @@ async def get_config(user=Depends(get_current_user)):
         "sensitive_replace_pinyin": settings.SENSITIVE_REPLACE_PINYIN,
         "sensitive_replace_tmdb": settings.SENSITIVE_REPLACE_TMDB,
         "tmdb_api_key": settings.TMDB_API_KEY,
+        "mh_address": settings.MH_ADDRESS,
+        "mh_username": settings.MH_USERNAME,
+        "mh_password": settings.MH_PASSWORD,
         "version": VERSION
     }
+
+@router.post("/test-mh")
+async def test_mh(cfg: ConfigUpdate, user=Depends(get_current_user)):
+    """Test MediaHelper login and drive115 account availability"""
+    from app.services.mh_client import MHClient
+
+    address = (cfg.mh_address if cfg.mh_address is not None else settings.MH_ADDRESS) or ""
+    username = (cfg.mh_username if cfg.mh_username is not None else settings.MH_USERNAME) or ""
+    password = (cfg.mh_password if cfg.mh_password is not None else settings.MH_PASSWORD) or ""
+
+    if not address.strip():
+        return {"status": "error", "message": "MediaHelper 地址不能为空"}
+    if not username.strip() or not password.strip():
+        return {"status": "error", "message": "MediaHelper 用户名和密码不能为空"}
+
+    client = MHClient()
+    try:
+        domain, token = await client.login_with(
+            address.strip().rstrip("/"),
+            username.strip(),
+            password,
+        )
+        if not domain or not token:
+            return {"status": "error", "message": "登录失败，请检查地址、用户名和密码"}
+
+        resp = await client.get("/api/v1/cloud-accounts?active_only=true")
+        if not isinstance(resp, dict) or resp.get("code") not in (200, "200", None):
+            # Some MH builds omit code on success; still accept data.accounts
+            if not (isinstance(resp, dict) and resp.get("data")):
+                return {"status": "error", "message": f"获取网盘账号失败: {resp}"}
+
+        accounts = (resp.get("data") or {}).get("accounts") or []
+        drive115 = [a for a in accounts if a.get("cloud_type") == "drive115"]
+        if not drive115:
+            return {"status": "error", "message": "登录成功，但 MediaHelper 中未配置可用的 115 网盘账号"}
+
+        names = [a.get("alias") or a.get("name") or a.get("external_id") for a in drive115]
+        return {
+            "status": "success",
+            "message": f"连接成功，发现 {len(drive115)} 个 115 账号: {', '.join(str(n) for n in names)}",
+        }
+    except Exception as e:
+        logger.error(f"❌ MediaHelper 测试失败: {e}")
+        return {"status": "error", "message": f"连接失败: {e}"}
+    finally:
+        await client.close()
+
 
 @router.post("/test-proxy")
 async def test_proxy(cfg: ConfigUpdate, user=Depends(get_current_user)):

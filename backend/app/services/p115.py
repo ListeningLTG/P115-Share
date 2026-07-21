@@ -25,6 +25,47 @@ API_MAX_RETRIES = 3
 # 重试间隔（秒）
 API_RETRY_DELAY = 5
 
+
+def parse_size_to_bytes(val) -> int:
+    """将 115 API 返回的 size（字节数或 '91.92GB' 等可读串）转为整数字节。"""
+    if isinstance(val, dict):
+        val = val.get("size") or val.get("size_total") or val.get("size_use") or 0
+    if val is None:
+        return 0
+    if isinstance(val, (int, float)):
+        return int(val)
+    s_val = str(val).strip().upper()
+    if not s_val:
+        return 0
+    match = re.match(r"^([0-9.]+)\s*([A-Z]*B?)$", s_val)
+    if not match:
+        try:
+            return int(float(s_val))
+        except (ValueError, TypeError):
+            return 0
+    number, unit = match.groups()
+    number = float(number)
+    units = {
+        "": 1, "B": 1,
+        "K": 1024, "KB": 1024,
+        "M": 1024**2, "MB": 1024**2,
+        "G": 1024**3, "GB": 1024**3,
+        "T": 1024**4, "TB": 1024**4,
+        "P": 1024**5, "PB": 1024**5,
+    }
+    return int(number * units.get(unit, 1))
+
+
+def sizes_approximately_equal(a: int, b: int, *, rel_tol: float = 0.001, abs_tol: int = 1024 * 1024) -> bool:
+    """可读 size（如 91.92GB）与精确字节比对时允许少量误差。"""
+    a, b = int(a or 0), int(b or 0)
+    if a == b:
+        return True
+    if a <= 0 or b <= 0:
+        return False
+    return abs(a - b) <= max(abs_tol, int(max(a, b) * rel_tol))
+
+
 # iOS 用户代理
 # app="ios" 对应 ssoent=D1，即「115生活_苹果端」，UA 必须使用 115Life iOS 客户端 UA
 # 注意：「115_苹果端（网盘）」的 app="115ios"，ssoent=D3，两者不能混用
@@ -1079,8 +1120,24 @@ class P115Service:
         
         logger.info(f"📥 开始处理分享链接: {share_url}")
         try:
+            # 0. RT 加密链接先经 MediaHelper 解密为明文（历史/回传仍用原始 URL）
+            from app.services.mh_decrypt import is_rt_encrypted_url, decrypt_rt_share_url, MHDecryptError
+            working_url = share_url
+            if is_rt_encrypted_url(share_url):
+                try:
+                    working_url = await decrypt_rt_share_url(share_url)
+                    logger.info(f"🔓 RT 链接已解密: {share_url[:80]}... -> {working_url}")
+                except MHDecryptError as e:
+                    logger.error(f"❌ RT 链接解密失败: {e}")
+                    return {
+                        "status": "error",
+                        "error_type": "mh_decrypt_failed",
+                        "message": str(e),
+                        "share_url": share_url,
+                    }
+
             # 1. Extract share/receive codes
-            payload = share_extract_payload(share_url)
+            payload = share_extract_payload(working_url)
             
             # 2. Get share snapshot to get file IDs and names (使用多端点容错)
             snap_resp = await self._share_snap_with_fallback(payload)
@@ -1342,7 +1399,7 @@ class P115Service:
                             "message": "检测为大包，跳过处理"
                         }
                     logger.warning(f"⚠️ 触发 115 非会员 500 文件保存限制，尝试递归分批保存: {share_url}")
-                    recursive_links = await self._save_share_recursive(share_url, task_cid)
+                    recursive_links = await self._save_share_recursive(working_url, task_cid)
                     logger.info(f"✅ 递归分批保存指令已处理完毕: {share_url}")
                     self._record_save_activity()
                 # Check if it's a "file already received" error (errno 4200045)
@@ -1718,7 +1775,17 @@ class P115Service:
             }
         """
         try:
-            payload = share_extract_payload(share_url)
+            from app.services.mh_decrypt import is_rt_encrypted_url, decrypt_rt_share_url, MHDecryptError
+            working_url = share_url
+            if is_rt_encrypted_url(share_url):
+                try:
+                    working_url = await decrypt_rt_share_url(share_url)
+                    logger.info(f"🔓 状态检查前 RT 链接已解密: {working_url}")
+                except MHDecryptError as e:
+                    logger.error(f"❌ 状态检查时 RT 解密失败: {e}")
+                    return None
+
+            payload = share_extract_payload(working_url)
             # 使用多端点容错机制获取分享状态
             snap_resp = await self._share_snap_with_fallback(payload)
             check_response(snap_resp)
@@ -2147,17 +2214,25 @@ class P115Service:
                     current_file_count = int(resp.get("count", 0) or resp.get("file_count", 0))
                     current_folder_count = int(resp.get("folder_count", 0))
                     current_total = current_file_count + current_folder_count
-                    current_size = int(resp.get("size", 0) or 0)
+                    current_size = parse_size_to_bytes(resp.get("size", 0))
 
                     logger.info(f"⚖️ [比对进程] 当前挂载层级统计: 大小={current_size} (基准: {original_total_size} 字节), 文件数={current_file_count}, 文件夹数={current_folder_count}")
 
                     # 3. 结合原先的顶部结构验证，确保外层骨架确实建好了
                     current_items = await self._get_dir_items(to_cid, strict=True)
-                    stats_match = (
-                        current_size == int(original_total_size or 0)
-                        and current_file_count == int(original_file_count or 0)
-                        and current_folder_count == int(original_folder_count or 0)
-                    )
+                    orig_size = int(original_total_size or 0)
+                    orig_files = int(original_file_count or 0)
+                    orig_folders = int(original_folder_count or 0)
+                    size_match = sizes_approximately_equal(current_size, orig_size) if orig_size > 0 else current_size > 0
+                    # 源分享常缺深层级文件/文件夹计数（为 0）；此时只按体积判定，避免永远等不到匹配
+                    if orig_files == 0 and orig_folders == 0:
+                        stats_match = size_match
+                    else:
+                        stats_match = (
+                            size_match
+                            and current_file_count == orig_files
+                            and current_folder_count == orig_folders
+                        )
                     # 敏感词处理可能已修改顶层名称，因此普通分享按顶层数量精确匹配。
                     # 定时移动/复制流程会在改名前执行更严格的名称/ID匹配。
                     top_match = len(current_items) == len(names)
@@ -2405,40 +2480,7 @@ class P115Service:
             return {"used": 0, "total": 0}
             
         def extract_size(val) -> int:
-            if isinstance(val, dict):
-                val = val.get("size") or val.get("size_total") or val.get("size_use") or 0
-            
-            if val is None:
-                return 0
-            if isinstance(val, (int, float)):
-                return int(val)
-            
-            # Handle string format (e.g., "2.04TB")
-            s_val = str(val).strip().upper()
-            if not s_val:
-                return 0
-            
-            import re
-            match = re.match(r"^([0-9.]+)\s*([A-Z]*B?)$", s_val)
-            if not match:
-                try:
-                    return int(float(s_val))
-                except:
-                    return 0
-            
-            number, unit = match.groups()
-            number = float(number)
-            
-            units = {
-                "": 1, "B": 1,
-                "K": 1024, "KB": 1024,
-                "M": 1024**2, "MB": 1024**2,
-                "G": 1024**3, "GB": 1024**3,
-                "T": 1024**4, "TB": 1024**4,
-                "P": 1024**5, "PB": 1024**5
-            }
-            
-            return int(number * units.get(unit, 1))
+            return parse_size_to_bytes(val)
 
         try:
             # 1. Directory Mode

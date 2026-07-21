@@ -36,7 +36,11 @@ class Settings(BaseSettings):
     SENSITIVE_REPLACE_TMDB: bool = False
     TMDB_API_KEY: str = ""
 
-    
+    # MediaHelper (RT 加密链接解密)
+    MH_ADDRESS: str = ""
+    MH_USERNAME: str = ""
+    MH_PASSWORD: str = ""
+
     # App
     WEB_PORT: int = 8000
     LOG_LEVEL: str = "INFO"
