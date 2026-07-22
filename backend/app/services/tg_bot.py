@@ -982,6 +982,64 @@ class TGService:
         """Calculate length in UTF-16 code units"""
         return len(text.encode('utf-16-le')) // 2
 
+    def _expand_broadcast_link_map(self, share_links_map: dict, metadata: dict) -> dict:
+        """扩展替换映射，避免 RT 密文原文对不上解密后的 share_url 导致频道仍推未解密链接。"""
+        from app.services.mh_decrypt import (
+            is_rt_encrypted_url,
+            get_cached_plaintext_url,
+            extract_share_code,
+        )
+
+        expanded = dict(share_links_map or {})
+        if not expanded:
+            return expanded
+
+        meta = metadata or {}
+        full_text = meta.get("full_text") or ""
+        meta_share_url = meta.get("share_url") or ""
+
+        def _plain(u: str) -> str:
+            if not u:
+                return ""
+            cached = get_cached_plaintext_url(u)
+            return cached or u
+
+        def _code(u: str) -> str:
+            return (extract_share_code(u) or "").lower()
+
+        # 单条推送时，metadata.share_url 通常是用户原文里的链接（可能是 RT）
+        if meta_share_url and len(expanded) == 1:
+            only_new = next(iter(expanded.values()))
+            expanded[meta_share_url] = only_new
+
+        for old_url, new_link in list(expanded.items()):
+            plain_old = _plain(old_url)
+            if plain_old and plain_old not in expanded:
+                expanded[plain_old] = new_link
+            if is_rt_encrypted_url(old_url) and plain_old:
+                expanded[plain_old] = new_link
+
+        # 扫描正文中的 RT 链接：若已解密且与 map 中明文同源，则一并替换
+        for m in re.finditer(
+            r"https?://(?:115\.com|115cdn\.com|anxia\.com)/s/[A-Za-z0-9]+(?:\?[^\s\"'<>]*)?",
+            full_text,
+            flags=re.IGNORECASE,
+        ):
+            cand = m.group(0)
+            if not is_rt_encrypted_url(cand):
+                continue
+            plain_cand = _plain(cand)
+            if not plain_cand or plain_cand == cand:
+                continue
+            cand_code = _code(plain_cand)
+            for old_url, new_link in list(expanded.items()):
+                plain_old = _plain(old_url)
+                if plain_cand == plain_old or (cand_code and cand_code == _code(plain_old)):
+                    expanded[cand] = new_link
+                    break
+
+        return expanded
+
     def _strip_bot_command_prefix(self, text: str, entities: list) -> tuple[str, list]:
         """去掉开头的 /share、/save（可带 @bot），供频道推送使用。"""
         if not text:
@@ -1016,6 +1074,7 @@ class TGService:
 
         # 频道推送去掉机器人命令前缀，避免出现 "/share https://..."
         full_text, entities_raw = self._strip_bot_command_prefix(full_text, entities_raw)
+        share_links_map = self._expand_broadcast_link_map(share_links_map, metadata)
         
         from aiogram.types import MessageEntity
         entities = []

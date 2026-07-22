@@ -1264,24 +1264,32 @@ class P115Service:
     async def _margin_task_success(self, item: dict, share_link: str):
         """分享排队任务成功后：保存历史 + 推送 TG"""
         share_url = item.get("share_url", "")
-        metadata = item.get("metadata", {})
+        metadata = item.get("metadata", {}) or {}
+        # metadata.share_url 多为用户原文链接（可能是 RT）；item.share_url 可能已是解密明文
+        original_url = metadata.get("share_url") or share_url
         try:
-            await self.save_history_link(share_url, share_link)
+            await self.save_history_link(share_url or original_url, share_link)
         except Exception as e:
             logger.warning(f"保存历史记录失败: {e}")
 
         try:
             from app.services.tg_bot import tg_service
+            from app.services.mh_decrypt import resolve_display_share_url
             if tg_service:
+                display_url = resolve_display_share_url(original_url) or resolve_display_share_url(share_url) or share_url
                 await tg_service.send_admin_msg(
                     f"✅ 分享排队任务已完成！\n"
-                    f"原链接: {share_url}\n"
+                    f"原链接: {display_url}\n"
                     f"新分享: {share_link}"
                 )
-                await tg_service.broadcast_to_channels(
-                    {share_url: share_link},
-                    metadata
-                )
+                link_map = {}
+                if share_url:
+                    link_map[share_url] = share_link
+                if original_url:
+                    link_map[original_url] = share_link
+                if not link_map:
+                    link_map[share_link] = share_link
+                await tg_service.broadcast_to_channels(link_map, metadata)
         except Exception as e:
             logger.warning(f"分享排队成功回调通知失败: {e}")
 
@@ -2394,6 +2402,10 @@ class P115Service:
             margin_hit_count = 0  # margin 限速不消耗轮询次数，单独计数
             max_margin_hits = 30  # margin 最多容忍 30 次（约 2.5 分钟）
             saw_405 = False
+            consecutive_405 = 0
+            # 目录查询连续全端点 405 达此次数后：跳过完整性校验，直接用任务子目录 CID 创建分享
+            max_405_before_skip = 3
+            skip_verify_share_cid = False
 
             for poll_attempt in range(1, max_poll_attempts + 1):
                 try:
@@ -2401,6 +2413,7 @@ class P115Service:
                     
                     # 1. 多端点获取实时深度体积（proapi → webapi）
                     resp = await self._fs_category_get_with_fallback(to_cid, timeout=10)
+                    consecutive_405 = 0  # 任一端点成功即清零
                     
                     # 🛡️ 检测 115 限速响应 {"margin": N}，不消耗轮询次数
                     if self._is_margin_response(resp):
@@ -2431,6 +2444,7 @@ class P115Service:
 
                     # 3. 结合原先的顶部结构验证，确保外层骨架确实建好了
                     current_items = await self._get_dir_items(to_cid, strict=True)
+                    consecutive_405 = 0
                     orig_size = int(original_total_size or 0)
                     orig_files = int(original_file_count or 0)
                     orig_folders = int(original_folder_count or 0)
@@ -2473,33 +2487,45 @@ class P115Service:
                     stable_times = 0
                     if self._is_405_error(e):
                         saw_405 = True
+                        consecutive_405 += 1
                         logger.warning(
-                            f"🚫 目录端点全部 405 (第 {poll_attempt} 次)，"
-                            f"转入分享排队（每 5 分钟重试，最多 30 次）: {e}"
+                            f"🚫 目录端点全部 405 "
+                            f"(连续 {consecutive_405}/{max_405_before_skip} 次, 轮询第 {poll_attempt}): {e}"
                         )
-                        return self._margin_limited_payload(
-                            save_result,
-                            "目录查询被风控(405)，已加入排队，每5分钟重试",
-                            limit_reason="405",
-                        )
+                        if consecutive_405 >= max_405_before_skip:
+                            logger.warning(
+                                f"⏭️ 目录校验连续 {consecutive_405} 次 405，"
+                                f"跳过完整性等待，直接用任务子目录 CID={to_cid} 创建分享"
+                            )
+                            # 给异步转存一点收尾时间，再分享整个任务目录
+                            await asyncio.sleep(15)
+                            new_fids = [to_cid]
+                            skip_verify_share_cid = True
+                            break
+                        if poll_attempt < max_poll_attempts:
+                            await asyncio.sleep(5)
+                        continue
                     logger.error(f"⚠️ 检索目录内容或属性失败 (第 {poll_attempt} 次): {e}", exc_info=True)
                     if poll_attempt < max_poll_attempts:
                         await asyncio.sleep(5)
 
             if not new_fids:
                 if saw_405:
+                    # 轮询耗尽仍全是 405：同样跳过校验，尝试直接分享任务目录
                     logger.warning(
-                        f"⚠️ 子目录 {to_cid} 轮询结束仍无文件列表，且曾触发 405，转入分享排队"
+                        f"⏭️ 子目录 {to_cid} 轮询结束仍无法列目录(405)，"
+                        f"跳过校验，直接用任务子目录创建分享"
                     )
-                    return self._margin_limited_payload(
-                        save_result,
-                        "目录查询被风控(405)，已加入排队，每5分钟重试",
-                        limit_reason="405",
-                    )
-                logger.warning(f"⚠️ 子目录 {to_cid} 中最终未检测到任何文件，可能 115 处理延迟或转存失败")
-                return None
+                    await asyncio.sleep(10)
+                    new_fids = [to_cid]
+                    skip_verify_share_cid = True
+                else:
+                    logger.warning(f"⚠️ 子目录 {to_cid} 中最终未检测到任何文件，可能 115 处理延迟或转存失败")
+                    return None
 
-            
+            if skip_verify_share_cid:
+                logger.info(f"🚀 [405跳过校验] 即将分享任务子目录 CID={to_cid}")
+
             # 7. Create new share with retry mechanism and split if > 10,000 files
             share_links = []
             fids_str_list = [str(fid) for fid in new_fids]
@@ -3006,9 +3032,11 @@ class P115Service:
                     logger.warning(f"⚠️ 目标目录 (CID: {cid}) 在等待 22 秒后依然为空或未稳定，直接执行敏感词检测")
         except Exception as e:
             if self._is_405_error(e):
-                logger.warning(f"⚠️ 敏感词替换前等待目录稳定失败 (405 风控): {e}")
-            else:
-                logger.warning(f"⚠️ 敏感词替换前等待目录稳定失败: {e}")
+                logger.warning(
+                    f"⏭️ 敏感词替换前等待目录稳定连续 405，跳过敏感词替换，继续后续分享: {e}"
+                )
+                return
+            logger.warning(f"⚠️ 敏感词替换前等待目录稳定失败: {e}")
 
         import re
         pattern = None
@@ -3040,6 +3068,10 @@ class P115Service:
             if replaced != name:
                 return replaced, "replace"
             return name, None
+
+        # 遍历过程中若根目录连续 405，整体放弃敏感词，避免阻塞分享
+        sensitive_405_hits = [0]
+        max_sensitive_405 = 3
 
         async def process_name(
             old_name: str,
@@ -3192,11 +3224,22 @@ class P115Service:
                 
                 try:
                     items = await self._get_dir_items(int(current_cid), strict=True)
+                    if int(current_cid) == int(cid):
+                        sensitive_405_hits[0] = 0
                 except Exception as read_ex:
                     if self._is_405_error(read_ex):
-                        logger.error(
-                            f"❌ 读取目录 (CID: {current_cid}) 失败 (405 风控，跳过敏感词本轮): {read_ex}"
-                        )
+                        if int(current_cid) == int(cid):
+                            sensitive_405_hits[0] += 1
+                            logger.error(
+                                f"❌ 读取目录 (CID: {current_cid}) 失败 (405 风控 "
+                                f"{sensitive_405_hits[0]}/{max_sensitive_405}): {read_ex}"
+                            )
+                            if sensitive_405_hits[0] >= max_sensitive_405:
+                                raise RuntimeError("SENSITIVE_SKIP_405")
+                        else:
+                            logger.error(
+                                f"❌ 读取目录 (CID: {current_cid}) 失败 (405 风控，跳过该子目录): {read_ex}"
+                            )
                     else:
                         logger.error(f"❌ 读取目录 (CID: {current_cid}) 失败: {read_ex}")
                     return
@@ -3255,7 +3298,16 @@ class P115Service:
                         if f_new_name != old_name:
                             to_rename.append((fid, f_new_name, old_name))
 
-            await walk_and_collect(cid)
+            try:
+                await walk_and_collect(cid)
+            except RuntimeError as walk_err:
+                if str(walk_err) == "SENSITIVE_SKIP_405":
+                    logger.warning(
+                        f"⏭️ 敏感词遍历根目录连续 {max_sensitive_405} 次 405，"
+                        f"跳过敏感词替换，继续后续分享"
+                    )
+                    return
+                raise
 
             if not to_rename:
                 logger.info(f"✅ 目录 (CID: {cid}) 内未检测到敏感词")
