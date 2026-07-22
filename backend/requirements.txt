@@ -19,9 +19,9 @@ pysocks
 pandas
 openpyxl
 xlrd
-p115client==0.0.9.4
-python-asynctools==0.1.4
-python-iterutils==0.3.0
-python-concurrenttools==0.1.5
+p115client==0.0.9.5
+python-asynctools==0.2.2
+python-iterutils==0.3.1.1
+python-concurrenttools==0.1.8
 iterdir==0.0.10
 pypinyin

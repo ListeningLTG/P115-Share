@@ -1,5 +1,6 @@
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiogram.types import BotCommand
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiohttp_socks import ProxyConnector
@@ -34,6 +35,7 @@ class TGService:
         self._lock = asyncio.Lock()
         self._current_polling_id = 0
         self._verify_tasks = []
+        self._commands_registered = False
         # url -> 开始处理时的时间戳，用于60s内去重
         self._processing_urls: dict[str, float] = {}
         if settings.TG_BOT_TOKEN:
@@ -142,6 +144,7 @@ class TGService:
                     self.bot = None
                     self.dp = None
                     self.is_connected = False
+                    self._commands_registered = False
                     logger.debug(f"{prefix} 状态变量已重置为 None")
 
     def _get_allowed_chats(self):
@@ -153,7 +156,27 @@ class TGService:
         self.dp.message(Command("start"))(self.handle_start)
         self.dp.message(Command("help"))(self.handle_help)
         self.dp.message(Command("id"))(self.handle_id)
+        self.dp.message(Command("share"))(self.handle_message)
+        self.dp.message(Command("save"))(self.handle_message)
         self.dp.message()(self.handle_message)
+
+    async def _ensure_bot_commands(self):
+        """向 Telegram 注册机器人命令，使客户端显示左侧 Menu 菜单。"""
+        if not self.bot or self._commands_registered:
+            return
+        commands = [
+            BotCommand(command="start", description="显示欢迎信息"),
+            BotCommand(command="help", description="查看使用说明"),
+            BotCommand(command="share", description="转存并生成长期分享链接"),
+            BotCommand(command="save", description="仅转存到网盘（不分享）"),
+            BotCommand(command="id", description="获取当前聊天 ID"),
+        ]
+        try:
+            await self.bot.set_my_commands(commands)
+            self._commands_registered = True
+            logger.info("✅ Telegram 机器人命令菜单已注册")
+        except Exception as e:
+            logger.warning(f"⚠️ 注册 Telegram 命令菜单失败: {e}")
 
     async def handle_start(self, message: types.Message):
         allowed = self._get_allowed_chats()
@@ -166,6 +189,8 @@ class TGService:
             "💡 可用命令：\n"
             "/start - 显示欢迎信息\n"
             "/help - 查看详细使用说明\n"
+            "/share - 转存并生成长期分享（可跟链接）\n"
+            "/save - 仅转存到网盘（可跟链接）\n"
             "/id - 获取当前聊天的 ID (用于设置白名单)"
         )
         await message.answer(help_text)
@@ -227,7 +252,17 @@ class TGService:
         
         if not share_urls:
             logger.debug(f"❌ 未检测到 115 链接 - 文本: '{full_text[:100]}...', 实体URLs: {entity_urls}")
-            if not full_text.startswith("/"):
+            if full_text.startswith("/share") or full_text.startswith("/save"):
+                cmd = "/save" if full_text.startswith("/save") else "/share"
+                tip = "仅转存到网盘" if cmd == "/save" else "转存并生成长期分享"
+                await message.answer(
+                    f"💡 用法：`{cmd}` + 115 分享链接\n"
+                    f"作用：{tip}\n\n"
+                    "也可直接发送链接（按默认模式处理）。\n"
+                    "支持域名: 115.com, 115cdn.com, anxia.com",
+                    parse_mode="Markdown",
+                )
+            elif not full_text.startswith("/"):
                 await message.answer("⚠️ 请发送有效的 115 分享链接。\n支持域名: 115.com, 115cdn.com, anxia.com")
             return
 
@@ -947,6 +982,19 @@ class TGService:
         """Calculate length in UTF-16 code units"""
         return len(text.encode('utf-16-le')) // 2
 
+    def _strip_bot_command_prefix(self, text: str, entities: list) -> tuple[str, list]:
+        """去掉开头的 /share、/save（可带 @bot），供频道推送使用。"""
+        if not text:
+            return text, entities or []
+        match = re.match(r"^/(?:share|save)(?:@[A-Za-z0-9_]+)?(?:\s+|$)", text, flags=re.IGNORECASE)
+        if not match:
+            return text, entities or []
+        start_u16 = self._get_utf16_len(match.group(0))
+        end_u16 = self._get_utf16_len(text)
+        if start_u16 >= end_u16:
+            return "", []
+        return self._slice_message(text, entities or [], start_u16, end_u16)
+
     async def _post_to_single_channel_batch(self, channel_config: dict, share_links_map: dict, metadata: dict):
         """Post to a single channel with multiple link replacements"""
         channel_id = channel_config.get("id")
@@ -965,6 +1013,9 @@ class TGService:
         if remove_image and not is_concise:
             photo_id = None
         entities_raw = metadata.get("entities", [])
+
+        # 频道推送去掉机器人命令前缀，避免出现 "/share https://..."
+        full_text, entities_raw = self._strip_bot_command_prefix(full_text, entities_raw)
         
         from aiogram.types import MessageEntity
         entities = []
@@ -1371,6 +1422,7 @@ class TGService:
             if me:
                 self.is_connected = True
                 logger.info(f"✅ Telegram Bot 连接验证成功: @{me.username}")
+                await self._ensure_bot_commands()
                 return True
         except asyncio.TimeoutError:
             logger.warning("⏱️ Telegram Bot 连接验证超时")

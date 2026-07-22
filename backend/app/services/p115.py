@@ -56,8 +56,13 @@ def parse_size_to_bytes(val) -> int:
     return int(number * units.get(unit, 1))
 
 
-def sizes_approximately_equal(a: int, b: int, *, rel_tol: float = 0.001, abs_tol: int = 1024 * 1024) -> bool:
-    """可读 size（如 91.92GB）与精确字节比对时允许少量误差。"""
+def sizes_approximately_equal(a: int, b: int, *, rel_tol: float = 0.002, abs_tol: int = 16 * 1024 * 1024) -> bool:
+    """可读 size（如 4.05GB）与精确字节比对时允许误差。
+
+    115 category/get 常返回两位小数的 GB/MB 字符串，反算字节相对 share_snap
+    精确 file_size 可能偏差数 MB（例如 4.05GB ≈ 4.35e9，相对真值可差 ~0.1%+）。
+    默认：相对 0.2% 或绝对 16MB（约 0.015GB），取较大者。
+    """
     a, b = int(a or 0), int(b or 0)
     if a == b:
         return True
@@ -274,6 +279,12 @@ class P115Service:
         self._endpoint_stats = {
             "share_snap_app": {"success": 0, "fail": 0, "last_405": 0},
             "share_snap_webapi": {"success": 0, "fail": 0, "last_405": 0},
+            "fs_category_proapi": {"success": 0, "fail": 0, "last_405": 0},
+            "fs_category_webapi": {"success": 0, "fail": 0, "last_405": 0},
+            "fs_files_app2": {"success": 0, "fail": 0, "last_405": 0},
+            "fs_files_app": {"success": 0, "fail": 0, "last_405": 0},
+            "fs_files_aps": {"success": 0, "fail": 0, "last_405": 0},
+            "fs_files_webapi": {"success": 0, "fail": 0, "last_405": 0},
         }
         
         # Cookie 文件管理（用于自动恢复登录态）
@@ -478,20 +489,66 @@ class P115Service:
             **{k: v for k, v in kwargs.items() if k != "app"}  # 过滤掉 app 参数
         )
 
+    async def _call_endpoints_with_fallback(
+        self,
+        endpoints: list,
+        *,
+        timeout: float = 30,
+        label: str = "API",
+    ) -> dict:
+        """按顺序尝试多个端点；405/失败时切换下一个，全部失败则抛出最后异常。
+
+        endpoints: [{"name", "func", "base_url"}, ...]，func 为返回 coroutine 的无参可调用对象。
+        """
+        last_error = None
+        for idx, endpoint_info in enumerate(endpoints, 1):
+            endpoint_name = endpoint_info["name"]
+            endpoint_func = endpoint_info["func"]
+            base_url = endpoint_info.get("base_url", "")
+
+            try:
+                resp = await asyncio.wait_for(endpoint_func(), timeout=timeout)
+                # margin 限速响应当作可返回结果，由调用方处理
+                if not self._is_margin_response(resp):
+                    check_response(resp)
+
+                self._record_endpoint_result(endpoint_name, success=True, is_405=False)
+                if idx > 1:
+                    logger.warning(f"⚠️ {label} 主端点失败，使用备用端点 {endpoint_name} 成功")
+                return resp
+
+            except Exception as e:
+                error_msg = str(e)
+                last_error = e
+                is_405 = self._is_405_error(e)
+                self._record_endpoint_result(endpoint_name, success=False, is_405=is_405)
+
+                if is_405:
+                    logger.warning(f"⚠️ 端点 {endpoint_name} ({base_url}) 返回 405，切换到备用端点")
+                    if idx < len(endpoints):
+                        await asyncio.sleep(1)
+                        continue
+                else:
+                    logger.warning(f"⚠️ 端点 {endpoint_name} ({base_url}) 失败: {error_msg}")
+
+                if idx < len(endpoints):
+                    await asyncio.sleep(0.5)
+                    continue
+                break
+
+        logger.error(f"❌ 所有 {label} 端点均失败，最后错误: {last_error}")
+        raise last_error
+
     async def _share_snap_with_fallback(self, payload: dict, **kwargs) -> dict:
         """
         多端点容错的 share_snap 调用
         策略：优先 app 接口（proapi），失败自动降级到 webapi
-        
-        :param payload: share_snap 请求参数
-        :return: API 响应字典
-        :raises: 所有端点都失败时抛出最后一个异常
         """
         endpoints = [
             {
                 "name": "share_snap_app",
                 "func": lambda: self.client.share_snap_app(
-                    payload, 
+                    payload,
                     base_url="https://proapi.115.com",
                     async_=True,
                     **self._get_ios_ua_kwargs(),
@@ -505,53 +562,87 @@ class P115Service:
                 "base_url": "https://webapi.115.com"
             },
         ]
-        
-        last_error = None
-        for idx, endpoint_info in enumerate(endpoints, 1):
-            endpoint_name = endpoint_info["name"]
-            endpoint_func = endpoint_info["func"]
-            base_url = endpoint_info["base_url"]
-            
-            try:
-                resp = await asyncio.wait_for(endpoint_func(), timeout=30)
-                check_response(resp)
-                
-                # 记录成功
-                self._record_endpoint_result(endpoint_name, success=True, is_405=False)
-                
-                if idx > 1:
-                    logger.warning(f"⚠️ share_snap 主端点失败，使用备用端点 {endpoint_name} 成功")
-                
-                return resp
-                
-            except Exception as e:
-                error_msg = str(e)
-                last_error = e
-                is_405 = "405" in error_msg or "Method Not Allowed" in error_msg.lower()
-                
-                # 记录失败
-                self._record_endpoint_result(endpoint_name, success=False, is_405=is_405)
-                
-                # 405 或风控错误，尝试下一个端点
-                if is_405:
-                    logger.warning(f"⚠️ 端点 {endpoint_name} ({base_url}) 返回 405，切换到备用端点")
-                    if idx < len(endpoints):
-                        await asyncio.sleep(1)  # 冷却1秒
-                        continue
-                else:
-                    logger.warning(f"⚠️ 端点 {endpoint_name} ({base_url}) 失败: {error_msg}")
-                
-                # 如果不是最后一个端点，尝试下一个
-                if idx < len(endpoints):
-                    await asyncio.sleep(0.5)  # 短暂冷却
-                    continue
-                
-                # 最后一个端点也失败，抛出异常
-                break
-        
-        # 所有端点都失败
-        logger.error(f"❌ 所有 share_snap 端点均失败，最后错误: {last_error}")
-        raise last_error
+        return await self._call_endpoints_with_fallback(
+            endpoints, timeout=30, label="share_snap"
+        )
+
+    async def _fs_category_get_with_fallback(self, cid, *, timeout: float = 10) -> dict:
+        """目录属性：proapi/ios → webapi（无 app）。"""
+        ios_kw = self._get_ios_ua_kwargs()
+        endpoints = [
+            {
+                "name": "fs_category_proapi",
+                "base_url": "https://proapi.115.com",
+                "func": lambda: self.client.fs_category_get_app(
+                    cid,
+                    base_url="https://proapi.115.com",
+                    async_=True,
+                    **ios_kw,
+                ),
+            },
+            {
+                "name": "fs_category_webapi",
+                "base_url": "https://webapi.115.com",
+                "func": lambda: self.client.fs_category_get(
+                    cid,
+                    base_url="https://webapi.115.com",
+                    async_=True,
+                    headers=ios_kw.get("headers"),
+                ),
+            },
+        ]
+        return await self._call_endpoints_with_fallback(
+            endpoints, timeout=timeout, label="fs_category_get"
+        )
+
+    async def _fs_files_with_fallback(self, payload: dict, *, timeout: float = 30) -> dict:
+        """列目录：app2 → app → aps → webapi。"""
+        ios_kw = self._get_ios_ua_kwargs()
+        endpoints = [
+            {
+                "name": "fs_files_app2",
+                "base_url": "https://proapi.115.com",
+                "func": lambda: self.client.fs_files_app2(
+                    payload,
+                    base_url="https://proapi.115.com",
+                    async_=True,
+                    **ios_kw,
+                ),
+            },
+            {
+                "name": "fs_files_app",
+                "base_url": "https://proapi.115.com",
+                "func": lambda: self.client.fs_files_app(
+                    payload,
+                    base_url="https://proapi.115.com",
+                    async_=True,
+                    **ios_kw,
+                ),
+            },
+            {
+                "name": "fs_files_aps",
+                "base_url": "https://aps.115.com",
+                "func": lambda: self.client.fs_files_aps(
+                    payload,
+                    base_url="https://aps.115.com",
+                    async_=True,
+                    headers=ios_kw.get("headers"),
+                ),
+            },
+            {
+                "name": "fs_files_webapi",
+                "base_url": "https://webapi.115.com",
+                "func": lambda: self.client.fs_files(
+                    payload,
+                    base_url="https://webapi.115.com",
+                    async_=True,
+                    headers=ios_kw.get("headers"),
+                ),
+            },
+        ]
+        return await self._call_endpoints_with_fallback(
+            endpoints, timeout=timeout, label="fs_files"
+        )
 
 
     async def _task_worker(self):
@@ -1496,7 +1587,7 @@ class P115Service:
 
             receive_payload = {
                 "share_code": payload["share_code"],
-                "receive_code": payload["receive_code"] or "",
+                "receive_code": payload.get("receive_code") or "",
                 "file_id": ",".join(fids),
                 "cid": task_cid
             }
@@ -1658,7 +1749,7 @@ class P115Service:
                 _cid = task_cid if 'task_cid' in locals() and task_cid else to_cid
                 retry_payload = {
                     "share_code": payload["share_code"],
-                    "receive_code": payload["receive_code"] or "",
+                    "receive_code": payload.get("receive_code") or "",
                     "file_id": ",".join(fids) if 'fids' in locals() else "",
                     "cid": _cid
                 }
@@ -1731,7 +1822,7 @@ class P115Service:
         """递归分批保存分享内容 (规避 500 文件限制，集成中转清理逻辑)"""
         payload = share_extract_payload(share_url)
         share_code = payload["share_code"]
-        receive_code = payload["receive_code"] or ""
+        receive_code = payload.get("receive_code") or ""
         
         # 状态追踪
         cid_map = {0: target_pid}
@@ -2071,12 +2162,9 @@ class P115Service:
         seen_page_signatures = set()
         try:
             while True:
-                resp = await self._api_call_with_timeout(
-                    self.client.fs_files_app2,
+                resp = await self._fs_files_with_fallback(
                     {"cid": cid, "limit": limit, "offset": offset, "show_dir": 1},
-                    async_=True,
-                    timeout=30, max_retries=2, label="fs_files_get_items",
-                    **self._get_ios_ua_kwargs()
+                    timeout=30,
                 )
                 # 🛡️ 检测 115 限速响应
                 if self._is_margin_response(resp):
@@ -2209,12 +2297,9 @@ class P115Service:
         logger.info(f"🔍 fs_search 找到 {len(matched)}/{len(target_names)} 个文件，尝试 fs_files 查找剩余: {remaining_names}")
         
         try:
-            resp = await self._api_call_with_timeout(
-                self.client.fs_files_app2,
+            resp = await self._fs_files_with_fallback(
                 {"cid": cid, "limit": 500, "show_dir": 1},
-                async_=True,
-                timeout=30, max_retries=2, label="fs_files",
-                **self._get_ios_ua_kwargs()
+                timeout=30,
             )
             check_response(resp)
             file_list = resp.get("data", [])
@@ -2314,12 +2399,8 @@ class P115Service:
                 try:
                     logger.debug(f"🔍 探测子目录属性详情 (第 {poll_attempt}/{max_poll_attempts} 次), CID: {to_cid}")
                     
-                    # 1. 尝试用你想要的方案：调用类 `fs_category_get` 获取实时深度体积
-                    resp = await self._api_call_with_timeout(
-                        self.client.fs_category_get_app, to_cid,
-                        async_=True, timeout=10, max_retries=1, label="fs_category_get_poll",
-                        **self._get_ios_ua_kwargs()
-                    )
+                    # 1. 多端点获取实时深度体积（proapi → webapi）
+                    resp = await self._fs_category_get_with_fallback(to_cid, timeout=10)
                     
                     # 🛡️ 检测 115 限速响应 {"margin": N}，不消耗轮询次数
                     if self._is_margin_response(resp):
@@ -2393,8 +2474,8 @@ class P115Service:
                     if self._is_405_error(e):
                         saw_405 = True
                         logger.warning(
-                            f"🚫 检索目录内容或属性触发 405 风控 (第 {poll_attempt} 次)，"
-                            f"立即转入分享排队（每 5 分钟重试，最多 30 次）: {e}"
+                            f"🚫 目录端点全部 405 (第 {poll_attempt} 次)，"
+                            f"转入分享排队（每 5 分钟重试，最多 30 次）: {e}"
                         )
                         return self._margin_limited_payload(
                             save_result,
@@ -2895,11 +2976,7 @@ class P115Service:
             stable_count = 0
             max_wait_attempts = 15
             for attempt in range(1, max_wait_attempts + 1):
-                resp = await self._api_call_with_timeout(
-                    self.client.fs_category_get_app, cid,
-                    async_=True, timeout=10, max_retries=1, label="replace_words_poll",
-                    **self._get_ios_ua_kwargs()
-                )
+                resp = await self._fs_category_get_with_fallback(cid, timeout=10)
                 if resp and not self._is_margin_response(resp):
                     cur_file = int(resp.get("count", 0) or resp.get("file_count", 0))
                     cur_folder = int(resp.get("folder_count", 0))
@@ -3093,7 +3170,8 @@ class P115Service:
                 if target_cid in dir_hint_cache:
                     return dir_hint_cache[target_cid]
                 try:
-                    sub_items = await self.fs.readdir(target_cid, async_=True, **self._get_ios_ua_kwargs())
+                    # 走多端点降级列目录，避免 readdir 死钉单一 proapi 接口
+                    sub_items = await self._get_dir_items(int(target_cid), strict=False)
                     hint = infer_media_hint_from_items(sub_items)
                 except Exception:
                     hint = "unknown"
@@ -3113,7 +3191,7 @@ class P115Service:
                 visited.add(current_cid)
                 
                 try:
-                    items = await self.fs.readdir(current_cid, async_=True, **self._get_ios_ua_kwargs())
+                    items = await self._get_dir_items(int(current_cid), strict=True)
                 except Exception as read_ex:
                     if self._is_405_error(read_ex):
                         logger.error(
