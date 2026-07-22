@@ -2366,6 +2366,9 @@ class P115Service:
         original_total_size = save_result.get("original_total_size", 0)
         original_file_count = save_result.get("original_file_count", 0)
         original_folder_count = save_result.get("original_folder_count", 0)
+        # 源分享含违规文件：转存时必有文件被 115 跳过，落地体积注定小于源声明。
+        # 此时不能以体积追平基准为完成条件，改由「顶层建好 + 体积停滞」判定。
+        has_violation = bool(save_result.get("have_vio", False))
 
         # 🔑 Bug 修复: 安全断言——禁止对根保存目录或根目录(CID=0)发起分享。
         # 当 _ensure_save_dir 缓存失效后回退到旧/错误 CID 时，to_cid 可能等于根保存目录
@@ -2390,6 +2393,11 @@ class P115Service:
 
         # 源分享规模是完成判定的硬基准，不能只依赖目标目录暂时稳定。
         logger.info(f"📊 [基准比对数据] 转存源分享规模: 大小 = {original_total_size} 字节, 文件数 = {original_file_count}, 文件夹数 = {original_folder_count}")
+        if has_violation:
+            logger.warning(
+                "⚠️ 源分享含违规文件 (have_vio=1)，预期部分文件无法保存、体积追不平基准，"
+                "将以「顶层结构匹配 + 体积停滞」判定完成"
+            )
 
         try:
             logger.info(f"⏳ 等待文件深度属性写入子孙目录 (CID: {to_cid})...")
@@ -2398,6 +2406,14 @@ class P115Service:
             stable_times = 0
             max_poll_attempts = 45 # 最多等待约 90s
             min_stable_required = 3 # 稳定不变的次数要求
+
+            # 体积停滞兜底：顶层结构已建好但体积追不平基准（如违规文件被跳过）时，
+            # 体积连续不变达到阈值即判定转存完成，避免死循环空转并触发 405。
+            last_seen_size = -1
+            size_stagnant_times = 0
+            # 违规分享注定追不平基准，用更短的停滞阈值尽快完成
+            min_stagnant_required = 2 if has_violation else 3
+            size_stagnant_done = False
 
             margin_hit_count = 0  # margin 限速不消耗轮询次数，单独计数
             max_margin_hits = 30  # margin 最多容忍 30 次（约 2.5 分钟）
@@ -2462,6 +2478,13 @@ class P115Service:
                     # 定时移动/复制流程会在改名前执行更严格的名称/ID匹配。
                     top_match = len(current_items) == len(names)
 
+                    # 体积停滞统计：顶层建好后，若体积连续不再变化，视为转存已停止增长
+                    if current_size > 0 and current_size == last_seen_size:
+                        size_stagnant_times += 1
+                    else:
+                        size_stagnant_times = 0
+                    last_seen_size = current_size
+
                     if stats_match and top_match:
                         stable_times += 1
                         logger.info(
@@ -2472,10 +2495,24 @@ class P115Service:
                             logger.info(f"✅ 目标目录与源分享基准连续一致，确认转存完成")
                             new_fids = [item["id"] for item in current_items]
                             break
+                    elif (
+                        top_match
+                        and current_size > 0
+                        and size_stagnant_times >= min_stagnant_required
+                    ):
+                        # 兜底：体积追不平基准但已连续多轮停滞（常见于源含违规文件被跳过）
+                        logger.warning(
+                            f"⏹️ 体积连续 {size_stagnant_times} 轮停滞({current_size} 字节)"
+                            f"且顶层结构匹配，判定转存完成（可能因违规文件被跳过，基准={orig_size}）"
+                        )
+                        new_fids = [item["id"] for item in current_items]
+                        size_stagnant_done = True
+                        break
                     else:
                         logger.info(
                             "📈 目标目录尚未达到源分享基准: "
                             f"统计匹配={stats_match}, 顶层结构匹配={top_match}, "
+                            f"体积停滞={size_stagnant_times}/{min_stagnant_required}, "
                             f"当前总项数={current_total}"
                         )
                         stable_times = 0
