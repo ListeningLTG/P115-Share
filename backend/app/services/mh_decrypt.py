@@ -1,5 +1,5 @@
 """
-MediaHelper RT 加密分享链接解密
+MediaHelper 加密分享链接解密（旧 RT2Z… / 新长密文 3V9u… 等）
 流程: 选 115 账号 → analyze-share-async → 轮询 progress 取明文 URL → cancel
 """
 import asyncio
@@ -17,12 +17,12 @@ _SHARE_CODE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# 普通 share_code 约 11 位；RT 加密码以 RT 开头且明显更长
-_RT_MIN_LEN = 20
+# 普通 share_code 约 11 位；加密分享码明显更长（旧 RT2Z…，新约 190 位 base64 风格密文）
+_ENCRYPTED_SHARE_CODE_MIN_LEN = 20
 
 
 class MHDecryptError(Exception):
-    """RT 链接解密失败"""
+    """加密分享链接解密失败"""
 
 
 def extract_share_code(url: str) -> Optional[str]:
@@ -31,11 +31,15 @@ def extract_share_code(url: str) -> Optional[str]:
 
 
 def is_rt_encrypted_url(url: str) -> bool:
-    """判断是否为 115 RT 加密分享链接"""
+    """判断是否为 115 加密分享链接（需经 MH 解密后再转存）。
+
+    不再依赖 RT 前缀：旧版以 RT 开头，新版为更长的字母数字密文（如 3V9u…）。
+    用长度区分普通 ~11 位 share_code 与加密密文。
+    """
     code = extract_share_code(url)
     if not code:
         return False
-    return code.startswith("RT") and len(code) >= _RT_MIN_LEN
+    return len(code) >= _ENCRYPTED_SHARE_CODE_MIN_LEN
 
 
 def _is_plaintext_share_url(url: str) -> bool:
@@ -121,7 +125,7 @@ async def _cancel_task(task_id: str) -> None:
 
 async def decrypt_rt_share_url(url: str, poll_interval: float = 2.0, max_wait: int = 120) -> str:
     """
-    解密 RT 加密分享链接，返回明文 115 分享 URL（可含 password）。
+    解密加密分享链接，返回明文 115 分享 URL（可含 password）。
     拿到明文后立即 cancel，不等待分析完成。
     """
     if not is_rt_encrypted_url(url):
@@ -129,9 +133,9 @@ async def decrypt_rt_share_url(url: str, poll_interval: float = 2.0, max_wait: i
 
     address = (settings.MH_ADDRESS or "").strip()
     if not address:
-        raise MHDecryptError("未配置 MediaHelper 地址，无法解密 RT 加密链接")
+        raise MHDecryptError("未配置 MediaHelper 地址，无法解密加密分享链接")
     if not (settings.MH_USERNAME or "").strip() or not (settings.MH_PASSWORD or "").strip():
-        raise MHDecryptError("MediaHelper 用户名或密码未配置，无法解密 RT 加密链接")
+        raise MHDecryptError("MediaHelper 用户名或密码未配置，无法解密加密分享链接")
 
     async with _decrypt_lock:
         if url in _rt_decrypt_cache:
@@ -161,7 +165,7 @@ async def decrypt_rt_share_url(url: str, poll_interval: float = 2.0, max_wait: i
             raise MHDecryptError(f"提交 MH 分析任务失败: {msg}")
 
         task_id = analyze_resp["data"]["task_id"]
-        logger.info(f"MH: 已提交 RT 解密分析任务 {task_id}")
+        logger.info(f"MH: 已提交加密链接解密分析任务 {task_id}")
 
         plaintext: Optional[str] = None
         try:
@@ -216,7 +220,7 @@ async def decrypt_rt_share_url(url: str, poll_interval: float = 2.0, max_wait: i
 
 
 async def normalize_115_share_url(url: str) -> str:
-    """若为 RT 加密链接则解密，否则原样返回。"""
+    """若为加密分享链接则解密，否则原样返回。"""
     if is_rt_encrypted_url(url):
         return await decrypt_rt_share_url(url)
     return url
