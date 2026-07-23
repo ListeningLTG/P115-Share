@@ -275,16 +275,18 @@ class P115Service:
         self._margin_retry_queue: deque = deque()
         self._margin_poller_task: Optional[asyncio.Task] = None
         
-        # 端点健康度监控（防 405）
+        # 端点健康度监控（防 405）；cooldown_until / consecutive_405 / last_alert 用于粘性降级
+        self._endpoint_cooldown_seconds = 600  # 连续 405 后冷却 10 分钟
+        self._endpoint_alert_interval = 300    # 同端点告警最少间隔 5 分钟
         self._endpoint_stats = {
-            "share_snap_app": {"success": 0, "fail": 0, "last_405": 0},
-            "share_snap_webapi": {"success": 0, "fail": 0, "last_405": 0},
-            "fs_category_proapi": {"success": 0, "fail": 0, "last_405": 0},
-            "fs_category_webapi": {"success": 0, "fail": 0, "last_405": 0},
-            "fs_files_app2": {"success": 0, "fail": 0, "last_405": 0},
-            "fs_files_app": {"success": 0, "fail": 0, "last_405": 0},
-            "fs_files_aps": {"success": 0, "fail": 0, "last_405": 0},
-            "fs_files_webapi": {"success": 0, "fail": 0, "last_405": 0},
+            "share_snap_app": {"success": 0, "fail": 0, "last_405": 0, "consecutive_405": 0, "cooldown_until": 0, "last_alert": 0},
+            "share_snap_webapi": {"success": 0, "fail": 0, "last_405": 0, "consecutive_405": 0, "cooldown_until": 0, "last_alert": 0},
+            "fs_category_proapi": {"success": 0, "fail": 0, "last_405": 0, "consecutive_405": 0, "cooldown_until": 0, "last_alert": 0},
+            "fs_category_webapi": {"success": 0, "fail": 0, "last_405": 0, "consecutive_405": 0, "cooldown_until": 0, "last_alert": 0},
+            "fs_files_app2": {"success": 0, "fail": 0, "last_405": 0, "consecutive_405": 0, "cooldown_until": 0, "last_alert": 0},
+            "fs_files_app": {"success": 0, "fail": 0, "last_405": 0, "consecutive_405": 0, "cooldown_until": 0, "last_alert": 0},
+            "fs_files_aps": {"success": 0, "fail": 0, "last_405": 0, "consecutive_405": 0, "cooldown_until": 0, "last_alert": 0},
+            "fs_files_webapi": {"success": 0, "fail": 0, "last_405": 0, "consecutive_405": 0, "cooldown_until": 0, "last_alert": 0},
         }
         
         # Cookie 文件管理（用于自动恢复登录态）
@@ -435,22 +437,48 @@ class P115Service:
         }
 
     def _record_endpoint_result(self, endpoint: str, success: bool, is_405: bool = False):
-        """记录端点调用结果，用于监控与告警"""
-        stats = self._endpoint_stats.get(endpoint, {})
+        """记录端点调用结果，用于监控、冷却与告警节流"""
+        stats = self._endpoint_stats.setdefault(
+            endpoint,
+            {"success": 0, "fail": 0, "last_405": 0, "consecutive_405": 0, "cooldown_until": 0, "last_alert": 0},
+        )
+        now = time.time()
         if success:
             stats["success"] = stats.get("success", 0) + 1
-        else:
-            stats["fail"] = stats.get("fail", 0) + 1
-            if is_405:
-                stats["last_405"] = time.time()
-        
-        # 告警阈值：5分钟内连续出现 405
-        if is_405:
-            last_405_time = stats.get("last_405", 0)
-            if last_405_time > 0 and time.time() - last_405_time < 300:
-                fail_count = stats.get("fail", 0)
-                if fail_count > 3:  # 连续3次以上失败
-                    logger.error(f"🚨 端点 {endpoint} 持续被 405 风控 (失败{fail_count}次)，建议检查登录态")
+            stats["consecutive_405"] = 0
+            return
+
+        stats["fail"] = stats.get("fail", 0) + 1
+        if not is_405:
+            stats["consecutive_405"] = 0
+            return
+
+        stats["last_405"] = now
+        consecutive = int(stats.get("consecutive_405", 0)) + 1
+        stats["consecutive_405"] = consecutive
+
+        # 连续 ≥3 次 405：进入冷却，跳过该端点
+        if consecutive >= 3:
+            cooldown_until = float(stats.get("cooldown_until", 0) or 0)
+            if now >= cooldown_until:
+                stats["cooldown_until"] = now + self._endpoint_cooldown_seconds
+                logger.warning(
+                    f"🧊 端点 {endpoint} 连续 {consecutive} 次 405，"
+                    f"冷却 {self._endpoint_cooldown_seconds // 60} 分钟"
+                )
+
+            last_alert = float(stats.get("last_alert", 0) or 0)
+            if now - last_alert >= self._endpoint_alert_interval:
+                stats["last_alert"] = now
+                logger.error(
+                    f"🚨 端点 {endpoint} 持续被 405 风控 "
+                    f"(连续{consecutive}次/累计失败{stats.get('fail', 0)}次)，建议检查登录态"
+                )
+
+    def _is_endpoint_in_cooldown(self, endpoint: str) -> bool:
+        """端点是否仍在 405 冷却期内。"""
+        stats = self._endpoint_stats.get(endpoint) or {}
+        return time.time() < float(stats.get("cooldown_until", 0) or 0)
 
     def _check_cookie_freshness(self):
         """检查并同步最新 cookie（如果文件被外部更新）"""
@@ -499,13 +527,20 @@ class P115Service:
         """按顺序尝试多个端点；405/失败时切换下一个，全部失败则抛出最后异常。
 
         endpoints: [{"name", "func", "base_url"}, ...]，func 为返回 coroutine 的无参可调用对象。
+        冷却中的端点直接跳过，避免对已风控的 proapi 反复探测。
         """
         last_error = None
-        for idx, endpoint_info in enumerate(endpoints, 1):
+        attempted = 0
+        for endpoint_info in endpoints:
             endpoint_name = endpoint_info["name"]
             endpoint_func = endpoint_info["func"]
             base_url = endpoint_info.get("base_url", "")
 
+            if self._is_endpoint_in_cooldown(endpoint_name):
+                logger.debug(f"⏭️ 端点 {endpoint_name} 仍在 405 冷却中，跳过")
+                continue
+
+            attempted += 1
             try:
                 resp = await asyncio.wait_for(endpoint_func(), timeout=timeout)
                 # margin 限速响应当作可返回结果，由调用方处理
@@ -513,7 +548,7 @@ class P115Service:
                     check_response(resp)
 
                 self._record_endpoint_result(endpoint_name, success=True, is_405=False)
-                if idx > 1:
+                if attempted > 1:
                     logger.warning(f"⚠️ {label} 主端点失败，使用备用端点 {endpoint_name} 成功")
                 return resp
 
@@ -525,17 +560,14 @@ class P115Service:
 
                 if is_405:
                     logger.warning(f"⚠️ 端点 {endpoint_name} ({base_url}) 返回 405，切换到备用端点")
-                    if idx < len(endpoints):
-                        await asyncio.sleep(1)
-                        continue
+                    await asyncio.sleep(1)
                 else:
                     logger.warning(f"⚠️ 端点 {endpoint_name} ({base_url}) 失败: {error_msg}")
-
-                if idx < len(endpoints):
                     await asyncio.sleep(0.5)
-                    continue
-                break
+                continue
 
+        if last_error is None:
+            last_error = RuntimeError(f"所有 {label} 端点均在冷却中，无可用端点")
         logger.error(f"❌ 所有 {label} 端点均失败，最后错误: {last_error}")
         raise last_error
 
@@ -2199,6 +2231,10 @@ class P115Service:
                 )
                 if page_signature in seen_page_signatures:
                     message = f"目录 {cid} 分页返回重复页面，offset={offset}"
+                    # aps/proapi 在翻过末页时常回显上一页；已有数据且 offset>0 视为 EOF
+                    if offset > 0 and items:
+                        logger.warning(f"⚠️ {message}，已收集 {len(items)} 项，视为翻页结束")
+                        break
                     if strict:
                         raise RuntimeError(message)
                     logger.warning(message)
@@ -3233,19 +3269,7 @@ class P115Service:
         try:
             to_rename = []
             visited = set()
-            dir_hint_cache: Dict[int, str] = {}
-
-            async def get_dir_hint(target_cid: int) -> str:
-                if target_cid in dir_hint_cache:
-                    return dir_hint_cache[target_cid]
-                try:
-                    # 走多端点降级列目录，避免 readdir 死钉单一 proapi 接口
-                    sub_items = await self._get_dir_items(int(target_cid), strict=False)
-                    hint = infer_media_hint_from_items(sub_items)
-                except Exception:
-                    hint = "unknown"
-                dir_hint_cache[target_cid] = hint
-                return hint
+            dir_interval_seconds = 0.25
 
             async def walk_and_collect(
                 current_cid: int,
@@ -3258,10 +3282,12 @@ class P115Service:
                 if current_cid in visited:
                     return
                 visited.add(current_cid)
-                
+
                 try:
-                    items = await self._get_dir_items(int(current_cid), strict=True)
-                    if int(current_cid) == int(cid):
+                    # 根目录 strict：全端点失败可触发 SENSITIVE_SKIP_405；子目录非严格避免整树中断
+                    is_root = int(current_cid) == int(cid)
+                    items = await self._get_dir_items(int(current_cid), strict=is_root)
+                    if is_root:
                         sensitive_405_hits[0] = 0
                 except Exception as read_ex:
                     if self._is_405_error(read_ex):
@@ -3283,6 +3309,7 @@ class P115Service:
 
                 dirs = [item for item in items if item.get("is_dir")]
                 files = [item for item in items if not item.get("is_dir")]
+                # 复用本次列目录结果推断 hint，避免对子目录二次 _get_dir_items
                 dir_structure_hint = infer_media_hint_from_items(items)
                 current_hint = dir_structure_hint if dir_structure_hint != "unknown" else inherited_hint
 
@@ -3295,12 +3322,7 @@ class P115Service:
                     old_name = d.get("name")
                     if sub_cid is not None and old_name:
                         name_hint = infer_media_hint_from_name(old_name)
-                        child_structure_hint = await get_dir_hint(sub_cid)
-                        d_media_hint = (
-                            name_hint if name_hint != "unknown"
-                            else child_structure_hint if child_structure_hint != "unknown"
-                            else current_hint
-                        )
+                        d_media_hint = name_hint if name_hint != "unknown" else current_hint
                         own_tmdb = extract_tmdb_id_from_name(old_name)
                         child_tmdb = own_tmdb if own_tmdb is not None else inherited_tmdb_id
                         d_new_name, d_replacements = await process_name(
@@ -3312,6 +3334,7 @@ class P115Service:
                         )
                         # Season 等中间目录只透传 tmdb，不强制写入目录名
                         pass_tmdb = extract_tmdb_id_from_name(d_new_name) or child_tmdb
+                        await asyncio.sleep(dir_interval_seconds)
                         await walk_and_collect(sub_cid, d_replacements, d_media_hint, pass_tmdb)
                         if d_new_name != old_name:
                             to_rename.append((sub_cid, d_new_name, old_name))

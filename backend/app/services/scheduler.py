@@ -103,15 +103,7 @@ async def _get_existing_dir_cid(svc, path: str) -> int:
 async def _read_dir_snapshot(svc, cid: int) -> dict:
     """严格读取目录顶层结构和服务端递归统计。"""
     items = await svc._get_dir_items(cid, strict=True)
-    resp = await svc._api_call_with_timeout(
-        svc.client.fs_category_get_app,
-        cid,
-        async_=True,
-        timeout=30,
-        max_retries=2,
-        label="scheduled_share_dir_stats",
-        **svc._get_ios_ua_kwargs(),
-    )
+    resp = await svc._fs_category_get_with_fallback(cid, timeout=30)
     if svc._is_margin_response(resp):
         raise RuntimeError(f"读取目录 {cid} 统计时触发限速: {resp}")
     check_response(resp)
