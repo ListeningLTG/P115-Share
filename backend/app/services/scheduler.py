@@ -661,7 +661,13 @@ async def _run_scheduled_share_task(task_id: int):
 
 class CleanupScheduler:
     def __init__(self):
-        self.scheduler = AsyncIOScheduler()
+        self.scheduler = AsyncIOScheduler(
+            job_defaults={
+                "misfire_grace_time": 300,
+                "coalesce": True,
+                "max_instances": 1,
+            }
+        )
 
     def start(self):
         """Start the scheduler"""

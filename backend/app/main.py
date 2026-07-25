@@ -91,15 +91,16 @@ def websocket_sink(message):
 LOG_DIR = "data/logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
-logger.add(websocket_sink, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{line} | {message}", level=settings.LOG_LEVEL)
-logger.add(sys.stdout, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level}</level> | <cyan>{name}:{line}</cyan> | {message}", level=settings.LOG_LEVEL)
+logger.add(websocket_sink, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{line} | {message}", level=settings.LOG_LEVEL, enqueue=True)
+logger.add(sys.stdout, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level}</level> | <cyan>{name}:{line}</cyan> | {message}", level=settings.LOG_LEVEL, enqueue=True)
 logger.add(
     os.path.join(LOG_DIR, "p115share_{time:YYYY-MM-DD}.log"),
     rotation="00:00",
     retention="7 days",
     format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{line} | {message}",
     encoding="utf-8",
-    level=settings.LOG_LEVEL
+    level=settings.LOG_LEVEL,
+    enqueue=True
 )
 
 @asynccontextmanager
