@@ -303,8 +303,12 @@
                     <a-switch v-model:checked="sensitiveReplaceEnabled" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
                   </div>
                   <div class="form-item" style="flex: 1; margin-left: 24px" v-if="sensitiveReplaceEnabled">
-                    <label>启用中文名称替换为拼音全拼</label>
-                    <a-switch v-model:checked="sensitiveReplacePinyin" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)" />
+                    <label>中文名称替换为拼音全拼</label>
+                    <a-select v-model:value="sensitiveReplacePinyin" style="width: 260px" :disabled="['running', 'pausing', 'cancelling'].includes(currentTask?.status)">
+                      <a-select-option value="0">禁用 (不转换拼音)</a-select-option>
+                      <a-select-option value="1">直接替换为拼音全拼 (无条件)</a-select-option>
+                      <a-select-option value="2">仅在包含 TMDB ID 时替换为拼音全拼</a-select-option>
+                    </a-select>
                   </div>
                   <div class="form-item" style="flex: 1; margin-left: 24px" v-if="sensitiveReplaceEnabled">
                     <label>启用 TMDB 别名替换</label>
@@ -566,7 +570,7 @@ const directSaveAccountId = ref<number | undefined>(undefined);
 const directSaveDir = ref('115-Save');
 const shareInterval = ref(0);
 const sensitiveReplaceEnabled = ref(false);
-const sensitiveReplacePinyin = ref(false);
+const sensitiveReplacePinyin = ref('0');
 const sensitiveReplaceTmdb = ref(false);
 const isTmdbConfigured = ref(false);
 const isConfigCollapsed = ref(false);
@@ -690,7 +694,10 @@ const fetchCurrentTask = async () => {
       if (updatedTask.target_dir !== undefined) directSaveDir.value = updatedTask.target_dir || '115-Save';
       if (updatedTask.share_interval !== undefined) shareInterval.value = updatedTask.share_interval || 0;
       if (updatedTask.sensitive_replace_enabled !== undefined) sensitiveReplaceEnabled.value = updatedTask.sensitive_replace_enabled || false;
-      if (updatedTask.sensitive_replace_pinyin !== undefined) sensitiveReplacePinyin.value = updatedTask.sensitive_replace_pinyin || false;
+      if (updatedTask.sensitive_replace_pinyin !== undefined) {
+        const pVal = updatedTask.sensitive_replace_pinyin;
+        sensitiveReplacePinyin.value = typeof pVal === 'boolean' ? (pVal ? '1' : '0') : String(pVal || '0');
+      }
       if (updatedTask.sensitive_replace_tmdb !== undefined) {
         sensitiveReplaceTmdb.value = isTmdbConfigured.value ? (updatedTask.sensitive_replace_tmdb || false) : false;
       }
@@ -746,7 +753,8 @@ const selectTask = (id: number) => {
   directSaveDir.value = task?.target_dir || '115-Save';
   shareInterval.value = task?.share_interval || 0;
   sensitiveReplaceEnabled.value = task?.sensitive_replace_enabled || false;
-  sensitiveReplacePinyin.value = task?.sensitive_replace_pinyin || false;
+  const pVal = task?.sensitive_replace_pinyin;
+  sensitiveReplacePinyin.value = typeof pVal === 'boolean' ? (pVal ? '1' : '0') : String(pVal || '0');
   sensitiveReplaceTmdb.value = isTmdbConfigured.value ? (task?.sensitive_replace_tmdb || false) : false;
   
   pagination.current = 1;

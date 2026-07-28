@@ -165,8 +165,8 @@ async def _save_state_to_db(account_id: int):
 
 
 async def perform_share_analysis(account_id: int):
-    """对指定账号执行全量分享分析"""
-    svc = account_manager.get_service(account_id)
+    """对指定账号执行全量分享分析（支持禁用账号）"""
+    svc = await account_manager.get_service_for_analysis(account_id)
     if not svc or not svc.client:
         logger.warning(f"账号 {account_id} 未连接，无法执行分析")
         state = _get_state(account_id)
@@ -294,13 +294,13 @@ async def _refresh_analysis_stats(account_id: int):
 
 
 async def perform_batch_cancel(account_id: int):
-    """批量取消已失效和已过期的分享"""
+    """批量取消已失效和已过期的分享（支持禁用账号）"""
     state = _get_cancel_state(account_id)
     state["is_canceling"] = True
     state["done"] = 0
     state["failed"] = 0
 
-    svc = account_manager.get_service(account_id)
+    svc = await account_manager.get_service_for_analysis(account_id)
     if not svc or not svc.client:
         state["is_canceling"] = False
         return

@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # Sensitive Word Replacement Configuration
     SENSITIVE_REPLACE_ENABLED: bool = False
     SENSITIVE_REPLACE_MAPPING: str = "{}"
-    SENSITIVE_REPLACE_PINYIN: bool = False
+    SENSITIVE_REPLACE_PINYIN: str = "0"
     SENSITIVE_REPLACE_TMDB: bool = False
     TMDB_API_KEY: str = ""
 

@@ -1,5 +1,5 @@
 import json
-from typing import List, Optional
+from typing import List, Optional, Union
 from pydantic import BaseModel
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
 from sqlalchemy import select, desc
@@ -26,7 +26,7 @@ class StartTaskRequest(BaseModel):
     target_dir: Optional[str] = None
     share_interval: Optional[int] = 0
     sensitive_replace_enabled: Optional[bool] = False
-    sensitive_replace_pinyin: Optional[bool] = False
+    sensitive_replace_pinyin: Optional[Union[str, bool, int]] = "0"
     sensitive_replace_tmdb: Optional[bool] = False
 
 @router.post("/parse")

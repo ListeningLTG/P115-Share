@@ -198,11 +198,12 @@
           <a-switch v-model:checked="formState.sensitive_replace_enabled" />
         </a-form-item>
 
-        <a-form-item label="启用中文名称替换为拼音全拼" name="sensitive_replace_pinyin" v-if="formState.sensitive_replace_enabled">
-          <a-switch v-model:checked="formState.sensitive_replace_pinyin" />
-          <div style="font-size: 11px; color: #888; margin-top: 4px">
-            开启后，将中文名替换为拼音全拼，如「斗破苍穹」→「Duo Po Cang Qiong」（映射表、TMDB 均未命中时才生效）。
-          </div>
+        <a-form-item label="中文名称替换为拼音全拼" name="sensitive_replace_pinyin" v-if="formState.sensitive_replace_enabled">
+          <a-select v-model:value="formState.sensitive_replace_pinyin" style="width: 280px">
+            <a-select-option value="0">禁用 (不转换拼音)</a-select-option>
+            <a-select-option value="1">直接替换为拼音全拼 (无条件)</a-select-option>
+            <a-select-option value="2">仅在包含 TMDB ID 时替换为拼音全拼</a-select-option>
+          </a-select>
         </a-form-item>
 
         <a-form-item label="启用 TMDB 别名替换" name="sensitive_replace_tmdb" v-if="formState.sensitive_replace_enabled">
@@ -251,7 +252,7 @@ interface Task {
   last_run_at: string | null;
   created_at: string;
   sensitive_replace_enabled: boolean;
-  sensitive_replace_pinyin: boolean;
+  sensitive_replace_pinyin: string | boolean;
   sensitive_replace_tmdb: boolean;
 }
 
@@ -304,7 +305,7 @@ const formState = reactive({
   target_channels: [] as string[],
   enabled: true,
   sensitive_replace_enabled: false,
-  sensitive_replace_pinyin: false,
+  sensitive_replace_pinyin: '0',
   sensitive_replace_tmdb: false,
 });
 
@@ -422,7 +423,7 @@ const openCreateModal = () => {
   formState.target_channels = [];
   formState.enabled = true;
   formState.sensitive_replace_enabled = false;
-  formState.sensitive_replace_pinyin = false;
+  formState.sensitive_replace_pinyin = '0';
   formState.sensitive_replace_tmdb = false;
   modalVisible.value = true;
 };
@@ -441,7 +442,14 @@ const openEditModal = (record: Task) => {
   formState.target_channels = [...(record.target_channels || [])];
   formState.enabled = record.enabled;
   formState.sensitive_replace_enabled = record.sensitive_replace_enabled ?? false;
-  formState.sensitive_replace_pinyin = record.sensitive_replace_pinyin ?? false;
+  const pVal = record.sensitive_replace_pinyin;
+  if (typeof pVal === 'boolean') {
+    formState.sensitive_replace_pinyin = pVal ? '1' : '0';
+  } else if (pVal !== undefined && pVal !== null) {
+    formState.sensitive_replace_pinyin = String(pVal);
+  } else {
+    formState.sensitive_replace_pinyin = '0';
+  }
   formState.sensitive_replace_tmdb = isTmdbConfigured.value
     ? (record.sensitive_replace_tmdb ?? false)
     : false;

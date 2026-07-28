@@ -4,7 +4,7 @@
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
-from typing import Optional, List
+from typing import Optional, List, Union
 from sqlalchemy import select
 from app.api.auth import get_current_user
 from app.core.database import async_session
@@ -26,7 +26,7 @@ class ScheduledShareTaskCreate(BaseModel):
     target_channels: List[str] = []
     enabled: bool = True
     sensitive_replace_enabled: bool = False
-    sensitive_replace_pinyin: bool = False
+    sensitive_replace_pinyin: Union[str, bool, int] = "0"
     sensitive_replace_tmdb: bool = False
 
     @field_validator('min_size', mode='before')
@@ -50,7 +50,7 @@ class ScheduledShareTaskUpdate(BaseModel):
     target_channels: Optional[List[str]] = None
     enabled: Optional[bool] = None
     sensitive_replace_enabled: Optional[bool] = None
-    sensitive_replace_pinyin: Optional[bool] = None
+    sensitive_replace_pinyin: Optional[Union[str, bool, int]] = None
     sensitive_replace_tmdb: Optional[bool] = None
 
     @field_validator('min_size', mode='before')
@@ -132,7 +132,7 @@ async def create_task(data: ScheduledShareTaskCreate, user=Depends(get_current_u
             enabled=data.enabled,
             status="waiting" if data.enabled else "disabled",
             sensitive_replace_enabled=data.sensitive_replace_enabled,
-            sensitive_replace_pinyin=data.sensitive_replace_pinyin,
+            sensitive_replace_pinyin=str(data.sensitive_replace_pinyin) if data.sensitive_replace_pinyin is not None else "0",
             sensitive_replace_tmdb=data.sensitive_replace_tmdb
         )
         session.add(task)
@@ -163,6 +163,8 @@ async def update_task(task_id: int, data: ScheduledShareTaskUpdate, user=Depends
 
         # 更新字段
         update_dict = data.model_dump(exclude_unset=True)
+        if "sensitive_replace_pinyin" in update_dict and update_dict["sensitive_replace_pinyin"] is not None:
+            update_dict["sensitive_replace_pinyin"] = str(update_dict["sensitive_replace_pinyin"])
         # Reconcile share_mode and clear_files if either is updated
         if "share_mode" in update_dict or "clear_files" in update_dict:
             curr_share_mode = update_dict.get("share_mode", task.share_mode or ("move" if task.clear_files else "copy"))

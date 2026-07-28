@@ -3,6 +3,7 @@ import random
 import io
 import pandas as pd
 from datetime import datetime
+from typing import Union, Optional, Any
 from loguru import logger
 from sqlalchemy import select, update, delete, func
 from app.core.database import async_session
@@ -1080,7 +1081,7 @@ class ExcelBatchService:
             await session.commit()
             logger.info("✅ [分批分享] 子批次处理完成，状态已重置")
 
-    async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False, strategy: str = "transfer", target_account_id: int = None, target_dir: str = None, share_interval: int = 0, sensitive_replace_enabled: bool = False, sensitive_replace_pinyin: bool = False, sensitive_replace_tmdb: bool = False):
+    async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False, strategy: str = "transfer", target_account_id: int = None, target_dir: str = None, share_interval: int = 0, sensitive_replace_enabled: bool = False, sensitive_replace_pinyin: Union[str, bool, int] = "0", sensitive_replace_tmdb: bool = False):
         async with async_session() as session:
             # Get currrent status
             result = await session.execute(select(ExcelTask).where(ExcelTask.id == task_id))
@@ -1117,7 +1118,7 @@ class ExcelBatchService:
             task.target_dir = target_dir
             task.share_interval = share_interval
             task.sensitive_replace_enabled = sensitive_replace_enabled
-            task.sensitive_replace_pinyin = sensitive_replace_pinyin
+            task.sensitive_replace_pinyin = str(sensitive_replace_pinyin)
             task.sensitive_replace_tmdb = sensitive_replace_tmdb
             
             if not is_resume:

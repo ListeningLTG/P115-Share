@@ -20,13 +20,21 @@
                 <a-switch v-model:checked="replaceEnabled" />
               </a-form-item>
 
-              <a-form-item label="启用中文名称替换为拼音全拼">
+              <a-form-item label="中文名称替换为拼音全拼">
                 <template #extra>
                   <div style="font-size: 12px; color: #999; margin-top: 4px">
-                    开启后，生成分享前将文件和目录名中的中文替换为拼音全拼（如「斗破苍穹」→「Duo Po Cang Qiong」）。优先级最低（映射表、TMDB 均未命中时才生效）。仅在启用敏感词替换时生效。
+                    优先级最低（映射表、TMDB 均未命中时才生效）。仅在启用敏感词替换时生效。
+                    <br />
+                    • <b>直接替换为拼音全拼</b>：生成分享前将文件和目录名中的中文无条件替换为拼音全拼（如「斗破苍穹」→「Duo Po Cang Qiong」）。
+                    <br />
+                    • <b>仅包含 TMDB ID 时替换</b>：仅当文件或目录包含/继承 TMDB ID 标识（如 <code>{tmdbid=12345}</code>）时才转换为拼音全拼。
                   </div>
                 </template>
-                <a-switch v-model:checked="replacePinyin" :disabled="!replaceEnabled" />
+                <a-select v-model:value="replacePinyinMode" style="width: 300px" :disabled="!replaceEnabled">
+                  <a-select-option value="0">禁用 (不转换拼音)</a-select-option>
+                  <a-select-option value="1">直接替换为拼音全拼 (无条件)</a-select-option>
+                  <a-select-option value="2">仅在包含 TMDB ID 时替换为拼音全拼</a-select-option>
+                </a-select>
               </a-form-item>
 
               <a-form-item label="启用 TMDB 别名替换">
@@ -202,7 +210,7 @@ const activeTab = ref('replace');
 // Sensitive Replace State
 const replaceEnabled = ref(false);
 const replaceMappingStr = ref('{}');
-const replacePinyin = ref(false);
+const replacePinyinMode = ref('0');
 const replaceTmdb = ref(false);
 const savingReplace = ref(false);
 const isTmdbConfigured = ref(false);
@@ -277,7 +285,14 @@ const loadReplaceConfig = async () => {
     const res = await axios.get('/api/config/');
     replaceEnabled.value = res.data.sensitive_replace_enabled || false;
     replaceMappingStr.value = res.data.sensitive_replace_mapping || '{}';
-    replacePinyin.value = res.data.sensitive_replace_pinyin || false;
+    const pVal = res.data.sensitive_replace_pinyin;
+    if (typeof pVal === 'boolean') {
+      replacePinyinMode.value = pVal ? '1' : '0';
+    } else if (pVal !== undefined && pVal !== null) {
+      replacePinyinMode.value = String(pVal);
+    } else {
+      replacePinyinMode.value = '0';
+    }
     isTmdbConfigured.value = !!res.data.tmdb_api_key;
     replaceTmdb.value = isTmdbConfigured.value ? (res.data.sensitive_replace_tmdb || false) : false;
   } catch (e) {
@@ -318,7 +333,7 @@ const saveReplaceConfig = async () => {
     const res = await axios.post('/api/config/update', {
       sensitive_replace_enabled: replaceEnabled.value,
       sensitive_replace_mapping: replaceMappingStr.value,
-      sensitive_replace_pinyin: replacePinyin.value,
+      sensitive_replace_pinyin: replacePinyinMode.value,
       sensitive_replace_tmdb: isTmdbConfigured.value ? replaceTmdb.value : false
     });
     if (res.data.status === 'success') {

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional
+from typing import Optional, Union
 from app.core.config import settings
 from app.services.p115 import p115_service
 from app.services.tg_bot import tg_service
@@ -44,7 +44,7 @@ class ConfigUpdate(BaseModel):
     tg_default_command_mode: Optional[str] = None
     sensitive_replace_enabled: Optional[bool] = None
     sensitive_replace_mapping: Optional[str] = None
-    sensitive_replace_pinyin: Optional[bool] = None
+    sensitive_replace_pinyin: Optional[Union[str, bool, int]] = None
     sensitive_replace_tmdb: Optional[bool] = None
     tmdb_api_key: Optional[str] = None
     mh_address: Optional[str] = None
@@ -168,8 +168,16 @@ async def update_config(cfg: ConfigUpdate, user=Depends(get_current_user)):
             raise HTTPException(status_code=400, detail="敏感词映射表不是有效的 JSON 格式")
         if settings.SENSITIVE_REPLACE_MAPPING != cfg.sensitive_replace_mapping:
             stage_setting("SENSITIVE_REPLACE_MAPPING", cfg.sensitive_replace_mapping)
-    if "sensitive_replace_pinyin" in update_data and settings.SENSITIVE_REPLACE_PINYIN != cfg.sensitive_replace_pinyin:
-        stage_setting("SENSITIVE_REPLACE_PINYIN", cfg.sensitive_replace_pinyin)
+    if "sensitive_replace_pinyin" in update_data:
+        val = str(cfg.sensitive_replace_pinyin).strip().lower()
+        if val in ("1", "true", "always", "direct"):
+            norm_val = "1"
+        elif val in ("2", "with_tmdb", "tmdb"):
+            norm_val = "2"
+        else:
+            norm_val = "0"
+        if settings.SENSITIVE_REPLACE_PINYIN != norm_val:
+            stage_setting("SENSITIVE_REPLACE_PINYIN", norm_val)
     if "sensitive_replace_tmdb" in update_data and settings.SENSITIVE_REPLACE_TMDB != cfg.sensitive_replace_tmdb:
         stage_setting("SENSITIVE_REPLACE_TMDB", cfg.sensitive_replace_tmdb)
     if "tmdb_api_key" in update_data and settings.TMDB_API_KEY != cfg.tmdb_api_key:

@@ -1084,7 +1084,7 @@ class P115Service:
             is_batch=is_batch
         )
 
-    async def save_and_share(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, db_id: Optional[int] = None, is_batch: bool = False, sensitive_replace_enabled: Optional[bool] = None, sensitive_replace_pinyin: Optional[bool] = None, sensitive_replace_tmdb: Optional[bool] = None):
+    async def save_and_share(self, share_url: str, metadata: dict = None, target_dir: Optional[str] = None, skip_large_package: bool = False, db_id: Optional[int] = None, is_batch: bool = False, sensitive_replace_enabled: Optional[bool] = None, sensitive_replace_pinyin: Optional[Union[bool, str, int]] = None, sensitive_replace_tmdb: Optional[bool] = None):
         """通过队列进行转存并分享"""
         async def _internal_flow():
             save_res = await self._save_share_link_internal(share_url, metadata, target_dir, skip_large_package, db_id=db_id, create_task_subdir=True)
@@ -3044,7 +3044,7 @@ class P115Service:
             logger.error("❌ 内部清空回收站失败: {}", e)
             return False
 
-    async def replace_sensitive_words_in_dir(self, cid: int, replace_enabled: Optional[bool] = None, replace_pinyin: Optional[bool] = None, replace_tmdb: Optional[bool] = None):
+    async def replace_sensitive_words_in_dir(self, cid: int, replace_enabled: Optional[bool] = None, replace_pinyin: Optional[Union[bool, str, int]] = None, replace_tmdb: Optional[bool] = None):
         """递归遍历指定目录并批量替换敏感词/TMDB别名"""
         should_replace = replace_enabled if replace_enabled is not None else settings.SENSITIVE_REPLACE_ENABLED
         if not should_replace:
@@ -3060,10 +3060,24 @@ class P115Service:
             logger.error(f"❌ 解析敏感词映射表失败: {e}")
             mapping = {}
 
-        should_pinyin = replace_pinyin if replace_pinyin is not None else settings.SENSITIVE_REPLACE_PINYIN
+        raw_pinyin = replace_pinyin if replace_pinyin is not None else settings.SENSITIVE_REPLACE_PINYIN
+        # 归一化 pinyin_mode: "0" = 禁用, "1" = 直接全拼(无条件), "2" = 仅在具有/继承 TMDB ID 时全拼
+        if isinstance(raw_pinyin, bool):
+            pinyin_mode = "1" if raw_pinyin else "0"
+        elif isinstance(raw_pinyin, (int, str)):
+            s_val = str(raw_pinyin).strip().lower()
+            if s_val in ("1", "true", "always", "direct"):
+                pinyin_mode = "1"
+            elif s_val in ("2", "with_tmdb", "tmdb"):
+                pinyin_mode = "2"
+            else:
+                pinyin_mode = "0"
+        else:
+            pinyin_mode = "0"
+
         should_tmdb = replace_tmdb if replace_tmdb is not None else settings.SENSITIVE_REPLACE_TMDB
 
-        if not mapping and not should_pinyin and not should_tmdb:
+        if not mapping and pinyin_mode == "0" and not should_tmdb:
             return
 
         logger.info(f"🔍 开始对目录 (CID: {cid}) 执行敏感词替换...")
@@ -3226,7 +3240,16 @@ class P115Service:
                         break
 
             # 3. 兜底：拼音全拼替换（仅转换连续中文段，保留英文/扩展名等）
-            if not tmdb_success and should_pinyin and contains_chinese(work_name):
+            # 评估 pinyin_mode: "1" = 直接全拼; "2" = 仅当自身或继承关联具有 TMDB ID 时全拼
+            effective_tmdb_id = extract_tmdb_id_from_name(work_name) or inherited_tmdb_id
+            should_do_pinyin = False
+            if not tmdb_success and contains_chinese(work_name):
+                if pinyin_mode == "1":
+                    should_do_pinyin = True
+                elif pinyin_mode == "2" and effective_tmdb_id is not None:
+                    should_do_pinyin = True
+
+            if should_do_pinyin:
                 try:
                     import pypinyin
                     episode_pattern = re.compile(r"第\s*[0-9一二三四五六七八九十百千万]+\s*[集季]")

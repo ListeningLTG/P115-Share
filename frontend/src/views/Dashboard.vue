@@ -18,8 +18,8 @@
         <a-card title="115 网盘账号" :bordered="false" size="small">
           <a-space wrap>
             <template v-for="acc in accounts" :key="acc.id">
-              <a-tag :color="acc.is_restricted ? 'red' : (acc.is_connected ? 'blue' : 'default')">
-                P{{ acc.priority }} {{ acc.name }}: {{ acc.is_restricted ? '风控中' : (acc.is_connected ? '在线' : '离线') }}
+              <a-tag :color="!acc.enabled ? 'default' : (acc.is_restricted ? 'red' : (acc.is_connected ? 'blue' : 'orange'))">
+                P{{ acc.priority }} {{ acc.name }}: {{ !acc.enabled ? '禁用' : (acc.is_restricted ? '风控中' : (acc.is_connected ? '在线' : '离线')) }}
               </a-tag>
             </template>
             <a-tag v-if="accounts.length === 0" color="default">未配置</a-tag>
@@ -71,6 +71,7 @@ interface Account {
   id: number;
   name: string;
   priority: number;
+  enabled: boolean;
   is_connected: boolean;
   is_restricted: boolean;
 }

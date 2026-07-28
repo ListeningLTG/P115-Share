@@ -5,13 +5,14 @@
         <!-- 账号选择器 -->
         <a-select
           v-model:value="selectedAccountId"
-          style="width: 180px"
+          style="width: 200px"
           placeholder="选择账号"
           @change="onAccountChange"
           :loading="accountsLoading"
         >
           <a-select-option v-for="acc in accounts" :key="acc.id" :value="acc.id">
             P{{ acc.priority }} {{ acc.name }}
+            <a-tag v-if="!acc.enabled" color="default" size="small" style="margin-left: 4px; font-size: 11px">禁用</a-tag>
           </a-select-option>
         </a-select>
 
@@ -127,6 +128,7 @@
         </template>
         <template v-if="column.key === 'actions'">
           <a-space size="small">
+            <a-button type="link" size="small" @click="copyShareLink(record)">复制链接</a-button>
             <a-button type="link" size="small" @click="openLink(record)">打开链接</a-button>
             <a-button
               v-if="record.is_invalid || record.is_expired"
@@ -315,11 +317,13 @@ import { ReloadOutlined, DeleteOutlined, DownloadOutlined, SendOutlined, Unorder
 import { message, Modal } from 'ant-design-vue';
 import axios from 'axios';
 import type { Dayjs } from 'dayjs';
+import { copyToClipboard } from '../utils/clipboard';
 
 interface Account {
   id: number;
   name: string;
   priority: number;
+  enabled: boolean;
 }
 
 const loading = ref(false);
@@ -424,7 +428,7 @@ const columns = [
   { title: '大小', dataIndex: 'size_text', key: 'size_text', width: 120 },
   { title: '分享时间', dataIndex: 'create_time', key: 'create_time', width: 180, sorter: true, defaultSortOrder: 'descend' },
   { title: '接收次数', dataIndex: 'receive_count', key: 'receive_count', width: 100, sorter: true },
-  { title: '操作', key: 'actions', width: 160 }
+  { title: '操作', key: 'actions', width: 220 }
 ];
 
 const pagination = ref({
@@ -650,10 +654,21 @@ const cancelInvalidExpired = async () => {
 
 const copyShareTitle = async (title: string) => {
   if (!title) return;
-  try {
-    await navigator.clipboard.writeText(title);
+  const success = await copyToClipboard(title);
+  if (success) {
     message.success('已复制分享名称');
-  } catch {
+  } else {
+    message.error('复制失败');
+  }
+};
+
+const copyShareLink = async (record: any) => {
+  const url = record.receive_code ? `${record.share_url}?password=${record.receive_code}` : record.share_url;
+  if (!url) return;
+  const success = await copyToClipboard(url);
+  if (success) {
+    message.success('已复制分享链接');
+  } else {
     message.error('复制失败');
   }
 };

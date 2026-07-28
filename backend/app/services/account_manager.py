@@ -164,6 +164,30 @@ class AccountManager:
         """获取指定账号的 P115Service 实例"""
         return self._services.get(account_id)
 
+    async def get_service_for_analysis(self, account_id: int) -> Optional[object]:
+        """获取指定账号的 P115Service 实例（包括禁用账号，用于分享链接管理分析）。
+        若账号已加载（启用状态），直接返回；
+        若账号被禁用，从数据库查询后临时创建 P115Service 实例（不加入 _services 调度池）。
+        """
+        from app.services.p115 import P115Service
+        # 已加载的（启用账号）直接返回
+        svc = self._services.get(account_id)
+        if svc:
+            return svc
+        # 禁用账号：按需从数据库实例化
+        async with async_session() as session:
+            result = await session.execute(
+                select(P115Account).where(P115Account.id == account_id)
+            )
+            acc = result.scalar_one_or_none()
+        if not acc:
+            return None
+        svc = P115Service(account=acc)
+        if acc.cookie:
+            svc.init_client(acc.cookie)
+        logger.info(f"🔍 为禁用账号 [{acc.id}] {acc.name} 临时创建 P115Service 实例（仅用于分析）")
+        return svc
+
     def get_primary_service(self) -> Optional[object]:
         """获取用于默认操作的账号（负载均衡关闭时返回优先级最高的）"""
         if not self._services:
