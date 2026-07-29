@@ -152,7 +152,9 @@ def infer_media_hint_from_name(name: str) -> str:
     name_clean = _strip_common_tags_for_media(name)
     if EPISODE_STRONG_PATTERN.search(name_clean) or EPISODE_CN_PATTERN.search(name_clean):
         return "tv"
-    if EPISODE_MID_PATTERN.search(name_clean):
+    if EPISODE_MID_PATTERN.search(name_clean) or SEASON_DIR_PATTERN.search(name_clean):
+        return "tv"
+    if re.search(r"(?i)(?:全\s*\d+\s*[集话]|Season\s*\d+|S\d{1,2}(?!\d))", name_clean):
         return "tv"
     return "unknown"
 
@@ -3346,6 +3348,15 @@ class P115Service:
                     if sub_cid is not None and old_name:
                         name_hint = infer_media_hint_from_name(old_name)
                         d_media_hint = name_hint if name_hint != "unknown" else current_hint
+                        if d_media_hint == "unknown":
+                            try:
+                                sub_items = await self._get_dir_items(int(sub_cid), strict=False)
+                                sub_struct_hint = infer_media_hint_from_items(sub_items)
+                                if sub_struct_hint != "unknown":
+                                    d_media_hint = sub_struct_hint
+                                    logger.debug(f"🧭 预检子目录结构获得媒体推断: name=[{old_name}] hint={d_media_hint}")
+                            except Exception as peek_ex:
+                                logger.debug(f"⚠️ 预检子目录 {sub_cid} 失败，保持 unknown: {peek_ex}")
                         own_tmdb = extract_tmdb_id_from_name(old_name)
                         child_tmdb = own_tmdb if own_tmdb is not None else inherited_tmdb_id
                         d_new_name, d_replacements = await process_name(
