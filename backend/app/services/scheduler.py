@@ -577,12 +577,17 @@ async def _run_scheduled_share_task(task_id: int):
                         replace_tmdb=task_db.sensitive_replace_tmdb
                     )
 
-                # 改名也可能异步执行，分享前重新取得稳定的最终目标快照
-                final_target_snapshot = await _capture_stable_dir_snapshot(svc, new_cid)
-                if final_target_snapshot["stats"] != baseline["stats"]:
-                    raise RuntimeError(
-                        f"敏感词处理后目标目录规模变化，拒绝创建分享: "
-                        f"{final_target_snapshot['stats']} != {baseline['stats']}"
+                # 改名也可能异步执行，尝试重新取得稳定的最终目标快照（允许降级跳过以保障分享、推送和后续步骤）
+                try:
+                    final_target_snapshot = await _capture_stable_dir_snapshot(svc, new_cid)
+                    if final_target_snapshot["stats"] != baseline["stats"]:
+                        logger.warning(
+                            f"⚠️ 敏感词处理后目标目录规模与基准不一致: "
+                            f"{final_target_snapshot['stats']} != {baseline['stats']}，将跳过卡控继续生成分享链接"
+                        )
+                except Exception as snap_ex:
+                    logger.warning(
+                        f"⚠️ 敏感词处理后获取目标目录快照失败: {snap_ex}，跳过快照强校验，继续正常生成分享链接及后续步骤。"
                     )
 
                 # 9. 对复制出来的新文件夹生成永久分享链接

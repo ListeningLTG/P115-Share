@@ -531,6 +531,19 @@ class P115Service:
         endpoints: [{"name", "func", "base_url"}, ...]，func 为返回 coroutine 的无参可调用对象。
         冷却中的端点直接跳过，避免对已风控的 proapi 反复探测。
         """
+        # 🛡️ 解冻探活机制：如果所有候选端点均在 405 冷却中，强行挑选冷却最快到期的端点解冻尝试 1 次
+        if endpoints and all(self._is_endpoint_in_cooldown(ep["name"]) for ep in endpoints):
+            def _get_cooldown_until(ep):
+                st = self._endpoint_stats.get(ep["name"]) or {}
+                return float(st.get("cooldown_until", 0) or 0)
+
+            target_ep = min(endpoints, key=_get_cooldown_until)
+            target_name = target_ep["name"]
+            logger.warning(f"⚠️ 所有 {label} 端点均处于 405 冷却中，强制解冻端点 [{target_name}] 进行探活尝试")
+            st = self._endpoint_stats.setdefault(target_name, {})
+            st["cooldown_until"] = 0
+            st["consecutive_405"] = 0
+
         last_error = None
         attempted = 0
         for endpoint_info in endpoints:
@@ -3442,9 +3455,11 @@ class P115Service:
                             logger.info(f"✏️ 单体容错重命名成功: [{item[2]}] -> [{item[1]}]")
                         except Exception as single_ex:
                             logger.error(f"❌ 容错重命名失败 [{item[2]}]: {single_ex}")
+                        await asyncio.sleep(0.2)
 
-                # 每次批量操作后，休眠 1.0 ~ 2.0 秒，降低风控概率
-                await asyncio.sleep(random.uniform(1.0, 2.0))
+                # 每次批量操作后，平滑休眠以降低 115 频率风控概率（超过 500 项大批次适度拉大间隔）
+                sleep_time = random.uniform(2.0, 3.5) if len(to_rename) > 500 else random.uniform(1.0, 2.0)
+                await asyncio.sleep(sleep_time)
 
             logger.info(f"🎉 敏感词替换完成，共替换了 {renamed_count} 个项目")
             # 等待 2 秒让网盘后台完成状态同步
