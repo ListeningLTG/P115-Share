@@ -16,8 +16,10 @@ class AccountManager:
     """115网盘账号管理器（单例）"""
 
     def __init__(self):
-        # account_id -> P115Service 实例
+        # account_id -> P115Service 实例（仅启用账号，参与负载均衡与活跃调度）
         self._services: Dict[int, object] = {}
+        # account_id -> P115Service 实例（未启用账号，不参与负载均衡）
+        self._disabled_services: Dict[int, object] = {}
         self._load_balance_enabled: bool = False
         self._initialized: bool = False
         self._lock = asyncio.Lock()
@@ -37,7 +39,7 @@ class AccountManager:
             await self._load_accounts()
             await self._load_global_settings()
             self._initialized = True
-            logger.info(f"✅ AccountManager 已初始化，共加载 {len(self._services)} 个账号")
+            logger.info(f"✅ AccountManager 已初始化，共加载 {len(self._services)} 个启用账号，{len(self._disabled_services)} 个未启用账号")
 
     async def _migrate_legacy_config(self):
         """将旧版单账号配置迁移到多账号表（只迁移一次）"""
@@ -127,24 +129,28 @@ class AccountManager:
             logger.info("✅ 旧版账号配置迁移完成 → 多账号表")
 
     async def _load_accounts(self):
-        """从数据库加载所有启用的账号并创建 P115Service 实例"""
+        """从数据库加载所有账号并创建 P115Service 实例"""
         from app.services.p115 import P115Service
         async with async_session() as session:
             result = await session.execute(
-                select(P115Account).where(P115Account.enabled == True).order_by(P115Account.priority)
+                select(P115Account).order_by(P115Account.priority)
             )
             accounts = result.scalars().all()
 
         now = time.time()
         for acc in accounts:
             svc = P115Service(account=acc)
-            self._services[acc.id] = svc
             if acc.cookie:
                 svc.init_client(acc.cookie)
             # 恢复未过期的风控状态
             if acc.restriction_until and acc.restriction_until > now:
                 svc._restriction_until = acc.restriction_until
                 logger.info(f"⚠️ 账号 [{acc.id}] {acc.name} 恢复风控状态，将于 {time.strftime('%H:%M:%S', time.localtime(acc.restriction_until))} 解除")
+
+            if acc.enabled:
+                self._services[acc.id] = svc
+            else:
+                self._disabled_services[acc.id] = svc
 
     async def _load_global_settings(self):
         """加载全局设置（负载均衡开关）"""
@@ -161,20 +167,17 @@ class AccountManager:
     # ─────────────────────────────────────────────
 
     def get_service(self, account_id: int) -> Optional[object]:
-        """获取指定账号的 P115Service 实例"""
-        return self._services.get(account_id)
+        """获取指定账号的 P115Service 实例（支持已启用与未启用账号）"""
+        return self._services.get(account_id) or self._disabled_services.get(account_id)
 
-    async def get_service_for_analysis(self, account_id: int) -> Optional[object]:
-        """获取指定账号的 P115Service 实例（包括禁用账号，用于分享链接管理分析）。
-        若账号已加载（启用状态），直接返回；
-        若账号被禁用，从数据库查询后临时创建 P115Service 实例（不加入 _services 调度池）。
+    async def get_service_by_id(self, account_id: int) -> Optional[object]:
+        """获取指定账号的 P115Service 实例（包含已启用和未启用的账号）。
+        若内存中已存在直接返回；若不存在，从数据库查询后加载。
         """
-        from app.services.p115 import P115Service
-        # 已加载的（启用账号）直接返回
-        svc = self._services.get(account_id)
+        svc = self.get_service(account_id)
         if svc:
             return svc
-        # 禁用账号：按需从数据库实例化
+
         async with async_session() as session:
             result = await session.execute(
                 select(P115Account).where(P115Account.id == account_id)
@@ -182,11 +185,21 @@ class AccountManager:
             acc = result.scalar_one_or_none()
         if not acc:
             return None
+
+        from app.services.p115 import P115Service
         svc = P115Service(account=acc)
         if acc.cookie:
             svc.init_client(acc.cookie)
-        logger.info(f"🔍 为禁用账号 [{acc.id}] {acc.name} 临时创建 P115Service 实例（仅用于分析）")
+
+        if acc.enabled:
+            self._services[acc.id] = svc
+        else:
+            self._disabled_services[acc.id] = svc
         return svc
+
+    async def get_service_for_analysis(self, account_id: int) -> Optional[object]:
+        """获取指定账号的 P115Service 实例（兼容原有接口）。"""
+        return await self.get_service_by_id(account_id)
 
     def get_primary_service(self) -> Optional[object]:
         """获取用于默认操作的账号（负载均衡关闭时返回优先级最高的）"""
@@ -287,9 +300,13 @@ class AccountManager:
 
         # 创建 Service 实例
         svc = P115Service(account=acc)
-        self._services[acc.id] = svc
         if acc.cookie:
             svc.init_client(acc.cookie)
+
+        if acc.enabled:
+            self._services[acc.id] = svc
+        else:
+            self._disabled_services[acc.id] = svc
 
         logger.info(f"✅ 新账号已创建: [{acc.id}] {acc.name}")
         return {"id": acc.id, "name": acc.name}
@@ -331,23 +348,25 @@ class AccountManager:
             await session.refresh(acc)
 
         # 更新 Service 实例
-        svc = self._services.get(account_id)
+        svc = self.get_service(account_id)
         if svc:
             svc.account = acc
             if cookie_changed and acc.cookie:
                 svc.init_client(acc.cookie)
             if save_dir_changed:
                 svc.clear_save_dir_cache()
-        elif acc.enabled:
-            # 如果之前没有 service（可能被禁用过），重新创建
+        else:
             svc = P115Service(account=acc)
-            self._services[account_id] = svc
             if acc.cookie:
                 svc.init_client(acc.cookie)
 
-        # 如果禁用了账号，从活跃服务中移除
-        if not acc.enabled and account_id in self._services:
-            del self._services[account_id]
+        # 根据 enabled 状态分流到对应的字典
+        if acc.enabled:
+            self._services[account_id] = svc
+            self._disabled_services.pop(account_id, None)
+        else:
+            self._disabled_services[account_id] = svc
+            self._services.pop(account_id, None)
 
         logger.info(f"✅ 账号已更新: [{account_id}] {acc.name}")
         return True
@@ -375,8 +394,8 @@ class AccountManager:
             await session.commit()
 
         # 4. 移除 Service 实例
-        if account_id in self._services:
-            del self._services[account_id]
+        self._services.pop(account_id, None)
+        self._disabled_services.pop(account_id, None)
 
         logger.info(f"🗑️ 账号已删除: [{account_id}]，关联数据已级联清理")
         return True

@@ -423,9 +423,9 @@ async def _run_scheduled_share_task(task_id: int):
         
     # 2. 获取网盘账号 service
     from app.services.account_manager import account_manager
-    svc = account_manager.get_service(task.account_id)
+    svc = await account_manager.get_service_by_id(task.account_id)
     if not svc:
-        raise ValueError(f"网盘账号 (ID: {task.account_id}) 不存在或未启用")
+        raise ValueError(f"网盘账号 (ID: {task.account_id}) 不存在")
 
     async def _execute_flow():
         # 再次获取任务对象以更新其状态为运行中

@@ -113,7 +113,7 @@
         <a-form-item label="执行账号" name="account_id">
           <a-select v-model:value="formState.account_id" placeholder="选择要执行网盘操作的 115 账号">
             <a-select-option v-for="acc in accounts" :key="acc.id" :value="acc.id">
-              {{ acc.name }} (ID: {{ acc.id }})
+              {{ acc.name }} (ID: {{ acc.id }}){{ !acc.enabled ? ' (已禁用)' : '' }}
             </a-select-option>
           </a-select>
         </a-form-item>
@@ -259,6 +259,7 @@ interface Task {
 interface Account {
   id: number;
   name: string;
+  enabled: boolean;
 }
 
 interface Channel {
@@ -334,7 +335,8 @@ const getShareModeText = (mode: string) => {
 
 const getAccountName = (id: number) => {
   const acc = accounts.value.find(a => a.id === id);
-  return acc ? acc.name : `账号 (ID: ${id})`;
+  if (!acc) return `账号 (ID: ${id})`;
+  return acc.name + (!acc.enabled ? ' (已禁用)' : '');
 };
 
 const getChannelName = (id: string) => {
