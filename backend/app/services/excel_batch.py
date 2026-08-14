@@ -101,6 +101,11 @@ class ExcelBatchService:
             
             # Regex patterns for links
             link_pattern = re.compile(r'https?://(?:115\.com|115cdn\.com)/s/([a-zA-Z0-9]+)(?:\?password=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            ali_pattern = re.compile(r'https?://(?:www\.)?(?:alipan\.com|aliyundrive\.com)/s/([a-zA-Z0-9_-]+)(?:\?password=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            quark_pattern = re.compile(r'https?://pan\.quark\.cn/s/([a-zA-Z0-9_-]+)(?:\?pwd=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            baidu_pattern = re.compile(r'https?://pan\.baidu\.com/s/([a-zA-Z0-9_-]+)(?:\?pwd=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            xunlei_pattern = re.compile(r'https?://pan\.xunlei\.com/s/([a-zA-Z0-9_-]+)(?:\?pwd=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            uc_pattern = re.compile(r'https?://drive\.uc\.cn/s/([a-zA-Z0-9_-]+)(?:\?pwd=([a-zA-Z0-9]+))?', re.IGNORECASE)
             ed2k_pattern = re.compile(r'(ed2k://\|file\|[^\s]+)', re.IGNORECASE)
             magnet_pattern = re.compile(r'(magnet:\?[^\s]+)', re.IGNORECASE)
             telegra_pattern = re.compile(r'(https?://telegra\.ph/[^\s]+)', re.IGNORECASE)
@@ -119,7 +124,7 @@ class ExcelBatchService:
                     return len(s.encode('utf-16-le')) // 2
 
                 current_offset = 0
-                links_info = [] # [(start_u16, end_u16, url, password)]
+                links_info = [] # [(start_u16, end_u16, url, password, link_type)]
 
                 for entity in text_entities:
                     entity_text = entity.get('text', '')
@@ -140,22 +145,47 @@ class ExcelBatchService:
                         # Check 115
                         match = link_pattern.search(url_val)
                         if match:
-                            links_info.append((current_offset, current_offset + length, url_val, match.group(2)))
+                            links_info.append((current_offset, current_offset + length, url_val, match.group(2), '115'))
+                            break
+                        # Check Alipan / Aliyundrive
+                        match_ali = ali_pattern.search(url_val)
+                        if match_ali:
+                            links_info.append((current_offset, current_offset + length, url_val, match_ali.group(2), 'ali'))
+                            break
+                        # Check Quark
+                        match_quark = quark_pattern.search(url_val)
+                        if match_quark:
+                            links_info.append((current_offset, current_offset + length, url_val, match_quark.group(2), 'quark'))
+                            break
+                        # Check Baidu
+                        match_baidu = baidu_pattern.search(url_val)
+                        if match_baidu:
+                            links_info.append((current_offset, current_offset + length, url_val, match_baidu.group(2), 'baidu'))
+                            break
+                        # Check Xunlei
+                        match_xl = xunlei_pattern.search(url_val)
+                        if match_xl:
+                            links_info.append((current_offset, current_offset + length, url_val, match_xl.group(2), 'xunlei'))
+                            break
+                        # Check UC
+                        match_uc = uc_pattern.search(url_val)
+                        if match_uc:
+                            links_info.append((current_offset, current_offset + length, url_val, match_uc.group(2), 'uc'))
                             break
                         # Check ed2k
                         match_ed2k = ed2k_pattern.search(url_val)
                         if match_ed2k:
-                            links_info.append((current_offset, current_offset + length, match_ed2k.group(1), None))
+                            links_info.append((current_offset, current_offset + length, match_ed2k.group(1), None, 'ed2k'))
                             break
                         # Check magnet
                         match_mag = magnet_pattern.search(url_val)
                         if match_mag:
-                            links_info.append((current_offset, current_offset + length, match_mag.group(1), None))
+                            links_info.append((current_offset, current_offset + length, match_mag.group(1), None, 'magnet'))
                             break
                         # Check telegraph
                         match_tel = telegra_pattern.search(url_val)
                         if match_tel:
-                            links_info.append((current_offset, current_offset + length, match_tel.group(1), None))
+                            links_info.append((current_offset, current_offset + length, match_tel.group(1), None, 'telegra'))
                             break
                     
                     # 2. Reconstruct entities for Telegram message format
@@ -205,74 +235,102 @@ class ExcelBatchService:
                     except Exception:
                         pass
                 
-                # 2. Smart Segmentation logic
-                text_utf16_len = get_u16_len(full_text)
-                last_boundary = 0
-                segments = []
-                
-                for idx, pos in enumerate(links_info):
-                    start_u16, end_u16, url, password = pos
-                    seg_end = end_u16
-                    
-                    if idx < len(links_info) - 1:
-                        next_start_u16 = links_info[idx + 1][0]
-                        try:
-                            # Convert U16 offsets to string characters for string searching
-                            between_start_char = len(full_text.encode('utf-16-le')[:end_u16*2].decode('utf-16-le', errors='ignore'))
-                            between_end_char = len(full_text.encode('utf-16-le')[:next_start_u16*2].decode('utf-16-le', errors='ignore'))
-                            between_text = full_text[between_start_char:between_end_char]
-                            
-                            double_newline_pos = between_text.find('\n\n')
-                            if double_newline_pos != -1:
-                                split_char = between_start_char + double_newline_pos + 2
-                                seg_end = get_u16_len(full_text[:split_char])
-                            else:
-                                if len(between_text.strip()) > 10:
-                                    seg_end = next_start_u16
-                        except Exception:
-                            seg_end = next_start_u16
-                    else:
-                        seg_end = text_utf16_len
-                        
-                    # Slice text and entities
-                    try:
-                        u16_text = full_text.encode('utf-16-le')
-                        slice_u16 = u16_text[last_boundary*2:seg_end*2]
-                        seg_text = slice_u16.decode('utf-16-le', errors='ignore')
-                        
-                        seg_entities = []
-                        for e in entities:
-                            offset = e["offset"]
-                            length = e["length"]
-                            if offset >= last_boundary and (offset + length) <= seg_end:
-                                e_copy = e.copy()
-                                e_copy["offset"] = offset - last_boundary
-                                seg_entities.append(e_copy)
-                            elif offset < seg_end and (offset + length) > last_boundary:
-                                o_start = max(offset, last_boundary)
-                                o_end = min(offset + length, seg_end)
-                                e_copy = e.copy()
-                                e_copy["offset"] = o_start - last_boundary
-                                e_copy["length"] = o_end - o_start
-                                seg_entities.append(e_copy)
-                                
-                        segments.append({
-                            "text": seg_text,
-                            "entities": seg_entities,
-                            "url": url,
-                            "password": password
-                        })
-                    except Exception as sl_e:
-                        # Fallback if slice fails
-                        logger.error(f"Slice message failed: {sl_e}")
-                        segments.append({
-                            "text": full_text,
-                            "entities": entities,
-                            "url": url,
-                            "password": password
-                        })
+                # Check whether links belong to separate sections (\n\n separated) or the same post
+                def get_link_priority(item):
+                    type_priority = {'115': 1, 'ali': 2, 'quark': 3, 'baidu': 4, 'xunlei': 5, 'uc': 6, 'magnet': 7, 'ed2k': 8, 'telegra': 9}
+                    return type_priority.get(item[4], 99)
 
-                    last_boundary = seg_end
+                has_double_newline_split = False
+                for idx in range(len(links_info) - 1):
+                    end_u16 = links_info[idx][1]
+                    next_start_u16 = links_info[idx + 1][0]
+                    try:
+                        between_start_char = len(full_text.encode('utf-16-le')[:end_u16*2].decode('utf-16-le', errors='ignore'))
+                        between_end_char = len(full_text.encode('utf-16-le')[:next_start_u16*2].decode('utf-16-le', errors='ignore'))
+                        between_text = full_text[between_start_char:between_end_char]
+                        if '\n\n' in between_text and len(between_text.strip()) > 10:
+                            has_double_newline_split = True
+                            break
+                    except Exception:
+                        pass
+
+                segments = []
+                if not has_double_newline_split:
+                    # Single message with 1 or multiple links for the same resource
+                    sorted_links = sorted(links_info, key=get_link_priority)
+                    primary_link = sorted_links[0]
+                    segments.append({
+                        "text": full_text,
+                        "entities": entities,
+                        "url": primary_link[2],
+                        "password": primary_link[3]
+                    })
+                else:
+                    # 2. Smart Segmentation logic for multi-resource digests
+                    text_utf16_len = get_u16_len(full_text)
+                    last_boundary = 0
+                    
+                    for idx, pos in enumerate(links_info):
+                        start_u16, end_u16, url, password, ltype = pos
+                        seg_end = end_u16
+                        
+                        if idx < len(links_info) - 1:
+                            next_start_u16 = links_info[idx + 1][0]
+                            try:
+                                between_start_char = len(full_text.encode('utf-16-le')[:end_u16*2].decode('utf-16-le', errors='ignore'))
+                                between_end_char = len(full_text.encode('utf-16-le')[:next_start_u16*2].decode('utf-16-le', errors='ignore'))
+                                between_text = full_text[between_start_char:between_end_char]
+                                
+                                double_newline_pos = between_text.find('\n\n')
+                                if double_newline_pos != -1:
+                                    split_char = between_start_char + double_newline_pos + 2
+                                    seg_end = get_u16_len(full_text[:split_char])
+                                else:
+                                    if len(between_text.strip()) > 10:
+                                        seg_end = next_start_u16
+                            except Exception:
+                                seg_end = next_start_u16
+                        else:
+                            seg_end = text_utf16_len
+                            
+                        # Slice text and entities
+                        try:
+                            u16_text = full_text.encode('utf-16-le')
+                            slice_u16 = u16_text[last_boundary*2:seg_end*2]
+                            seg_text = slice_u16.decode('utf-16-le', errors='ignore')
+                            
+                            seg_entities = []
+                            for e in entities:
+                                offset = e["offset"]
+                                length = e["length"]
+                                if offset >= last_boundary and (offset + length) <= seg_end:
+                                    e_copy = e.copy()
+                                    e_copy["offset"] = offset - last_boundary
+                                    seg_entities.append(e_copy)
+                                elif offset < seg_end and (offset + length) > last_boundary:
+                                    o_start = max(offset, last_boundary)
+                                    o_end = min(offset + length, seg_end)
+                                    e_copy = e.copy()
+                                    e_copy["offset"] = o_start - last_boundary
+                                    e_copy["length"] = o_end - o_start
+                                    seg_entities.append(e_copy)
+                                    
+                            segments.append({
+                                "text": seg_text,
+                                "entities": seg_entities,
+                                "url": url,
+                                "password": password
+                            })
+                        except Exception as sl_e:
+                            logger.error(f"Slice message failed: {sl_e}")
+                            segments.append({
+                                "text": full_text,
+                                "entities": entities,
+                                "url": url,
+                                "password": password
+                            })
+
+                        last_boundary = seg_end
                     
                 # 3. Process each segment and extract title
                 for seg in segments:
@@ -329,7 +387,7 @@ class ExcelBatchService:
                     })
             
             if not extracted_data:
-                raise Exception("未在 JSON 文件中找到有效的 115 分享链接")
+                raise Exception("未在 JSON 文件中找到有效的网盘分享链接")
             
             return extracted_data
         except Exception as e:
