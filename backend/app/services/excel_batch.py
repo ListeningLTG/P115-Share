@@ -1244,6 +1244,10 @@ class ExcelBatchService:
             except Exception as push_err:
                 logger.error(f"❌ [分批分享] 推送至频道失败: {push_err}")
                 
+        # 1. 分享完成，等待 60 秒后再删除目录
+        logger.info("⏳ [分批分享] 分享已完成，等待 60 秒后删除已分享目录...")
+        await asyncio.sleep(60)
+
         # 删除重命名后的目录
         logger.info(f"🗑️ [分批分享] 正在删除已分享的目录 '{new_folder_name}' (CID: {target_cid})")
         try:
@@ -1256,6 +1260,10 @@ class ExcelBatchService:
         except Exception as del_err:
             logger.error(f"❌ [分批分享] 删除已分享的目录失败: {del_err}")
             
+        # 2. 等待 60 秒，确保目录完全进入回收站
+        logger.info("⏳ [分批分享] 等待 60 秒，确保已删除目录完全进入回收站...")
+        await asyncio.sleep(60)
+
         # 清空回收站
         logger.info("🗑️ [分批分享] 正在清空回收站...")
         try:

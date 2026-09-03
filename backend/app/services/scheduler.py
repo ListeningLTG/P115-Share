@@ -20,7 +20,7 @@ SOURCE_SNAPSHOT_INTERVAL = 2
 TRANSFER_STABLE_SAMPLES = 3
 TRANSFER_NO_PROGRESS_TIMEOUT = 15 * 60
 TRANSFER_ABSOLUTE_TIMEOUT = 2 * 60 * 60
-SCHEDULED_SHARE_CLEANUP_DELAY = 30
+SCHEDULED_SHARE_CLEANUP_DELAY = 60
 
 
 class MoveProgressFailed(RuntimeError):
@@ -329,8 +329,8 @@ async def _cleanup_scheduled_temp_dir(
         **svc._get_ios_ua_kwargs(),
     )
     check_response(delete_resp)
-    logger.info("⏳ 等待 5 秒，确保临时目录进入回收站...")
-    await asyncio.sleep(5)
+    logger.info("⏳ 等待 60 秒，确保临时目录进入回收站...")
+    await asyncio.sleep(60)
     if not await svc.cleanup_recycle_bin():
         raise RuntimeError("临时目录已删除，但清空回收站失败")
     return True
