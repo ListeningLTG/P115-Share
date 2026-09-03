@@ -445,8 +445,12 @@
               <span class="value">{{ pendingFile?.name }}</span>
            </div>
            <div class="summary-item">
-              <span class="label">数据行数</span>
+              <span class="label">数据总行数</span>
               <span class="value">{{ parseResult?.total_rows }} 行</span>
+           </div>
+           <div class="summary-item" v-if="parseResult?.p115_count !== undefined">
+              <span class="label">识别到 115 链接</span>
+              <span class="value" style="color: #27ae60; font-weight: bold">{{ parseResult?.p115_count }} 条</span>
            </div>
         </div>
 
@@ -456,14 +460,21 @@
               <a-select v-model:value="mapping.link" placeholder="请选择链接所在列" style="width: 100%">
                  <a-select-option v-for="h in parseResult?.headers" :key="h" :value="h">{{ h }}</a-select-option>
               </a-select>
-              <div class="header-suggest" v-if="mapping.link">
+              <div class="header-suggest" v-if="mapping.link && parseResult?.preview?.length > 0">
                  样本：{{ parseResult?.preview[0][mapping.link] }}
               </div>
            </div>
 
            <div class="mapping-row">
-              <div class="mapping-label"><FileTextOutlined /> 描述列 (可选)</div>
+              <div class="mapping-label"><FileTextOutlined /> 描述/标题列 (可选)</div>
               <a-select v-model:value="mapping.title" placeholder="选择资源名称/标题列" style="width: 100%" allow-clear>
+                 <a-select-option v-for="h in parseResult?.headers" :key="h" :value="h">{{ h }}</a-select-option>
+              </a-select>
+           </div>
+
+           <div class="mapping-row">
+              <div class="mapping-label"><InfoCircleOutlined /> 备注/质量列 (可选，将追加至标题)</div>
+              <a-select v-model:value="mapping.remark" placeholder="选择备注/清晰度/说明列" style="width: 100%" allow-clear>
                  <a-select-option v-for="h in parseResult?.headers" :key="h" :value="h">{{ h }}</a-select-option>
               </a-select>
            </div>
@@ -473,6 +484,16 @@
               <a-select v-model:value="mapping.code" placeholder="选择提取码/访问码列" style="width: 100%" allow-clear>
                  <a-select-option v-for="h in parseResult?.headers" :key="h" :value="h">{{ h }}</a-select-option>
               </a-select>
+           </div>
+
+           <div class="mapping-row" style="background: rgba(39, 174, 96, 0.08); border: 1px solid rgba(39, 174, 96, 0.25); padding: 10px 14px; border-radius: 6px; margin-top: 8px;">
+              <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+                 <div>
+                    <span style="font-weight: 500; color: #e0e0e0;">仅提取与导入 115 分享链接</span>
+                    <span style="color: #888; font-size: 12px; margin-left: 8px;">（自动过滤表格中的夸克/百度/阿里等非 115 链接）</span>
+                 </div>
+                 <a-switch v-model:checked="mapping.filter_p115_only" />
+              </div>
            </div>
         </div>
 
@@ -492,11 +513,12 @@
                  <tr v-for="(h, idx) in parseResult?.headers" :key="h">
                    <td>{{ String.fromCharCode(65 + Number(idx)) }}</td>
                    <td>{{ h }}</td>
-                   <td>{{ parseResult?.preview[0][h] }}</td>
+                   <td>{{ parseResult?.preview?.length > 0 ? parseResult?.preview[0][h] : '' }}</td>
                    <td>
                      <a-tag v-if="isLinkCol(h)" color="success">链接</a-tag>
-                     <a-tag v-else-if="isTitleCol(h)" color="processing">描述</a-tag>
+                     <a-tag v-else-if="isTitleCol(h)" color="processing">标题</a-tag>
                      <a-tag v-else-if="isCodeCol(h)" color="warning">访问码</a-tag>
+                     <a-tag v-else-if="isRemarkCol(h)" color="cyan">备注</a-tag>
                    </td>
                  </tr>
                </tbody>
@@ -586,10 +608,18 @@ const stopRow = ref(0);
 const skipLargePackage = ref(false);
 const pendingFile = ref<File | null>(null);
 const parseResult = ref<any>(null);
-const mapping = reactive({
+const mapping = reactive<{
+  link?: string;
+  title?: string;
+  code?: string;
+  remark?: string;
+  filter_p115_only: boolean;
+}>({
   link: undefined,
   title: undefined,
-  code: undefined
+  code: undefined,
+  remark: undefined,
+  filter_p115_only: true
 });
 
 // Timer for polling
@@ -776,6 +806,8 @@ const handleBeforeUpload = async (file: File) => {
       mapping.link = res.data.data.headers.find((h: string) => isLinkCol(h));
       mapping.title = res.data.data.headers.find((h: string) => isTitleCol(h));
       mapping.code = res.data.data.headers.find((h: string) => isCodeCol(h));
+      mapping.remark = res.data.data.headers.find((h: string) => isRemarkCol(h));
+      mapping.filter_p115_only = (res.data.data.p115_count ?? 0) > 0;
       
       mappingModalVisible.value = true;
     } else {
@@ -1012,8 +1044,9 @@ const getStatusColor = (status: string) => {
 
 // Helpers for suggest
 const isLinkCol = (h: string) => /链接|url|link|s\/|115/i.test(h);
-const isTitleCol = (h: string) => /标题|名称|资源|name|title/i.test(h);
+const isTitleCol = (h: string) => /^(标题|名称|资源|name|title)$/i.test(h) || (/标题|名称|资源|name|title/i.test(h) && !/媒体/i.test(h));
 const isCodeCol = (h: string) => /提取码|访问码|密码|code|pwd|password|msg/i.test(h);
+const isRemarkCol = (h: string) => /备注|质量|清晰度|remark|desc|note|说明/i.test(h);
 
 watch([currentTaskId, () => currentTask.value?.status], ([newId, status]) => {
   if (pollTimer) {

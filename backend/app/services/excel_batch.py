@@ -35,6 +35,63 @@ class ExcelBatchService:
         self._lock = asyncio.Lock()
         self._audit_retry_rounds: dict[int, int] = {}  # task_id -> 已重试轮次
 
+    @staticmethod
+    def _clean_val(val: Any) -> Optional[str]:
+        """Clean and validate cell values, handling NaN, None, null, undefined"""
+        if val is None:
+            return None
+        try:
+            if pd.isna(val):
+                return None
+        except Exception:
+            pass
+        s = str(val).strip()
+        if not s or s.lower() in ('nan', 'none', 'null', 'nat', '<na>', 'undefined'):
+            return None
+        return s
+
+    def _detect_excel_header_row(self, content: bytes) -> int:
+        """Detect true header row index from first 15 rows of Excel"""
+        try:
+            preview_df = pd.read_excel(io.BytesIO(content), header=None, nrows=15)
+        except Exception:
+            return 0
+        header_keywords = {'链接', 'url', 'link', 'share', '标题', '名称', 'name', 'title', '访问码', '提取码', '密码', 'code', 'pwd', 'password', '备注', '类型', 'id', '记录', '时间', 'slug'}
+        best_row = 0
+        best_score = -1
+        for idx, row in preview_df.iterrows():
+            row_vals = [str(x).strip() for x in row.values if pd.notnull(x) and str(x).strip()]
+            if not row_vals or len(row_vals) < 2:
+                continue
+            if len(set(row_vals)) == 1:
+                continue
+            avg_len = sum(len(v) for v in row_vals) / len(row_vals)
+            if avg_len > 30:
+                continue
+            score = 0
+            for val in row_vals:
+                val_lower = val.lower()
+                if any(k in val_lower for k in header_keywords):
+                    score += 3
+                if len(val) <= 15:
+                    score += 1
+            unique_ratio = len(set(row_vals)) / len(row_vals)
+            score = score * unique_ratio
+            if score > best_score:
+                best_score = score
+                best_row = int(idx)
+        return best_row
+
+    def _read_excel_smart(self, content: bytes) -> pd.DataFrame:
+        """Read Excel smartly skipping preamble notes/empty banners"""
+        header_row = self._detect_excel_header_row(content)
+        df = pd.read_excel(io.BytesIO(content), skiprows=header_row)
+        # Drop columns that are completely unnamed and empty
+        df = df.dropna(how='all', axis=1)
+        # Clean column names
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+
     def _read_csv(self, content: bytes):
         """Try reading CSV with multiple encodings"""
         for encoding in ['utf-8', 'utf-8-sig', 'gbk', 'gb18030']:
@@ -47,25 +104,44 @@ class ExcelBatchService:
         raise Exception("无法识别CSV文件编码，请确保文件是 UTF-8 或 GBK 格式")
 
     async def parse_file(self, content: bytes, filename: str):
-        """Parse Excel/CSV/JSON file and return headers and sample data"""
+        """Parse Excel/CSV/JSON file and return headers, sample data and 115 link statistics"""
         try:
+            import re
+            p115_pattern = re.compile(r'https?://(?:115\.com|115cdn\.com|anxia\.com)/s/([a-zA-Z0-9]+)', re.IGNORECASE)
+            
             if filename.endswith('.json'):
                 data = self._parse_telegram_json(content)
                 df = pd.DataFrame(data)
             elif filename.endswith('.csv'):
                 df = self._read_csv(content)
             else:
-                df = pd.read_excel(io.BytesIO(content))
+                df = self._read_excel_smart(content)
             
             headers = df.columns.tolist()
             # Convert NaN to None for JSON serialization
             df_cleaned = df.where(pd.notnull(df), None)
-            preview_data = df_cleaned.head(5).to_dict(orient='records')
+            
+            # Count 115 links across the dataframe
+            p115_count = 0
+            p115_sample_indices = []
+            for idx, row in df_cleaned.iterrows():
+                row_str = " ".join([str(v) for v in row.values if v is not None])
+                if p115_pattern.search(row_str):
+                    p115_count += 1
+                    if len(p115_sample_indices) < 5:
+                        p115_sample_indices.append(idx)
+            
+            # Preview rows: prefer 115 sample rows if available, else first 5 rows
+            if p115_sample_indices:
+                preview_data = df_cleaned.loc[p115_sample_indices].to_dict(orient='records')
+            else:
+                preview_data = df_cleaned.head(5).to_dict(orient='records')
             
             return {
                 "headers": headers,
                 "preview": preview_data,
-                "total_rows": len(df)
+                "total_rows": len(df),
+                "p115_count": p115_count
             }
         except Exception as e:
             logger.error(f"解析文件失败 {filename}: {e}")
@@ -397,19 +473,25 @@ class ExcelBatchService:
     async def create_task(self, filename: str, mapping: dict, content: bytes):
         """Create task and items based on mapping"""
         try:
+            import re
+            p115_pattern = re.compile(r'https?://(?:115\.com|115cdn\.com|anxia\.com)/s/([a-zA-Z0-9]+)(?:[?&]password=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            pwd_pattern = re.compile(r'(?:访问码|提取码|密码|pwd|code)[:：\s]*([a-zA-Z0-9]{4,6})', re.IGNORECASE)
+
             if filename.endswith('.json'):
                 data = self._parse_telegram_json(content)
                 df = pd.DataFrame(data)
             elif filename.endswith('.csv'):
                 df = self._read_csv(content)
             else:
-                df = pd.read_excel(io.BytesIO(content))
+                df = self._read_excel_smart(content)
             
             df = df.where(pd.notnull(df), None)
             
             link_col = mapping.get('link')
             title_col = mapping.get('title')
             code_col = mapping.get('code')
+            remark_col = mapping.get('remark')
+            filter_p115_only = mapping.get('filter_p115_only', True)
             
             if not link_col:
                 raise Exception("未指定链接列")
@@ -418,24 +500,81 @@ class ExcelBatchService:
                 task = ExcelTask(
                     name=filename,
                     status="wait",
-                    total_count=len(df)
+                    total_count=0
                 )
                 session.add(task)
                 await session.flush()
                 
                 # Add items
+                saved_count = 0
                 for idx, row in df.iterrows():
+                    raw_link = self._clean_val(row.get(link_col))
+                    if not raw_link:
+                        continue
+                    
+                    p115_match = p115_pattern.search(raw_link)
+                    
+                    if filter_p115_only and not p115_match:
+                        # If link_col didn't match, check other cells as fallback
+                        for c_name, c_val in row.items():
+                            clean_c = self._clean_val(c_val)
+                            if clean_c and c_name != link_col:
+                                fallback_m = p115_pattern.search(clean_c)
+                                if fallback_m:
+                                    p115_match = fallback_m
+                                    raw_link = clean_c
+                                    break
+                        if not p115_match:
+                            continue
+
+                    if p115_match:
+                        clean_url = f"https://115.com/s/{p115_match.group(1)}"
+                        url_pwd = self._clean_val(p115_match.group(2))
+                    else:
+                        clean_url = raw_link
+                        url_pwd = None
+
+                    # Extraction code: check code_col first, then url_pwd, then regex in raw_link
+                    code_val = self._clean_val(row.get(code_col)) if code_col else None
+                    if not code_val:
+                        code_val = url_pwd
+                    if not code_val:
+                        code_m = pwd_pattern.search(raw_link)
+                        if code_m:
+                            code_val = self._clean_val(code_m.group(1))
+
+                    # Title and Remark
+                    title_val = self._clean_val(row.get(title_col)) if title_col else None
+                    remark_val = self._clean_val(row.get(remark_col)) if remark_col else (self._clean_val(row.get('备注')) if '备注' in row else None)
+                    
+                    if title_val and remark_val and remark_val not in title_val:
+                        full_title = f"{title_val} {remark_val}"
+                    else:
+                        full_title = title_val or remark_val or f"Item_{saved_count + 1}"
+
+                    metadata = row.get('item_metadata') if 'item_metadata' in row and row.get('item_metadata') is not None else {
+                        "description": full_title,
+                        "title": title_val or full_title,
+                        "remark": remark_val or "",
+                        "full_text": f"云盘分享\n资源名称：{full_title}\n分享链接：{{{{share_link}}}}"
+                    }
+
+                    saved_count += 1
                     item = ExcelTaskItem(
                         task_id=task.id,
-                        row_index=int(idx) + 1,
-                        original_url=str(row[link_col]) if row[link_col] else "",
-                        title=str(row[title_col]) if title_col and row[title_col] else None,
-                        extraction_code=str(row[code_col]) if code_col and row[code_col] else None,
-                        item_metadata=row.get('item_metadata') if 'item_metadata' in row else None,
+                        row_index=saved_count,
+                        original_url=clean_url,
+                        title=full_title,
+                        extraction_code=code_val if code_val else None,
+                        item_metadata=metadata,
                         status="待处理"
                     )
                     session.add(item)
                 
+                if saved_count == 0:
+                    raise Exception("未在文件中找到有效的分享链接")
+                    
+                task.total_count = saved_count
                 await session.commit()
                 return task.id
         except Exception as e:
@@ -844,13 +983,19 @@ class ExcelBatchService:
                     "share_url": original_url
                 }
 
+            # Clean code validation
+            clean_code = self._clean_val(item.extraction_code)
+
             # --- Strategy: Push ---
             if strategy == "push":
+                url_with_code = original_url
+                if clean_code and "?password=" not in url_with_code:
+                    url_with_code = f"{original_url}?password={clean_code}"
                 if tg_service:
-                    await tg_service.broadcast_to_channels({original_url: original_url}, metadata, channel_ids=target_channels)
+                    await tg_service.broadcast_to_channels({original_url: url_with_code, "{{share_link}}": url_with_code}, metadata, channel_ids=target_channels)
                 
                 item.status = "成功"
-                item.new_share_url = original_url
+                item.new_share_url = url_with_code
                 item.error_msg = "直接推送完成"
                 await session.commit()
                 await self._update_task_counts(task_id)
@@ -861,8 +1006,8 @@ class ExcelBatchService:
                 try:
                     # Combine password if present for saving
                     url_to_save = original_url
-                    if item.extraction_code and "?password=" not in url_to_save:
-                        url_to_save = f"{url_to_save}?password={item.extraction_code}"
+                    if clean_code and "?password=" not in url_to_save:
+                        url_to_save = f"{url_to_save}?password={clean_code}"
 
                     save_res = await svc.save_share_link(
                         url_to_save,
@@ -923,15 +1068,14 @@ class ExcelBatchService:
                 await session.commit()
                 await self._update_task_counts(task_id)
                 if tg_service:
-                    await tg_service.broadcast_to_channels({original_url: history_url}, metadata, channel_ids=target_channels)
+                    await tg_service.broadcast_to_channels({original_url: history_url, "{{share_link}}": history_url}, metadata, channel_ids=target_channels)
                 return True
 
             try:
-                
                 # Combine password if present for saving
                 url_to_save = original_url
-                if item.extraction_code and "?password=" not in url_to_save:
-                    url_to_save = f"{url_to_save}?password={item.extraction_code}"
+                if clean_code and "?password=" not in url_to_save:
+                    url_to_save = f"{url_to_save}?password={clean_code}"
 
                 save_res = await svc.save_and_share(
                     url_to_save,
@@ -966,9 +1110,9 @@ class ExcelBatchService:
                             # Broadcast to channels
                             if tg_service:
                                 if item.item_metadata:
-                                    await tg_service.broadcast_to_channels({original_url: all_links}, metadata, channel_ids=target_channels)
+                                    await tg_service.broadcast_to_channels({original_url: all_links, "{{share_link}}": all_links}, metadata, channel_ids=target_channels)
                                 else:
-                                    await tg_service.broadcast_to_channels({original_url: all_links}, {"full_text": f"资源名称：{item.title or '未知'}\n分享链接：{{{{share_link}}}}"}, channel_ids=target_channels)
+                                    await tg_service.broadcast_to_channels({original_url: all_links, "{{share_link}}": all_links}, {"full_text": f"资源名称：{item.title or '未知'}\n分享链接：{{{{share_link}}}}"}, channel_ids=target_channels)
                         else:
                             item.status = "失败"
                             item.error_msg = "转存成功但生成分享链接返回为空"

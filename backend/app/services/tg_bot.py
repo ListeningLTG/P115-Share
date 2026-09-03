@@ -1119,6 +1119,12 @@ class TGService:
                     new_text, new_entities, old_url, new_url
                 )
                 
+                # Also replace placeholder {{share_link}} if present in text
+                if "{{share_link}}" in new_text:
+                    new_text, new_entities = self._replace_text_and_adjust_entities(
+                        new_text, new_entities, "{{share_link}}", new_url
+                    )
+                
                 # If flattening is enabled, also find any text_link entities pointing to this old_url
                 # and replace their label with the new URL.
                 if flatten_link:
