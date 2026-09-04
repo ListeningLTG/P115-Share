@@ -663,15 +663,8 @@ class ExcelBatchService:
                                                 ExcelTaskItem.status == "待审核"
                                             ).values(status="跳过", error_msg=f"审核中超时，已达最大重试次数({AUDIT_MAX_RETRIES}轮)")
                                         )
-                                        await session.execute(
-                                            update(ExcelTask).where(ExcelTask.id == task.id).values(
-                                                status="completed", current_row=0, is_waiting=False
-                                            )
-                                        )
                                         await session.commit()
-                                        self._audit_retry_rounds.pop(task.id, None)
-                                        await self._update_task_counts(task.id)
-                                        self.active_task_id = None
+                                        await self._finish_task_and_flush_sub_batch(task.id)
                                         continue
                                     else:
                                         self._audit_retry_rounds[task.id] = retry_round
@@ -692,45 +685,9 @@ class ExcelBatchService:
                                         await asyncio.sleep(AUDIT_RETRY_INTERVAL)
                                         continue
                                 else:
-                                    # 真正完成 - 先从数据库读取最新的子批次状态
-                                    task_res = await session.execute(select(ExcelTask).where(ExcelTask.id == task.id))
-                                    task_db = task_res.scalar_one()
-                                    sub_batch_count = task_db.sub_batch_count
-                                    share_interval = task_db.share_interval
-                                    strategy = task_db.strategy
-                                    target_account_id = task_db.target_account_id
-                                    
-                                    # 结束并提交当前 session，避免长连接锁定
+                                    # 真正完成 - 先提交当前 session 并执行统一收尾
                                     await session.commit()
-                                    
-                                    if strategy == "direct_save" and share_interval > 0 and sub_batch_count > 0:
-                                        if target_account_id:
-                                            from app.services.account_manager import account_manager
-                                            task_svc = account_manager.get_service(target_account_id)
-                                        else:
-                                            task_svc = None
-                                        if not task_svc:
-                                            task_svc, _ = _get_svc()
-                                            
-                                        logger.info(f"🏁 任务完成，正在处理最后一批 sub-batch (剩余 {sub_batch_count} 条)")
-                                        try:
-                                            await self._trigger_sub_batch_share(task.id, task_svc)
-                                        except Exception as final_err:
-                                            logger.error(f"❌ 运行至最后一条处理最后一批 sub-batch 失败: {final_err}")
-                                            
-                                    # 重新开启 session 更新状态为 completed
-                                    async with async_session() as session_comp:
-                                        await session_comp.execute(
-                                            update(ExcelTask).where(ExcelTask.id == task.id).values(
-                                                status="completed",
-                                                current_row=0,
-                                                is_waiting=False
-                                            )
-                                        )
-                                        await session_comp.commit()
-                                        
-                                    self._audit_retry_rounds.pop(task.id, None)
-                                    self.active_task_id = None
+                                    await self._finish_task_and_flush_sub_batch(task.id)
                                     continue
 
                         # Process the item
@@ -1290,6 +1247,49 @@ class ExcelBatchService:
             )
             await session.commit()
             logger.info("✅ [分批分享] 子批次处理完成，状态已重置")
+
+    async def _finish_task_and_flush_sub_batch(self, task_id: int):
+        """任务完成时的统一收尾：检查并打包分享最后一批未满 share_interval 的子批次，并标记任务为 completed"""
+        async with async_session() as session:
+            task_res = await session.execute(select(ExcelTask).where(ExcelTask.id == task_id))
+            task_db = task_res.scalar_one_or_none()
+            if not task_db:
+                return
+            sub_batch_count = task_db.sub_batch_count
+            share_interval = task_db.share_interval
+            strategy = task_db.strategy
+            target_account_id = task_db.target_account_id
+            await session.commit()
+
+        if strategy == "direct_save" and share_interval > 0 and sub_batch_count > 0:
+            if target_account_id:
+                from app.services.account_manager import account_manager
+                task_svc = account_manager.get_service(target_account_id)
+            else:
+                task_svc = None
+            if not task_svc:
+                task_svc, _ = _get_svc()
+
+            logger.info(f"🏁 任务完成，正在处理最后一批 sub-batch (剩余 {sub_batch_count} 条)")
+            try:
+                await self._trigger_sub_batch_share(task_id, task_svc)
+            except Exception as final_err:
+                logger.error(f"❌ 运行至最后一条处理最后一批 sub-batch 失败: {final_err}")
+
+        # 重新开启 session 更新状态为 completed
+        async with async_session() as session_comp:
+            await session_comp.execute(
+                update(ExcelTask).where(ExcelTask.id == task_id).values(
+                    status="completed",
+                    current_row=0,
+                    is_waiting=False
+                )
+            )
+            await session_comp.commit()
+
+        self._audit_retry_rounds.pop(task_id, None)
+        await self._update_task_counts(task_id)
+        self.active_task_id = None
 
     async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False, strategy: str = "transfer", target_account_id: int = None, target_dir: str = None, share_interval: int = 0, sensitive_replace_enabled: bool = False, sensitive_replace_pinyin: Union[str, bool, int] = "0", sensitive_replace_tmdb: bool = False):
         async with async_session() as session:
