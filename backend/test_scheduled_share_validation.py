@@ -216,6 +216,9 @@ async def test_margin_response_cannot_be_treated_as_empty_snapshot():
             assert strict
             return []
 
+        async def _fs_category_get_with_fallback(self, _cid, *, timeout=10):
+            return {"margin": 5}
+
         async def _api_call_with_timeout(self, *_args, **_kwargs):
             return {"margin": 5}
 
@@ -237,8 +240,11 @@ async def test_strict_directory_listing_does_not_turn_error_into_empty():
     class Service:
         client = SimpleNamespace(fs_files_app2=object())
 
-        async def _api_call_with_timeout(self, *_args, **_kwargs):
+        async def _fs_files_with_fallback(self, payload, **kwargs):
             raise RuntimeError("page failed")
+
+        def _is_405_error(self, e):
+            return False
 
         def _is_margin_response(self, _resp):
             return False
@@ -273,9 +279,12 @@ async def test_directory_listing_continues_after_short_page():
         def __init__(self):
             self.offsets = []
 
-        async def _api_call_with_timeout(self, _func, payload, **_kwargs):
+        async def _fs_files_with_fallback(self, payload, **kwargs):
             self.offsets.append(payload["offset"])
             return {"state": True, "data": pages.pop(0)}
+
+        def _is_405_error(self, e):
+            return False
 
         def _is_margin_response(self, _resp):
             return False
@@ -337,6 +346,40 @@ async def test_cleanup_switch_enabled_deletes_and_clears_recycle_bin():
     assert service.recycle_cleaned is True
 
 
+async def test_move_degrades_gracefully_when_stats_delayed():
+    # 模拟大目录移动场景：顶层项完全一致，但 115 服务端深层统计延迟为 0
+    items = [{"id": "1", "name": "BigFolder", "is_dir": True}]
+    baseline = snapshot(1, items, 8540 * (1024**3), 10000, 200)
+    # 服务端新目录 stats 为 0，但 items 已经全部就位
+    delayed_target = snapshot(2, items, 0, 0, 0)
+
+    class Service:
+        client = SimpleNamespace()
+
+        async def _get_dir_items(self, _cid, *, strict=False):
+            assert strict
+            return []  # 源目录待移项已清空
+
+    async def fake_read(_svc, _cid):
+        return delayed_target
+
+    with patch.object(scheduler, "_read_dir_snapshot", fake_read), patch.object(
+        scheduler.asyncio, "sleep", no_sleep
+    ):
+        result = await scheduler._wait_transfer_complete(
+            Service(),
+            mode="move",
+            source_cid=1,
+            target_cid=2,
+            baseline=baseline,
+            stable_required=3,
+            no_progress_timeout=10,
+            absolute_timeout=30,
+        )
+    # 验证降级放行成功返回 target 快照
+    assert result == delayed_target
+
+
 async def main():
     await test_stable_source_snapshot_resets_after_error()
     await test_copy_waits_for_complete_stats_and_duplicate_names()
@@ -349,6 +392,7 @@ async def main():
     await test_directory_listing_continues_after_short_page()
     await test_cleanup_switch_disabled_keeps_temp_dir()
     await test_cleanup_switch_enabled_deletes_and_clears_recycle_bin()
+    await test_move_degrades_gracefully_when_stats_delayed()
     print("All scheduled share validation tests passed")
 
 

@@ -230,6 +230,7 @@ async def _wait_transfer_complete(
     last_progress_at = started_at
     last_target_signature = None
     stable_times = 0
+    structure_stable_times = 0
     last_progress_signature = None
     last_source_pending = None
     expected_ids = {item["id"] for item in baseline["items"]}
@@ -279,8 +280,12 @@ async def _wait_transfer_complete(
             else:
                 structure_match = target_names == expected_names
 
+            if structure_match and progress_ready:
+                last_progress_at = time.monotonic()
+
             if stats_match and structure_match and progress_ready:
                 stable_times += 1
+                structure_stable_times = 0
                 logger.info(
                     "定时分享 %s 模式完整性校验通过（连续 %s/%s 次）",
                     mode,
@@ -289,8 +294,26 @@ async def _wait_transfer_complete(
                 )
                 if stable_times >= stable_required:
                     return target
+            elif mode == "move" and structure_match and progress_ready:
+                stable_times = 0
+                structure_stable_times += 1
+                logger.info(
+                    "定时分享 move 模式顶层结构与任务进度校验通过（连续 %s/%s 次，等待服务端统计同步中）",
+                    structure_stable_times,
+                    stable_required,
+                )
+                if structure_stable_times >= stable_required:
+                    logger.warning(
+                        "⚠️ 定时分享 move 模式顶层结构已完全就位 (%s 项)，但 115 服务端深层统计尚未同步完成 "
+                        "(原基准: %s, 目标目录当前统计: %s)，降级放行",
+                        len(expected_ids),
+                        expected_stats,
+                        target["stats"],
+                    )
+                    return target
             else:
                 stable_times = 0
+                structure_stable_times = 0
                 logger.info(
                     "等待定时分享传输完成: mode=%s, stats=%s, structure=%s, progress=%s",
                     mode,
@@ -302,6 +325,7 @@ async def _wait_transfer_complete(
             raise
         except Exception as exc:
             stable_times = 0
+            structure_stable_times = 0
             logger.warning("定时分享传输完成检测失败，将继续轮询: %s", exc)
 
         await asyncio.sleep(_transfer_poll_interval(time.monotonic() - started_at))
