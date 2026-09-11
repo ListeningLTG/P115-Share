@@ -177,9 +177,27 @@ def _collect_weak_episode_numbers(name: str) -> Tuple[str, Optional[int]]:
     return base, ep_num
 
 
+# 【方案B】用于电影结构检测的扩展名集合
+_VIDEO_EXTS = frozenset({
+    '.mkv', '.mp4', '.m4v', '.avi', '.mov', '.ts', '.m2ts',
+    '.wmv', '.flv', '.webm', '.rmvb', '.iso',
+})
+
+
 def infer_media_hint_from_items(items: List[Dict[str, Any]]) -> str:
+    """从目录内容推断媒体类型。返回 'tv' / 'movie' / 'unknown'。
+
+    方案B：在原有 tv 评分基础上增加电影结构检测——
+    若目录内含视频文件、无任何 TV 剧集标记、无 Season 子目录，
+    则识别为 'movie'，防止被父级 tv hint 错误污染。
+    """
     tv_score = 0
     weak_groups: Dict[str, set] = {}
+
+    # 方案B 计数器
+    video_file_count = 0
+    tv_marker_count = 0
+    has_season_dir = False
 
     for item in items:
         item_name = (item.get("name") or "").strip()
@@ -188,11 +206,19 @@ def infer_media_hint_from_items(items: List[Dict[str, Any]]) -> str:
         if item.get("is_dir"):
             if SEASON_DIR_PATTERN.search(item_name):
                 tv_score += 5
+                has_season_dir = True
             continue
 
         hint = infer_media_hint_from_name(item_name)
         if hint == "tv":
             tv_score += 2
+            tv_marker_count += 1
+
+        # 方案B: 检测视频文件扩展名
+        dot_pos = item_name.rfind('.')
+        ext = item_name[dot_pos:].lower() if dot_pos >= 0 else ''
+        if ext in _VIDEO_EXTS:
+            video_file_count += 1
 
         base, ep_num = _collect_weak_episode_numbers(item_name)
         if base and ep_num is not None:
@@ -203,7 +229,15 @@ def infer_media_hint_from_items(items: List[Dict[str, Any]]) -> str:
             tv_score += 3
             break
 
-    return "tv" if tv_score >= 3 else "unknown"
+    if tv_score >= 3:
+        return "tv"
+
+    # 方案B: 电影结构判定
+    # 条件：含视频文件 + 无任何 TV 剧集标记 + 无 Season 子目录
+    if video_file_count >= 1 and tv_marker_count == 0 and not has_season_dir:
+        return "movie"
+
+    return "unknown"
 
 
 def extract_replacement_title_fragment(name: str) -> str:
@@ -3361,15 +3395,33 @@ class P115Service:
                     if sub_cid is not None and old_name:
                         name_hint = infer_media_hint_from_name(old_name)
                         d_media_hint = name_hint if name_hint != "unknown" else current_hint
-                        if d_media_hint == "unknown":
+
+                        # 方案A: 子目录名无 TV 特征但继承了父级 tv hint，
+                        # 且子目录名携带 tmdb id → 子目录极可能是独立电影目录，
+                        # 需主动预检内容避免父级 hint 污染（与 hint==unknown 时合并处理）
+                        is_tmdb_tv_override = (
+                            d_media_hint == "tv"
+                            and name_hint == "unknown"
+                            and extract_tmdb_id_from_name(old_name) is not None
+                        )
+                        should_peek = d_media_hint == "unknown" or is_tmdb_tv_override
+
+                        if should_peek:
                             try:
                                 sub_items = await self._get_dir_items(int(sub_cid), strict=False)
                                 sub_struct_hint = infer_media_hint_from_items(sub_items)
                                 if sub_struct_hint != "unknown":
                                     d_media_hint = sub_struct_hint
                                     logger.debug(f"🧭 预检子目录结构获得媒体推断: name=[{old_name}] hint={d_media_hint}")
+                                elif is_tmdb_tv_override:
+                                    # 子目录内容无 TV 特征，且携带 tmdb id
+                                    # 修正被父级污染的 tv hint → movie
+                                    d_media_hint = "movie"
+                                    logger.debug(
+                                        f"🧭 tmdb子目录无TV特征，修正继承污染 tv→movie: name=[{old_name}]"
+                                    )
                             except Exception as peek_ex:
-                                logger.debug(f"⚠️ 预检子目录 {sub_cid} 失败，保持 unknown: {peek_ex}")
+                                logger.debug(f"⚠️ 预检子目录 {sub_cid} 失败，保持 {d_media_hint}: {peek_ex}")
                         own_tmdb = extract_tmdb_id_from_name(old_name)
                         child_tmdb = own_tmdb if own_tmdb is not None else inherited_tmdb_id
                         d_new_name, d_replacements = await process_name(
