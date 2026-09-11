@@ -112,6 +112,15 @@
                 <a-popconfirm title="确认删除选中的缓存记录？" ok-text="删除" cancel-text="取消" @confirm="batchDeleteCacheRecords">
                   <a-button danger :disabled="selectedCacheRowKeys.length === 0">批量删除</a-button>
                 </a-popconfirm>
+                <a-popconfirm
+                  title="⚠️ 确认清空整个别名库？此操作不可恢复，将删除所有缓存记录。"
+                  ok-text="确认清空"
+                  cancel-text="取消"
+                  ok-type="danger"
+                  @confirm="clearAllCacheRecords"
+                >
+                  <a-button danger :loading="clearingAll">一键清空</a-button>
+                </a-popconfirm>
                 <a-button type="primary" @click="openCreateModal">新增记录</a-button>
               </a-space>
             </a-space>
@@ -248,6 +257,8 @@ const cacheStatus = ref('');
 const cacheModalVisible = ref(false);
 const cacheEditId = ref<number | null>(null);
 const selectedCacheRowKeys = ref<number[]>([]);
+
+const clearingAll = ref(false);
 
 const cacheForm = reactive({
   tmdb_id: undefined as number | undefined,
@@ -471,6 +482,25 @@ const batchDeleteCacheRecords = async () => {
     }
   } catch (e: any) {
     message.error(e.response?.data?.detail || '批量删除失败');
+  }
+};
+
+const clearAllCacheRecords = async () => {
+  try {
+    clearingAll.value = true;
+    const res = await axios.post('/api/sensitive/tmdb-alias-cache/clear-all');
+    if (res.data?.state) {
+      message.success(res.data.message || '别名库已清空');
+      selectedCacheRowKeys.value = [];
+      cachePage.value = 1;
+      await fetchTmdbCache(1);
+    } else {
+      message.error(res.data?.message || '清空失败');
+    }
+  } catch (e: any) {
+    message.error(e.response?.data?.detail || '清空失败');
+  } finally {
+    clearingAll.value = false;
   }
 };
 

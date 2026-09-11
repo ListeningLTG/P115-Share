@@ -207,3 +207,16 @@ async def batch_delete_tmdb_alias_cache(payload: TMDBAliasCacheBatchDelete, user
 
 		await session.commit()
 		return {"state": True, "message": "批量删除成功", "deleted": len(rows)}
+
+
+@router.post("/tmdb-alias-cache/clear-all")
+async def clear_all_tmdb_alias_cache(user=Depends(get_current_user)):
+	"""清空整张 TMDB 别名缓存表。"""
+	from sqlalchemy import delete as sa_delete
+
+	async with async_session() as session:
+		result = await session.execute(sa_delete(TMDBAliasCache))
+		await session.commit()
+		deleted = result.rowcount if result.rowcount is not None else 0
+		return {"state": True, "message": f"已清空别名库，共删除 {deleted} 条记录", "deleted": deleted}
+
