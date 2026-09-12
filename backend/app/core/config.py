@@ -107,6 +107,39 @@ class Settings(BaseSettings):
                     conn.execute(text(sql))
                     logger.info(f"[DB] 数据库迁移: 为表 {table_name} 添加列 {column.name}")
 
+    def _migrate_tmdb_alias_index(self, conn):
+        """Step 2E：将 tmdb_alias_cache 表的旧单列唯一索引迁移为 (tmdb_id, media_type) 复合唯一索引。
+
+        SQLite 不支持 DROP INDEX 前检测名称，通过查询 sqlite_master 判断是否需要迁移：
+        - 旧索引特征：仅包含 tmdb_id 一列的唯一索引 (ix_tmdb_alias_cache_tmdb_id)
+        - 新索引：(tmdb_id, media_type) 复合唯一索引 (uix_tmdb_alias_tmdb_media)
+        """
+        from sqlalchemy import text, inspect
+        inspector = inspect(conn)
+        TABLE = "tmdb_alias_cache"
+        NEW_IDX = "uix_tmdb_alias_tmdb_media"
+        OLD_IDX = "ix_tmdb_alias_cache_tmdb_id"
+
+        if not inspector.has_table(TABLE):
+            return  # 新库，create_all 会直接带正确索引建表
+
+        existing_indexes = {idx["name"] for idx in inspector.get_indexes(TABLE)}
+
+        if NEW_IDX in existing_indexes:
+            return  # 新复合索引已存在，无需迁移
+
+        # 删除旧单列唯一索引（如果存在）
+        if OLD_IDX in existing_indexes:
+            conn.execute(text(f"DROP INDEX IF EXISTS {OLD_IDX}"))
+            logger.info(f"[DB] 迁移: 删除旧单列唯一索引 {OLD_IDX}")
+
+        # 建立新复合唯一索引
+        conn.execute(text(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {NEW_IDX} "
+            f"ON {TABLE} (tmdb_id, media_type)"
+        ))
+        logger.info(f"[DB] 迁移: 建立复合唯一索引 {NEW_IDX}(tmdb_id, media_type)")
+
     async def init_db(self):
         """Initialize database tables and ensure schema is up-to-date"""
         async with engine.begin() as conn:
@@ -114,6 +147,8 @@ class Settings(BaseSettings):
             await conn.run_sync(Base.metadata.create_all)
             # Migrate missing columns for existing databases
             await conn.run_sync(self._migrate_columns)
+            # Step 2E: 将 tmdb_alias_cache 索引迁移为复合唯一索引
+            await conn.run_sync(self._migrate_tmdb_alias_index)
 
         async with async_session() as session:
             # Check if admin exists

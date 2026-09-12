@@ -925,18 +925,24 @@ class TMDBService:
 
         return None, chinese_alias
 
-    async def _get_alias_cache(self, tmdb_id: int) -> Optional[TMDBAliasCache]:
+    async def _get_alias_cache(
+        self, tmdb_id: int, media_type: Optional[str] = None
+    ) -> Optional[TMDBAliasCache]:
+        """按 tmdb_id [及 media_type] 查询缓存记录。
+
+        Step 2B：引入 media_type 参数，使山个 (tmdb_id, media_type) 对能独立命中。
+        - 指定 media_type (movie/tv) 时：精确进行过滤
+        - 未指定时：优先返回 status=success 的记录，否则返回第一条
+        """
         try:
             async with async_session() as session:
-                row = (
-                    (
-                        await session.execute(
-                            select(TMDBAliasCache).where(TMDBAliasCache.tmdb_id == tmdb_id)
-                        )
-                    )
-                    .scalars()
-                    .first()
-                )
+                stmt = select(TMDBAliasCache).where(TMDBAliasCache.tmdb_id == tmdb_id)
+                if media_type and media_type in ("movie", "tv"):
+                    stmt = stmt.where(TMDBAliasCache.media_type == media_type)
+                    row = (await session.execute(stmt)).scalars().first()
+                else:
+                    rows = (await session.execute(stmt)).scalars().all()
+                    row = next((r for r in rows if r.status == "success"), None) or (rows[0] if rows else None)
                 return row
         except OperationalError as e:
             logger.warning(f"⚠️ TMDB 别名缓存表不可用，跳过缓存读取: {e}")
@@ -953,28 +959,34 @@ class TMDBService:
         status: str,
         note: Optional[str] = None,
     ) -> None:
+        """Step 2C：upsert 改为按 (tmdb_id, media_type) 定位记录，避免 movie/tv 互相覆盖。"""
+        effective_media = media_type or "unknown"
         try:
             async with async_session() as session:
                 row = (
                     (
                         await session.execute(
-                            select(TMDBAliasCache).where(TMDBAliasCache.tmdb_id == tmdb_id)
+                            select(TMDBAliasCache).where(
+                                TMDBAliasCache.tmdb_id == tmdb_id,
+                                TMDBAliasCache.media_type == effective_media,
+                            )
                         )
                     )
                     .scalars()
                     .first()
                 )
                 if not row:
-                    row = TMDBAliasCache(tmdb_id=tmdb_id)
+                    row = TMDBAliasCache(tmdb_id=tmdb_id, media_type=effective_media)
                     session.add(row)
 
-                row.media_type = media_type or row.media_type or "unknown"
+                row.media_type = effective_media
                 if chinese_title:
                     row.chinese_title = chinese_title
                 if original_title:
                     row.original_title = original_title
-                if alias is not None:
-                    row.alias = alias
+                # 【Fix 1A】无论 alias 是否为 None 都强制写入，
+                # 确保失败写入时能清空之前残留的脏别名（如 movie alias 污染 tv 记录）
+                row.alias = alias
                 row.source = source
                 row.status = status
                 row.note = note
@@ -990,38 +1002,25 @@ class TMDBService:
         preferred_media: Optional[str] = None,
         chinese_title_hint: Optional[str] = None,
     ) -> Optional[str]:
-        """根据 TMDB ID 获取替换名（支持媒体类型提示与 tv/movie 回退）。"""
-        cache_row = await self._get_alias_cache(tmdb_id)
-        if cache_row and cache_row.alias:
-            cache_media = (cache_row.media_type or "unknown").lower()
-            requested_media = (preferred_media or "").lower()
-
-            media_conflict = (
-                requested_media in ["movie", "tv"]
-                and cache_media in ["movie", "tv"]
-                and requested_media != cache_media
+        """Step 2D：按 (tmdb_id, preferred_media) 查询缓存，不再需要冲突检测逻辑。"""
+        # 传入 preferred_media 实现精确匹配，(movie/279873) 和 (tv/279873) 完全独立
+        cache_row = await self._get_alias_cache(tmdb_id, preferred_media)
+        if cache_row and cache_row.alias and cache_row.status == "success":  # 【Fix 1B】检查 status 防止脏缓存命中
+            if (not cache_row.chinese_title) and chinese_title_hint and self._contains_chinese(chinese_title_hint):
+                await self._save_alias_cache(
+                    tmdb_id=tmdb_id,
+                    media_type=cache_row.media_type,
+                    chinese_title=chinese_title_hint,
+                    original_title=cache_row.original_title,
+                    alias=cache_row.alias,
+                    source=cache_row.source or "cache",
+                    status=cache_row.status or "success",
+                    note=cache_row.note,
+                )
+            logger.debug(
+                f"🗂️ 命中 TMDB 别名缓存: tmdb_id={tmdb_id} alias=[{cache_row.alias}] media={cache_row.media_type}"
             )
-
-            if media_conflict:
-                logger.warning(
-                    f"⚠️ TMDB 别名缓存媒体类型冲突: tmdb_id={tmdb_id} cache_media={cache_media} requested_media={requested_media}，跳过缓存并回源查询"
-                )
-            else:
-                if (not cache_row.chinese_title) and chinese_title_hint and self._contains_chinese(chinese_title_hint):
-                    await self._save_alias_cache(
-                        tmdb_id=tmdb_id,
-                        media_type=cache_row.media_type,
-                        chinese_title=chinese_title_hint,
-                        original_title=cache_row.original_title,
-                        alias=cache_row.alias,
-                        source=cache_row.source or "cache",
-                        status=cache_row.status or "success",
-                        note=cache_row.note,
-                    )
-                logger.debug(
-                    f"🗂️ 命中 TMDB 别名缓存: tmdb_id={tmdb_id} alias=[{cache_row.alias}] media={cache_row.media_type}"
-                )
-                return cache_row.alias
+            return cache_row.alias
 
         api_key = await self._ensure_api_key()
         if not api_key:

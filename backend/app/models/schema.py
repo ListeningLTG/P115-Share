@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import String, Text, DateTime, Integer, Boolean, JSON, Float, ForeignKey
+from sqlalchemy import String, Text, DateTime, Integer, Boolean, JSON, Float, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
 
@@ -180,11 +180,19 @@ class SensitiveMovie(Base):
 
 
 class TMDBAliasCache(Base):
-    """TMDB 别名缓存表（用于替换加速与人工校正）"""
+    """TMDB 别名缓存表（用于替换加速与人工校正）。
+
+    主键设计：(tmdb_id, media_type) 复合唯一约束。
+    TMDB 的 movie id 和 tv id 是两个独立命名空间，同一数字可同时对应一部电影和一部剧集，
+    必须按 (tmdb_id, media_type) 分开存储才能避免互相覆盖。
+    """
     __tablename__ = "tmdb_alias_cache"
+    __table_args__ = (
+        UniqueConstraint("tmdb_id", "media_type", name="uix_tmdb_alias_tmdb_media"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    tmdb_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    tmdb_id: Mapped[int] = mapped_column(Integer, index=True)  # 复合唯一键，不再单列 unique
     media_type: Mapped[str] = mapped_column(String(20), default="unknown")  # movie/tv/unknown
     chinese_title: Mapped[str] = mapped_column(String(255), nullable=True)
     original_title: Mapped[str] = mapped_column(String(255), nullable=True)

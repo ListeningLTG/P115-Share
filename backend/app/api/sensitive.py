@@ -118,18 +118,23 @@ async def list_tmdb_alias_cache(
 
 @router.post("/tmdb-alias-cache")
 async def upsert_tmdb_alias_cache(payload: TMDBAliasCacheUpsert, user=Depends(get_current_user)):
+	"""Step 2F: upsert 改为按 (tmdb_id, media_type) 定位，避免覆盖另一媒体类型的记录。"""
+	effective_media = payload.media_type or "unknown"
 	async with async_session() as session:
 		existing = (
 			(
 				await session.execute(
-					select(TMDBAliasCache).where(TMDBAliasCache.tmdb_id == payload.tmdb_id)
+					select(TMDBAliasCache).where(
+						TMDBAliasCache.tmdb_id == payload.tmdb_id,
+						TMDBAliasCache.media_type == effective_media,
+					)
 				)
 			)
 			.scalars()
 			.first()
 		)
 		if existing:
-			existing.media_type = payload.media_type or existing.media_type
+			existing.media_type = effective_media
 			existing.chinese_title = payload.chinese_title
 			existing.original_title = payload.original_title
 			existing.alias = payload.alias
@@ -140,7 +145,7 @@ async def upsert_tmdb_alias_cache(payload: TMDBAliasCacheUpsert, user=Depends(ge
 		else:
 			existing = TMDBAliasCache(
 				tmdb_id=payload.tmdb_id,
-				media_type=payload.media_type or "unknown",
+				media_type=effective_media,
 				chinese_title=payload.chinese_title,
 				original_title=payload.original_title,
 				alias=payload.alias,
@@ -153,6 +158,7 @@ async def upsert_tmdb_alias_cache(payload: TMDBAliasCacheUpsert, user=Depends(ge
 		await session.commit()
 		await session.refresh(existing)
 		return {"state": True, "message": "保存成功", "id": existing.id}
+
 
 
 @router.put("/tmdb-alias-cache/{cache_id}")
