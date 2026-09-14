@@ -887,8 +887,10 @@ class TMDBService:
             return ["tv", "movie"]
         if preferred_media == "movie":
             return ["movie", "tv"]
-        # 未知类型时优先按电影尝试：常见电影目录无分集特征，先查 tv 容易命中同 ID 的剧集条目。
-        return ["movie", "tv"]
+        # 【Bug 1+3 Fix】preferred=None/unknown 时改为 tv 优先。
+        # 中文内容中剧集占比远高于电影， movie 优先极易在同 ID 的电影条目下命中错误结果。
+        # Fix A 将继承污染的 hint 回退为 unknown 后，此处改为 tv 优先能真正修复末端查询的此项缺陷。
+        return ["tv", "movie"]
 
     async def _fetch_alias_titles(self, tmdb_id: int, media_type: str, params: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
         alt_url = f"{self.BASE_URL}/{media_type}/{tmdb_id}/alternative_titles"
@@ -942,7 +944,14 @@ class TMDBService:
                     row = (await session.execute(stmt)).scalars().first()
                 else:
                     rows = (await session.execute(stmt)).scalars().all()
-                    row = next((r for r in rows if r.status == "success"), None) or (rows[0] if rows else None)
+                    # 【Bug 4 Fix】无 preferred 时，优先返回 tv 类型的 success 记录；
+                    # 再退而求其次任意类型的 success；最后一条。
+                    # 避免 DB 返回顺序不稳定时随机命中 movie 记录而错误。
+                    row = (
+                        next((r for r in rows if r.status == "success" and r.media_type == "tv"), None)
+                        or next((r for r in rows if r.status == "success"), None)
+                        or (rows[0] if rows else None)
+                    )
                 return row
         except OperationalError as e:
             logger.warning(f"⚠️ TMDB 别名缓存表不可用，跳过缓存读取: {e}")

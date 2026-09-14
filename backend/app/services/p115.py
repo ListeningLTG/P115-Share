@@ -80,10 +80,13 @@ IOS_UA = (
 )
 
 TMDB_ID_PATTERN = re.compile(r"(?i)(?:tmdbid|tmdb)\s*(?:=|:|[-_])?\s*(\d+)")
-SEASON_DIR_PATTERN = re.compile(r"(?i)^(?:season\s*0*\d{1,2}|s0*\d{1,2}|第\s*[0-9一二三四五六七八九十百千万]+\s*季)$")
+# 【Bug 6 Fix】全行锁定版，仅用于 infer_media_hint_from_name （目录名自身判断）
+SEASON_DIR_PATTERN = re.compile(r"(?i)^(?:season\s*0*\d{1,2}|s0*\d{1,2}|\u7b2c\s*[0-9\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\u4e07]+\s*\u5b63)$")
+# 【Bug 6 Fix】包含匹配版，用于 infer_media_hint_from_items 中子目录名检测（允许如 "Season 1 (2026)" 这类含额外说明的目录名）
+SEASON_DIR_CONTAINS_PATTERN = re.compile(r"(?i)(?:^|\b)(?:season\s*0*\d{1,2}|s0*\d{1,2}(?:\b|$)|\u7b2c\s*[0-9\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\u4e07]+\s*\u5b63)")
 EPISODE_STRONG_PATTERN = re.compile(r"(?i)\bS\d{1,2}E\d{1,3}\b")
 EPISODE_MID_PATTERN = re.compile(r"(?i)\b(?:EP?|E)\s*0*\d{1,3}\b")
-EPISODE_CN_PATTERN = re.compile(r"第\s*[0-9一二三四五六七八九十百千万]+\s*集")
+EPISODE_CN_PATTERN = re.compile(r"\u7b2c\s*[0-9\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\u4e07]+\s*\u96c6")
 WEAK_NUMBER_PATTERN = re.compile(r"(?:^|[\s._-])(\d{1,2})(?:[\s._-]|$)")
 
 
@@ -204,7 +207,8 @@ def infer_media_hint_from_items(items: List[Dict[str, Any]]) -> str:
         if not item_name:
             continue
         if item.get("is_dir"):
-            if SEASON_DIR_PATTERN.search(item_name):
+            # 【Bug 6 Fix】用包含匹配版，允许 "Season 1 (2026)" 这类带额外说明的目录名被正确识别
+            if SEASON_DIR_CONTAINS_PATTERN.search(item_name):
                 tv_score += 5
                 has_season_dir = True
             continue
@@ -232,9 +236,9 @@ def infer_media_hint_from_items(items: List[Dict[str, Any]]) -> str:
     if tv_score >= 3:
         return "tv"
 
-    # 方案B: 电影结构判定
-    # 条件：含视频文件 + 无任何 TV 剧集标记 + 无 Season 子目录
-    if video_file_count >= 1 and tv_marker_count == 0 and not has_season_dir:
+    # 【Fix B】tv_score==0 比 tv_marker_count==0 更严格：
+    # weak_group 加分（3分/组）也纳入判断，避免弱TV特征目录被误判为 movie
+    if video_file_count >= 1 and tv_score == 0 and not has_season_dir:
         return "movie"
 
     return "unknown"
@@ -3396,15 +3400,17 @@ class P115Service:
                         name_hint = infer_media_hint_from_name(old_name)
                         d_media_hint = name_hint if name_hint != "unknown" else current_hint
 
-                        # 方案A: 子目录名无 TV 特征但继承了父级 tv hint，
-                        # 且子目录名携带 tmdb id → 子目录极可能是独立电影目录，
-                        # 需主动预检内容避免父级 hint 污染（与 hint==unknown 时合并处理）
-                        is_tmdb_tv_override = (
-                            d_media_hint == "tv"
+                        # 【Fix A】方案A 扩展：子目录名无自身 media 特征（name_hint=unknown），
+                        # 但继承了父级 tv 或 movie hint，且携带 tmdb id 时，
+                        # 均需主动预检内容——无论父级 hint 是 tv 还是 movie，都可能污染独立作品。
+                        # 原 is_tmdb_tv_override 仅覆盖 d_media_hint=="tv"，
+                        # 本次扩展为同时覆盖 d_media_hint=="movie" 的反向污染场景。
+                        is_inherited_hint_override = (
+                            d_media_hint in ("tv", "movie")
                             and name_hint == "unknown"
                             and extract_tmdb_id_from_name(old_name) is not None
                         )
-                        should_peek = d_media_hint == "unknown" or is_tmdb_tv_override
+                        should_peek = d_media_hint == "unknown" or is_inherited_hint_override
 
                         if should_peek:
                             try:
@@ -3413,12 +3419,12 @@ class P115Service:
                                 if sub_struct_hint != "unknown":
                                     d_media_hint = sub_struct_hint
                                     logger.debug(f"🧭 预检子目录结构获得媒体推断: name=[{old_name}] hint={d_media_hint}")
-                                elif is_tmdb_tv_override:
-                                    # 子目录内容无 TV 特征，且携带 tmdb id
-                                    # 修正被父级污染的 tv hint → movie
-                                    d_media_hint = "movie"
+                                elif is_inherited_hint_override:
+                                    # 子目录内容无明确特征，有 tmdb id → 保守回退到 unknown，
+                                    # 让 TMDB 按实际内容（preferred=None）自行决定，不强制继承父级 hint
+                                    d_media_hint = "unknown"
                                     logger.debug(
-                                        f"🧭 tmdb子目录无TV特征，修正继承污染 tv→movie: name=[{old_name}]"
+                                        f"🧭 tmdb子目录内容无明确特征，清除继承污染 {d_media_hint}→unknown: name=[{old_name}]"
                                     )
                             except Exception as peek_ex:
                                 logger.debug(f"⚠️ 预检子目录 {sub_cid} 失败，保持 {d_media_hint}: {peek_ex}")
@@ -3444,8 +3450,16 @@ class P115Service:
                     old_name = f.get("name")
                     if fid is not None and old_name:
                         file_hint = infer_media_hint_from_name(old_name)
-                        f_media_hint = file_hint if file_hint != "unknown" else current_hint
+                        # 【Bug 2 Fix】文件名自身无 media 特征，且文件有独立 tmdb id，
+                        # 但父级目录的 current_hint 为 "movie"（可能来自继承污染）时，
+                        # 保守降级为 unknown，避免强制用 movie 端点查询属于 TV 的 tmdb id
                         own_tmdb = extract_tmdb_id_from_name(old_name)
+                        if file_hint != "unknown":
+                            f_media_hint = file_hint
+                        elif current_hint == "movie" and own_tmdb is not None:
+                            f_media_hint = "unknown"
+                        else:
+                            f_media_hint = current_hint
                         file_tmdb = own_tmdb if own_tmdb is not None else inherited_tmdb_id
                         f_new_name, _ = await process_name(
                             old_name,
