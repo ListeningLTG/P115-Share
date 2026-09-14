@@ -3450,13 +3450,12 @@ class P115Service:
                     old_name = f.get("name")
                     if fid is not None and old_name:
                         file_hint = infer_media_hint_from_name(old_name)
-                        # 【Bug 2 Fix】文件名自身无 media 特征，且文件有独立 tmdb id，
-                        # 但父级目录的 current_hint 为 "movie"（可能来自继承污染）时，
-                        # 保守降级为 unknown，避免强制用 movie 端点查询属于 TV 的 tmdb id
                         own_tmdb = extract_tmdb_id_from_name(old_name)
                         if file_hint != "unknown":
                             f_media_hint = file_hint
-                        elif current_hint == "movie" and own_tmdb is not None:
+                        elif own_tmdb is not None:
+                            # 自身携带独立 TMDB ID，且文件名无明确剧集特征（file_hint=unknown）
+                            # 不应被所在目录可能因混存或误判的 TV/Movie 标记污染，交由 TMDB 结合中文标题自主决断
                             f_media_hint = "unknown"
                         else:
                             f_media_hint = current_hint

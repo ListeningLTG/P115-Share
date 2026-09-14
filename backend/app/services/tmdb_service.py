@@ -881,6 +881,14 @@ class TMDBService:
     def _contains_english(text: str) -> bool:
         return bool(re.search(r"[A-Za-z]", text or ""))
 
+    @staticmethod
+    def _title_matches(hint: Optional[str], title: Optional[str]) -> bool:
+        if not hint or not title:
+            return False
+        h = hint.strip().lower()
+        t = title.strip().lower()
+        return h in t or t in h
+
     @classmethod
     def _build_media_query_order(cls, preferred_media: Optional[str]) -> List[str]:
         if preferred_media == "tv":
@@ -928,31 +936,50 @@ class TMDBService:
         return None, chinese_alias
 
     async def _get_alias_cache(
-        self, tmdb_id: int, media_type: Optional[str] = None
+        self,
+        tmdb_id: int,
+        media_type: Optional[str] = None,
+        chinese_title_hint: Optional[str] = None,
     ) -> Optional[TMDBAliasCache]:
-        """按 tmdb_id [及 media_type] 查询缓存记录。
-
-        Step 2B：引入 media_type 参数，使山个 (tmdb_id, media_type) 对能独立命中。
-        - 指定 media_type (movie/tv) 时：精确进行过滤
-        - 未指定时：优先返回 status=success 的记录，否则返回第一条
+        """按 tmdb_id [及 media_type / chinese_title_hint] 查询缓存记录。
+        - 若传入了 chinese_title_hint，优先匹配中文标题一致的 success 记录，防跨作品误判
+        - 若指定了 media_type，精确过滤
+        - 若均未指定，优先返回 success 记录
         """
         try:
             async with async_session() as session:
                 stmt = select(TMDBAliasCache).where(TMDBAliasCache.tmdb_id == tmdb_id)
+                rows = (await session.execute(stmt)).scalars().all()
+                if not rows:
+                    return None
+
+                # 1. 优先根据中文标题 hint 进行精准匹配（防止同 ID 电影/剧集错位）
+                if chinese_title_hint and self._contains_chinese(chinese_title_hint):
+                    if media_type and media_type in ("movie", "tv"):
+                        typed_match = next(
+                            (r for r in rows if r.status == "success" and r.media_type == media_type and self._title_matches(chinese_title_hint, r.chinese_title)),
+                            None,
+                        )
+                        if typed_match:
+                            return typed_match
+                    else:
+                        cross_match = next(
+                            (r for r in rows if r.status == "success" and self._title_matches(chinese_title_hint, r.chinese_title)),
+                            None,
+                        )
+                        if cross_match:
+                            return cross_match
+
+                # 2. 如果指定了 media_type，按 media_type 取记录
                 if media_type and media_type in ("movie", "tv"):
-                    stmt = stmt.where(TMDBAliasCache.media_type == media_type)
-                    row = (await session.execute(stmt)).scalars().first()
-                else:
-                    rows = (await session.execute(stmt)).scalars().all()
-                    # 【Bug 4 Fix】无 preferred 时，优先返回 tv 类型的 success 记录；
-                    # 再退而求其次任意类型的 success；最后一条。
-                    # 避免 DB 返回顺序不稳定时随机命中 movie 记录而错误。
-                    row = (
-                        next((r for r in rows if r.status == "success" and r.media_type == "tv"), None)
-                        or next((r for r in rows if r.status == "success"), None)
-                        or (rows[0] if rows else None)
-                    )
-                return row
+                    return next((r for r in rows if r.media_type == media_type), None)
+
+                # 3. 未指定 media_type 且无标题命中：返回任意 success 记录（tv 优先），兜底第一条
+                return (
+                    next((r for r in rows if r.status == "success" and r.media_type == "tv"), None)
+                    or next((r for r in rows if r.status == "success"), None)
+                    or rows[0]
+                )
         except OperationalError as e:
             logger.warning(f"⚠️ TMDB 别名缓存表不可用，跳过缓存读取: {e}")
             return None
@@ -1011,9 +1038,10 @@ class TMDBService:
         preferred_media: Optional[str] = None,
         chinese_title_hint: Optional[str] = None,
     ) -> Optional[str]:
-        """Step 2D：按 (tmdb_id, preferred_media) 查询缓存，不再需要冲突检测逻辑。"""
-        # 传入 preferred_media 实现精确匹配，(movie/279873) 和 (tv/279873) 完全独立
-        cache_row = await self._get_alias_cache(tmdb_id, preferred_media)
+        """按 (tmdb_id, preferred_media) 及 chinese_title_hint 查询缓存并请求 TMDB 接口。"""
+        cache_row = await self._get_alias_cache(
+            tmdb_id, preferred_media, chinese_title_hint=chinese_title_hint
+        )
         if cache_row and cache_row.alias and cache_row.status == "success":  # 【Fix 1B】检查 status 防止脏缓存命中
             if (not cache_row.chinese_title) and chinese_title_hint and self._contains_chinese(chinese_title_hint):
                 await self._save_alias_cache(
@@ -1046,24 +1074,57 @@ class TMDBService:
             )
             return None
 
-        params = {"api_key": api_key}
+        params = {"api_key": api_key, "language": "zh-CN"}
         media_order = self._build_media_query_order(preferred_media)
 
-        detail = None
-        detail_media = None
-        status = None
+        candidates = []
+        last_status = None
+        has_hint = bool(chinese_title_hint and self._contains_chinese(chinese_title_hint))
+
         for media_type in media_order:
             url = f"{self.BASE_URL}/{media_type}/{tmdb_id}"
             d, s = await self._request_with_retry(url, params, max_retries=2)
-            if d and s == 200:
-                detail = d
-                detail_media = media_type
-                break
-            status = s
+            if not d or s != 200:
+                last_status = s
+                continue
 
-        if not detail or not detail_media:
+            orig_title = ((d.get("original_title") if media_type == "movie" else d.get("original_name")) or "").strip()
+            disp_title = ((d.get("title") if media_type == "movie" else d.get("name")) or "").strip()
+            eng_alias, cn_alt_alias = await self._fetch_alias_titles(tmdb_id, media_type, {"api_key": api_key})
+
+            # 收集该条目所有可考证的中文标题候选
+            cn_candidates = []
+            if self._contains_chinese(disp_title):
+                cn_candidates.append(disp_title)
+            if self._contains_chinese(orig_title) and orig_title not in cn_candidates:
+                cn_candidates.append(orig_title)
+            if cn_alt_alias and self._contains_chinese(cn_alt_alias) and cn_alt_alias not in cn_candidates:
+                cn_candidates.append(cn_alt_alias)
+
+            matches_hint = False
+            if has_hint:
+                matches_hint = any(self._title_matches(chinese_title_hint, c) for c in cn_candidates)
+
+            candidate_info = {
+                "media_type": media_type,
+                "detail": d,
+                "orig_title": orig_title,
+                "disp_title": disp_title,
+                "eng_alias": eng_alias,
+                "cn_candidates": cn_candidates,
+                "matches_hint": matches_hint,
+            }
+            candidates.append(candidate_info)
+
+            # 若满足以下任一条件，直接确定命中无歧义，无需多余请求：
+            # 1. 命中中文标题匹配，且（无偏好 或 正好是首选媒体类型）
+            # 2. 未传入中文标题 hint，首个 200 候选按偏好顺序直接生效
+            if (has_hint and matches_hint and (preferred_media is None or media_type == preferred_media)) or not has_hint:
+                break
+
+        if not candidates:
             logger.warning(
-                f"⚠️ 无法获取 TMDB ID {tmdb_id} 的详情 (preferred={preferred_media}, last_http={status})"
+                f"⚠️ 无法获取 TMDB ID {tmdb_id} 的详情 (preferred={preferred_media}, last_http={last_status})"
             )
             await self._save_alias_cache(
                 tmdb_id=tmdb_id,
@@ -1073,22 +1134,39 @@ class TMDBService:
                 alias=None,
                 source="runtime",
                 status="failed",
-                note=f"detail_request_failed_http_{status}",
+                note=f"detail_request_failed_http_{last_status}",
             )
             return None
 
-        original_title = ((detail.get("original_title") if detail_media == "movie" else detail.get("original_name")) or "").strip()
-        chinese_title = ""
-        display_title = ((detail.get("title") if detail_media == "movie" else detail.get("name")) or "").strip()
-        if self._contains_chinese(original_title):
-            chinese_title = original_title
-        elif self._contains_chinese(display_title):
-            chinese_title = display_title
-        english_alias, chinese_alt_alias = await self._fetch_alias_titles(tmdb_id, detail_media, params)
-        if (not chinese_title) and chinese_alt_alias:
-            chinese_title = chinese_alt_alias
-        if (not chinese_title) and chinese_title_hint and self._contains_chinese(chinese_title_hint):
-            chinese_title = chinese_title_hint
+        # 从候选条目中智能选出最优解：
+        # 1. 若有候选命中中文标题匹配，优先选命中者；
+        #    若首选媒体类型未命中，而另一类型命中，记录纠偏日志！
+        # 2. 若均未命中（或无 hint），选与 preferred_media 一致的，否则选第一条
+        selected = None
+        if has_hint:
+            matched_candidates = [c for c in candidates if c["matches_hint"]]
+            if matched_candidates:
+                selected = next((c for c in matched_candidates if c["media_type"] == preferred_media), matched_candidates[0])
+                if preferred_media and selected["media_type"] != preferred_media:
+                    logger.info(
+                        f"🧭 TMDB 媒体类型智能纠偏: preferred=[{preferred_media}] 无中文匹配，"
+                        f"但 [{selected['media_type']}] 标题匹配 [{chinese_title_hint}]，自动纠偏为 [{selected['media_type']}]"
+                    )
+
+        if not selected:
+            selected = next((c for c in candidates if c["media_type"] == preferred_media), candidates[0])
+
+        detail = selected["detail"]
+        detail_media = selected["media_type"]
+        original_title = selected["orig_title"]
+        display_title = selected["disp_title"]
+        english_alias = selected["eng_alias"]
+        cn_candidates = selected["cn_candidates"]
+
+        chinese_title = cn_candidates[0] if cn_candidates else ""
+        if not chinese_title:
+            if selected.get("matches_hint") or (len(candidates) == 1 and has_hint):
+                chinese_title = chinese_title_hint or ""
 
         # 名称策略：
         # 1) 原名本身英文 -> 直接使用原名
