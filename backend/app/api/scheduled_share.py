@@ -23,6 +23,7 @@ class ScheduledShareTaskCreate(BaseModel):
     cleanup_temp_dir: bool = True
     min_size: float = 0.0
     min_size_unit: str = "GB"
+    min_file_count: Optional[int] = None
     target_channels: List[str] = []
     enabled: bool = True
     sensitive_replace_enabled: bool = False
@@ -36,6 +37,17 @@ class ScheduledShareTaskCreate(BaseModel):
             return 0.0
         return v
 
+    @field_validator('min_file_count', mode='before')
+    @classmethod
+    def coerce_min_file_count(cls, v):
+        if v is None or v == "":
+            return None
+        try:
+            val = int(v)
+            return val if val >= 0 else None
+        except (ValueError, TypeError):
+            return None
+
 
 class ScheduledShareTaskUpdate(BaseModel):
     name: Optional[str] = None
@@ -47,6 +59,7 @@ class ScheduledShareTaskUpdate(BaseModel):
     cleanup_temp_dir: Optional[bool] = None
     min_size: Optional[float] = None
     min_size_unit: Optional[str] = None
+    min_file_count: Optional[int] = None
     target_channels: Optional[List[str]] = None
     enabled: Optional[bool] = None
     sensitive_replace_enabled: Optional[bool] = None
@@ -59,6 +72,17 @@ class ScheduledShareTaskUpdate(BaseModel):
         if v is None or v == "":
             return 0.0
         return v
+
+    @field_validator('min_file_count', mode='before')
+    @classmethod
+    def coerce_min_file_count(cls, v):
+        if v is None or v == "":
+            return None
+        try:
+            val = int(v)
+            return val if val >= 0 else None
+        except (ValueError, TypeError):
+            return None
 
 
 @router.get("/")
@@ -81,6 +105,7 @@ async def list_tasks(user=Depends(get_current_user)):
                     "cleanup_temp_dir": t.cleanup_temp_dir,
                     "min_size": t.min_size,
                     "min_size_unit": t.min_size_unit,
+                    "min_file_count": t.min_file_count,
                     "target_channels": t.target_channels,
                     "enabled": t.enabled,
                     "status": t.status,
@@ -128,6 +153,7 @@ async def create_task(data: ScheduledShareTaskCreate, user=Depends(get_current_u
             cleanup_temp_dir=data.cleanup_temp_dir,
             min_size=data.min_size,
             min_size_unit=data.min_size_unit,
+            min_file_count=data.min_file_count,
             target_channels=data.target_channels,
             enabled=data.enabled,
             status="waiting" if data.enabled else "disabled",

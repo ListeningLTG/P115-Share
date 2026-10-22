@@ -51,6 +51,11 @@
             {{ record.min_size > 0 ? `≥ ${record.min_size} ${record.min_size_unit}` : '不检测' }}
           </a-tag>
         </template>
+        <template v-if="column.key === 'min_file_count'">
+          <a-tag :color="record.min_file_count !== null && record.min_file_count !== undefined ? 'geekblue' : 'default'">
+            {{ record.min_file_count !== null && record.min_file_count !== undefined ? `> ${record.min_file_count} 个` : '不限制' }}
+          </a-tag>
+        </template>
         <template v-if="column.key === 'target_channels'">
           <div style="max-width: 250px; display: flex; flex-wrap: wrap; gap: 4px">
             <a-tag v-for="ch in record.target_channels" :key="ch" color="cyan">
@@ -176,6 +181,21 @@
           </a-input-group>
         </a-form-item>
 
+        <a-form-item label="文件数触发阈值" name="min_file_count">
+          <template #extra>
+            <div style="font-size: 12px; color: #999; margin-top: 4px">
+              源目录内文件总数（包含所有子目录递归统计）大于该数值时才触发分享；留空表示不限制文件数。
+            </div>
+          </template>
+          <a-input-number
+            v-model:value="formState.min_file_count"
+            :min="0"
+            :precision="0"
+            style="width: 100%"
+            placeholder="留空表示不限制（如填 5 则文件数 > 5 才触发）"
+          />
+        </a-form-item>
+
         <a-form-item label="推送目标频道" name="target_channels">
           <template #extra>
             <div style="font-size: 12px; color: #999; margin-top: 4px">定时任务生成分享链接后，广播推送到选中的频道。可多选。</div>
@@ -246,6 +266,7 @@ interface Task {
   cleanup_temp_dir: boolean;
   min_size: number;
   min_size_unit: string;
+  min_file_count?: number | null;
   target_channels: string[];
   enabled: boolean;
   status: string;
@@ -277,6 +298,7 @@ const columns = [
   { title: '文件处理模式', key: 'share_mode', dataIndex: 'share_mode' },
   { title: '临时目录', key: 'cleanup_temp_dir', dataIndex: 'cleanup_temp_dir' },
   { title: '容量检测阈值', key: 'min_size', dataIndex: 'min_size' },
+  { title: '文件数阈值', key: 'min_file_count', dataIndex: 'min_file_count' },
   { title: '运行状态', key: 'status', dataIndex: 'status' },
   { title: '启用', key: 'enabled', dataIndex: 'enabled' },
   { title: '上次运行时间', key: 'last_run_at', dataIndex: 'last_run_at' },
@@ -303,6 +325,7 @@ const formState = reactive({
   cleanup_temp_dir: true,
   min_size: 0.0,
   min_size_unit: 'GB',
+  min_file_count: undefined as number | undefined | null,
   target_channels: [] as string[],
   enabled: true,
   sensitive_replace_enabled: false,
@@ -422,6 +445,7 @@ const openCreateModal = () => {
   formState.cleanup_temp_dir = true;
   formState.min_size = 0.0;
   formState.min_size_unit = 'GB';
+  formState.min_file_count = undefined;
   formState.target_channels = [];
   formState.enabled = true;
   formState.sensitive_replace_enabled = false;
@@ -441,6 +465,7 @@ const openEditModal = (record: Task) => {
   formState.cleanup_temp_dir = record.cleanup_temp_dir ?? true;
   formState.min_size = record.min_size ?? 0.0;
   formState.min_size_unit = record.min_size_unit ?? 'GB';
+  formState.min_file_count = record.min_file_count ?? undefined;
   formState.target_channels = [...(record.target_channels || [])];
   formState.enabled = record.enabled;
   formState.sensitive_replace_enabled = record.sensitive_replace_enabled ?? false;
@@ -469,6 +494,9 @@ const handleModalOk = async () => {
     }
     if (payload.min_size === null || payload.min_size === undefined || (payload.min_size as any) === '') {
       payload.min_size = 0.0;
+    }
+    if (payload.min_file_count === undefined || (payload.min_file_count as any) === '') {
+      payload.min_file_count = null;
     }
     if (editingId.value) {
       const res = await axios.put(`/api/scheduled-share/${editingId.value}`, payload);

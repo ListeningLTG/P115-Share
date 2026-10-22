@@ -500,42 +500,73 @@ async def _run_scheduled_share_task(task_id: int):
                         await session.commit()
                 return
                 
-            # 5.5 如果设置了容量限制，进行源目录容量检测
+            # 5.4 检测文件数与容量阈值限制
+            raw_min_file_count = getattr(task_db, "min_file_count", None)
+            min_file_count_val = None
+            if raw_min_file_count is not None:
+                try:
+                    min_file_count_val = int(raw_min_file_count)
+                except (ValueError, TypeError):
+                    min_file_count_val = None
+
             try:
                 min_size_val = float(getattr(task_db, "min_size", 0.0) or 0.0)
             except (ValueError, TypeError):
                 min_size_val = 0.0
 
-            if min_size_val > 0.0:
-                logger.info(f"⚖️ 开始检测源目录容量 (阈值: {min_size_val} {task_db.min_size_unit})...")
-                try:
-                    if baseline:
-                        dir_size = baseline["stats"]["size"]
-                    else:
-                        cat_resp = await svc._api_call_with_timeout(
-                            svc.client.fs_category_get_app, src_cid, async_=True,
-                            **svc._get_ios_ua_kwargs()
-                        )
+            if min_file_count_val is not None or min_size_val > 0.0:
+                stats_cache = None
+                if baseline:
+                    stats_cache = baseline.get("stats", {})
+                else:
+                    try:
+                        cat_resp = await svc._fs_category_get_with_fallback(src_cid, timeout=30)
+                        if svc._is_margin_response(cat_resp):
+                            raise RuntimeError(f"读取目录 {src_cid} 统计时触发限速: {cat_resp}")
                         check_response(cat_resp)
-                        dir_size = parse_size_to_bytes(cat_resp.get("size", 0))
-                    
-                    # 将任务设定的阈值换算为字节
-                    unit = getattr(task_db, "min_size_unit", "GB").upper()
-                    threshold_bytes = min_size_val * (1024**4 if unit == "TB" else 1024**3)
-                    
-                    logger.info(f"📊 源目录实际大小: {dir_size / (1024**3):.3f} GB ({dir_size} 字节), 设定阈值: {min_size_val} {unit} ({threshold_bytes} 字节)")
-                    
-                    if dir_size < threshold_bytes:
-                        logger.warning(f"⚠️ 源目录实际容量未达到阈值，跳过本次分享。")
-                        async with async_session() as session:
-                            task_db_cap = await session.get(ScheduledShareTask, task_id)
-                            if task_db_cap:
-                                task_db_cap.status = "success"
-                                task_db_cap.last_run_at = datetime.utcnow()
-                                await session.commit()
-                        return
-                except Exception as size_e:
-                    logger.error(f"❌ 获取源目录容量失败: {size_e}，将直接进行备份分享。")
+                        stats_cache = {
+                            "size": parse_size_to_bytes(cat_resp.get("size", 0)),
+                            "file_count": int(cat_resp.get("count", 0) or cat_resp.get("file_count", 0) or 0),
+                            "folder_count": int(cat_resp.get("folder_count", 0) or 0),
+                        }
+                    except Exception as cat_e:
+                        logger.error(f"❌ 获取源目录统计信息失败: {cat_e}")
+
+                if min_file_count_val is not None:
+                    logger.info(f"⚖️ 开始检测源目录文件数 (阈值: > {min_file_count_val} 个，包含子目录)...")
+                    if stats_cache and "file_count" in stats_cache:
+                        actual_file_count = stats_cache["file_count"]
+                        logger.info(f"📊 源目录实际文件总数: {actual_file_count} 个, 设定阈值: > {min_file_count_val} 个")
+                        if actual_file_count <= min_file_count_val:
+                            logger.warning(f"⚠️ 源目录文件总数 ({actual_file_count}) 未达到阈值 (需大于 {min_file_count_val})，跳过本次分享。")
+                            async with async_session() as session:
+                                task_db_cnt = await session.get(ScheduledShareTask, task_id)
+                                if task_db_cnt:
+                                    task_db_cnt.status = "success"
+                                    task_db_cnt.last_run_at = datetime.utcnow()
+                                    await session.commit()
+                            return
+                    else:
+                        logger.warning(f"⚠️ 未能获取源目录文件数统计，跳过文件数检测。")
+
+                if min_size_val > 0.0:
+                    logger.info(f"⚖️ 开始检测源目录容量 (阈值: {min_size_val} {task_db.min_size_unit})...")
+                    if stats_cache and "size" in stats_cache:
+                        dir_size = stats_cache["size"]
+                        unit = getattr(task_db, "min_size_unit", "GB").upper()
+                        threshold_bytes = min_size_val * (1024**4 if unit == "TB" else 1024**3)
+                        logger.info(f"📊 源目录实际大小: {dir_size / (1024**3):.3f} GB ({dir_size} 字节), 设定阈值: {min_size_val} {unit} ({threshold_bytes} 字节)")
+                        if dir_size < threshold_bytes:
+                            logger.warning(f"⚠️ 源目录实际容量未达到阈值，跳过本次分享。")
+                            async with async_session() as session:
+                                task_db_cap = await session.get(ScheduledShareTask, task_id)
+                                if task_db_cap:
+                                    task_db_cap.status = "success"
+                                    task_db_cap.last_run_at = datetime.utcnow()
+                                    await session.commit()
+                            return
+                    else:
+                        logger.warning(f"⚠️ 未能获取源目录容量统计，跳过容量检测。")
                 
             if share_mode == "direct":
                 logger.info(f"🔗 [直接分享模式] 正在为 {folder_name} (CID: {src_cid}) 创建分享链接...")

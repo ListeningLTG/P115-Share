@@ -239,6 +239,7 @@ class ScheduledShareTask(Base):
     cleanup_temp_dir: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1") # 分享成功后删除临时目录并清空回收站
     min_size: Mapped[float] = mapped_column(Float, default=0.0)                      # 最小容量触发阈值，0表示不检测
     min_size_unit: Mapped[str] = mapped_column(String(10), default="GB")             # 容量触发阈值单位 (GB/TB)
+    min_file_count: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)  # 最小文件数触发阈值（大于该值才执行），None 表示不限制
     target_channels: Mapped[dict] = mapped_column(JSON, default=list)                # 要推送的TG频道列表，支持多选
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)                      # 任务是否启用
     status: Mapped[str] = mapped_column(String(50), default="waiting")               # 当前运行状态 (waiting, running, success, failed)
