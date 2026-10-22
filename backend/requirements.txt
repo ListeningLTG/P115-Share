@@ -8,7 +8,8 @@ python-multipart
 aiohttp
 apscheduler==3.10.4
 aiofiles
-sqlalchemy
+sqlalchemy[asyncio]
+greenlet
 aiosqlite
 alembic
 python-jose[cryptography]
