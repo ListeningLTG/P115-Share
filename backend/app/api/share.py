@@ -7,7 +7,7 @@ from app.services.account_manager import account_manager
 from app.core.config import settings
 from app.core.database import async_session
 from app.models.schema import ShareAnalysisResult, ShareAnalysisState, P115Account, SharePushTask
-from sqlalchemy import select, delete, desc, or_, func
+from sqlalchemy import select, delete, desc, or_, func, case
 from loguru import logger
 import asyncio
 import time
@@ -95,6 +95,8 @@ def _get_state(account_id: int) -> dict:
     if account_id not in _analysis_states:
         _analysis_states[account_id] = {
             "is_analyzing": False,
+            "analysis_mode": None,
+            "incremental_added": 0,
             "total": 0,
             "normal": 0,
             "violated": 0,
@@ -118,6 +120,8 @@ async def _load_state_from_db(account_id: int):
             state = _get_state(account_id)
             state.update({
                 "is_analyzing": False,
+                "analysis_mode": None,
+                "incremental_added": 0,
                 "total": row.total,
                 "normal": row.normal,
                 "violated": row.violated,
@@ -175,6 +179,8 @@ async def perform_share_analysis(account_id: int):
 
     state = _get_state(account_id)
     state["is_analyzing"] = True
+    state["analysis_mode"] = "full"
+    state["incremental_added"] = 0
     state["normal"] = 0
     state["violated"] = 0
     state["invalid"] = 0
@@ -276,21 +282,186 @@ async def perform_share_analysis(account_id: int):
         await _save_state_to_db(account_id)
 
 
-async def _refresh_analysis_stats(account_id: int):
-    """从数据库重新计算分析统计并更新内存状态及数据库"""
-    async with async_session() as session:
-        rows = (await session.execute(
-            select(ShareAnalysisResult).where(ShareAnalysisResult.account_id == account_id)
-        )).scalars().all()
+
+async def perform_incremental_share_analysis(account_id: int):
+    """对指定账号执行增量分享分析（仅获取自上次分析以来的新增分享状态）"""
+    svc = await account_manager.get_service_for_analysis(account_id)
+    if not svc or not svc.client:
+        logger.warning(f"账号 {account_id} 未连接，无法执行增量分析")
+        state = _get_state(account_id)
+        state["is_analyzing"] = False
+        state["analysis_mode"] = None
+        return
+
     state = _get_state(account_id)
-    state["total"] = len(rows)
-    state["normal"] = sum(1 for r in rows if not r.is_violated and not r.is_expired and not r.is_reviewing)
-    state["invalid"] = sum(1 for r in rows if r.is_invalid)
-    state["violated"] = sum(1 for r in rows if r.is_violated and not r.is_invalid)
-    state["expired"] = sum(1 for r in rows if r.is_expired)
-    state["reviewing"] = sum(1 for r in rows if r.is_reviewing)
+    state["is_analyzing"] = True
+    state["analysis_mode"] = "incremental"
+    state["incremental_added"] = 0
+
+    # 查询本地已有分析结果中最大的 create_timestamp 及同时间戳已有的 share_code (防止同一秒多条分享去重问题)
+    async with async_session() as session:
+        max_ts_result = await session.execute(
+            select(func.max(ShareAnalysisResult.create_timestamp)).where(
+                ShareAnalysisResult.account_id == account_id
+            )
+        )
+        max_timestamp = max_ts_result.scalar() or 0
+
+        existing_codes = set()
+        if max_timestamp > 0:
+            codes_result = await session.execute(
+                select(ShareAnalysisResult.share_code).where(
+                    ShareAnalysisResult.account_id == account_id,
+                    ShareAnalysisResult.create_timestamp >= max_timestamp
+                )
+            )
+            existing_codes = {c for c in codes_result.scalars().all() if c}
+
+    # 如果本地没有任何历史记录，自动转为全量分析
+    if max_timestamp == 0:
+        logger.info(f"账号 {account_id} 本地无历史分析数据，增量分析自动转为全量分析")
+        await perform_share_analysis(account_id)
+        return
+
+    logger.info(f"账号 {account_id} 开始增量分析，基准时间戳: {max_timestamp} ({datetime.fromtimestamp(max_timestamp)})")
+
+    new_items_count = 0
+    try:
+        offset = 0
+        limit = 100
+        stop_scan = False
+
+        while not stop_scan:
+            payload = {
+                "offset": offset,
+                "limit": limit,
+                "order": "create_time",
+                "asc": 0,
+                "show_cancel_share": 0
+            }
+
+            resp = await svc.client.share_list(payload, async_=True)
+            if not resp.get("state"):
+                logger.warning(f"增量分析获取 share_list 失败: {resp}")
+                break
+
+            items = resp.get("list", [])
+            if not items:
+                break
+
+            rows_to_insert = []
+            for item in items:
+                create_time = item.get("create_time", 0)
+                share_code = item.get("share_code")
+
+                # 如果遇到比本地最新时间戳还要早的记录，说明已进入历史已知数据区间，立即终止扫描
+                if create_time < max_timestamp:
+                    stop_scan = True
+                    break
+
+                # 如果时间戳与最新时间戳相同，且已存在于本地库中，跳过
+                if create_time == max_timestamp and share_code in existing_codes:
+                    continue
+
+                status_info = get_share_status(item)
+                create_time_str = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M:%S') if create_time else "-"
+
+                rows_to_insert.append(ShareAnalysisResult(
+                    account_id=account_id,
+                    snap_id=item.get("snap_id"),
+                    share_code=share_code,
+                    share_title=item.get("share_title"),
+                    share_url=item.get("share_url"),
+                    receive_code=item.get("receive_code", ""),
+                    file_size=item.get("file_size", 0),
+                    size_text=format_size(item.get("file_size", 0)),
+                    create_time=create_time_str,
+                    create_timestamp=create_time,
+                    share_state=item.get("share_state"),
+                    status_text=status_info["status_text"],
+                    is_violated=status_info["is_violated"],
+                    is_invalid=status_info["is_invalid"],
+                    is_expired=status_info["is_expired"],
+                    is_reviewing=status_info["is_reviewing"],
+                    receive_count=item.get("receive_count", 0),
+                ))
+
+            if rows_to_insert:
+                async with async_session() as session:
+                    session.add_all(rows_to_insert)
+                    await session.commit()
+                new_items_count += len(rows_to_insert)
+                state["incremental_added"] = new_items_count
+
+            # 如果单页返回条数小于 limit 或已触发退出条件，终止循环
+            if stop_scan or len(items) < limit:
+                break
+
+            offset += limit
+            await asyncio.sleep(1.0)
+
+        # 增量抓取完成后，重新计算总体统计指标并保存
+        await _refresh_analysis_stats(account_id)
+        state["incremental_added"] = new_items_count
+        state["last_updated"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        await _save_state_to_db(account_id)
+        logger.info(f"账号 {account_id} 增量分析完成，新增入库 {new_items_count} 条记录")
+
+    except Exception as e:
+        logger.error(f"账号 {account_id} 增量分析异常: {e}")
+    finally:
+        state["is_analyzing"] = False
+        await _save_state_to_db(account_id)
+
+
+async def _refresh_analysis_stats(account_id: int):
+    """从数据库重新计算分析统计并更新内存状态及数据库（SQL聚合优化）"""
+    async with async_session() as session:
+        stmt = select(
+            func.count(ShareAnalysisResult.id).label("total"),
+            func.sum(
+                case(
+                    (
+                        (ShareAnalysisResult.is_violated == False)
+                        & (ShareAnalysisResult.is_expired == False)
+                        & (ShareAnalysisResult.is_reviewing == False),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("normal"),
+            func.sum(
+                case((ShareAnalysisResult.is_invalid == True, 1), else_=0)
+            ).label("invalid"),
+            func.sum(
+                case(
+                    (
+                        (ShareAnalysisResult.is_violated == True)
+                        & (ShareAnalysisResult.is_invalid == False),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("violated"),
+            func.sum(
+                case((ShareAnalysisResult.is_expired == True, 1), else_=0)
+            ).label("expired"),
+            func.sum(
+                case((ShareAnalysisResult.is_reviewing == True, 1), else_=0)
+            ).label("reviewing"),
+        ).where(ShareAnalysisResult.account_id == account_id)
+        res = (await session.execute(stmt)).one()
+
+    state = _get_state(account_id)
+    state["total"] = int(res.total or 0)
+    state["normal"] = int(res.normal or 0)
+    state["invalid"] = int(res.invalid or 0)
+    state["violated"] = int(res.violated or 0)
+    state["expired"] = int(res.expired or 0)
+    state["reviewing"] = int(res.reviewing or 0)
     state["scanned"] = state["total"]
     await _save_state_to_db(account_id)
+
 
 
 async def perform_batch_cancel(account_id: int):
@@ -361,8 +532,12 @@ async def perform_batch_cancel(account_id: int):
 
 
 @router.post("/analyze")
-async def start_analysis(background_tasks: BackgroundTasks, account_id: Optional[int] = None):
-    """开始全量分享分析"""
+async def start_analysis(
+    background_tasks: BackgroundTasks,
+    account_id: Optional[int] = None,
+    mode: str = Query("incremental", regex="^(incremental|full)$"),
+):
+    """开始分享分析（支持增量 incremental 与全量 full 模式）"""
     if account_id is None:
         account_id = await _get_default_account_id()
     if account_id is None:
@@ -370,10 +545,17 @@ async def start_analysis(background_tasks: BackgroundTasks, account_id: Optional
 
     state = _get_state(account_id)
     if state["is_analyzing"]:
-        return {"state": True, "message": "该账号分析正在进行中"}
+        mode_label = "全量" if state.get("analysis_mode") == "full" else "增量"
+        return {"state": True, "message": f"该账号{mode_label}分析正在进行中"}
 
-    background_tasks.add_task(perform_share_analysis, account_id)
-    return {"state": True, "message": "分析已启动", "account_id": account_id}
+    state["analysis_mode"] = mode
+    state["incremental_added"] = 0
+    if mode == "full":
+        background_tasks.add_task(perform_share_analysis, account_id)
+        return {"state": True, "message": "全量分析已启动", "account_id": account_id, "mode": "full"}
+    else:
+        background_tasks.add_task(perform_incremental_share_analysis, account_id)
+        return {"state": True, "message": "增量分析已启动", "account_id": account_id, "mode": "incremental"}
 
 
 @router.post("/reset")
@@ -411,9 +593,20 @@ async def get_analysis_status(account_id: Optional[int] = None):
     if account_id is None:
         account_id = await _get_default_account_id()
     if account_id is None:
-        return {"account_id": None, "is_analyzing": False, "total": 0,
-                "normal": 0, "violated": 0, "expired": 0, "reviewing": 0,
-                "scanned": 0, "last_updated": None}
+        return {
+            "account_id": None,
+            "is_analyzing": False,
+            "analysis_mode": None,
+            "incremental_added": 0,
+            "total": 0,
+            "normal": 0,
+            "violated": 0,
+            "invalid": 0,
+            "expired": 0,
+            "reviewing": 0,
+            "scanned": 0,
+            "last_updated": None,
+        }
 
     # 若内存中没有状态，先从 DB 加载
     if account_id not in _analysis_states:

@@ -17,9 +17,22 @@
         </a-select>
 
         <!-- 操作按钮区（始终显示，最左侧） -->
-        <a-button type="primary" :loading="isAnalyzing || loading" @click="startFullAnalysis">
+        <a-button
+          type="primary"
+          :loading="isAnalyzing && analysisMode === 'incremental'"
+          :disabled="isAnalyzing && analysisMode !== 'incremental'"
+          @click="startIncrementalAnalysis"
+        >
+          <template #icon><SyncOutlined /></template>
+          {{ isAnalyzing && analysisMode === 'incremental' ? '增量分析中...' : '增量分析' }}
+        </a-button>
+        <a-button
+          :loading="isAnalyzing && analysisMode === 'full'"
+          :disabled="isAnalyzing && analysisMode !== 'full'"
+          @click="startFullAnalysis"
+        >
           <template #icon><ReloadOutlined /></template>
-          {{ isAnalyzing ? '正在扫描...' : '一键分析' }}
+          {{ isAnalyzing && analysisMode === 'full' ? '全量扫描中...' : '全量分析' }}
         </a-button>
         <a-button :disabled="isAnalyzing || statsTotal === 0" @click="resetAnalysis">
           <template #icon><DeleteOutlined /></template>
@@ -58,7 +71,12 @@
           推送任务
         </a-button>
         <div v-if="isAnalyzing" style="font-size: 12px; color: #999">
-          扫描中: {{ scannedCount }} / {{ statsTotal }} ({{ statsTotal > 0 ? (scannedCount / statsTotal * 100).toFixed(2) : 0 }}%)
+          <template v-if="analysisMode === 'incremental'">
+            增量同步中: 已新增 {{ incrementalAdded }} 条...
+          </template>
+          <template v-else>
+            扫描中: {{ scannedCount }} / {{ statsTotal }} ({{ statsTotal > 0 ? (scannedCount / statsTotal * 100).toFixed(2) : 0 }}%)
+          </template>
         </div>
 
         <!-- 搜索和筛选：有扫描进度或分析结果时即可用 -->
@@ -313,7 +331,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, computed, onUnmounted } from 'vue';
-import { ReloadOutlined, DeleteOutlined, DownloadOutlined, SendOutlined, UnorderedListOutlined, StopOutlined } from '@ant-design/icons-vue';
+import { ReloadOutlined, SyncOutlined, DeleteOutlined, DownloadOutlined, SendOutlined, UnorderedListOutlined, StopOutlined } from '@ant-design/icons-vue';
 import { message, Modal } from 'ant-design-vue';
 import axios from 'axios';
 import type { Dayjs } from 'dayjs';
@@ -328,6 +346,8 @@ interface Account {
 
 const loading = ref(false);
 const isAnalyzing = ref(false);
+const analysisMode = ref<'full' | 'incremental' | ''>('');
+const incrementalAdded = ref(0);
 const shareData = ref([]);
 const searchText = ref('');
 const statusFilter = ref('all');
@@ -488,6 +508,12 @@ const pollAnalysisStatus = async () => {
     const data = response.data;
 
     isAnalyzing.value = data.is_analyzing;
+    if (data.analysis_mode) {
+      analysisMode.value = data.analysis_mode;
+    }
+    if (data.incremental_added !== undefined) {
+      incrementalAdded.value = data.incremental_added;
+    }
     statsTotal.value = data.total;
     statsNormal.value = data.normal;
     statsViolated.value = data.violated;
@@ -501,41 +527,88 @@ const pollAnalysisStatus = async () => {
       if (pollTimer) {
         clearInterval(pollTimer);
         pollTimer = null;
-        message.success('全量分析完成');
+        if (analysisMode.value === 'incremental') {
+          message.success(`增量分析完成，本次新增 ${data.incremental_added || 0} 条分享`);
+        } else {
+          message.success('全量分析完成');
+        }
+        analysisMode.value = '';
       }
       fetchShares(pagination.value.current, pagination.value.pageSize);
-    } else if (data.scanned > 0) {
-      // 扫描中静默刷新，支持实时查看/筛选已入库数据
+    } else if (data.scanned > 0 && analysisMode.value === 'full') {
+      // 全量扫描中静默刷新，支持实时查看/筛选已入库数据
       fetchShares(pagination.value.current, pagination.value.pageSize, true);
     }
   } catch (error) {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     isAnalyzing.value = false;
+    analysisMode.value = '';
   }
 };
 
-const startFullAnalysis = async () => {
+const startIncrementalAnalysis = async () => {
   if (isAnalyzing.value) return;
   try {
     const response = await axios.post('/api/share/analyze', null, {
-      params: { account_id: selectedAccountId.value }
+      params: {
+        account_id: selectedAccountId.value,
+        mode: 'incremental'
+      }
     });
     if (response.data.state) {
       isAnalyzing.value = true;
-      scannedCount.value = 0;
-      statsNormal.value = 0; statsViolated.value = 0;
-      statsExpired.value = 0; statsReviewing.value = 0;
-      shareData.value = [];
-      pagination.value.total = 0;
+      analysisMode.value = 'incremental';
+      incrementalAdded.value = 0;
       if (pollTimer) clearInterval(pollTimer);
-      pollTimer = setInterval(pollAnalysisStatus, 2000);
-      message.info('分析任务已在后台启动');
+      pollTimer = setInterval(pollAnalysisStatus, 1500);
+      message.info('增量分析已在后台启动');
     } else {
-      message.error(response.data.error || '启动分析失败');
+      message.error(response.data.error || response.data.message || '启动增量分析失败');
     }
   } catch (error) {
     message.error('请求失败');
   }
+};
+
+const executeFullAnalysis = async () => {
+  if (isAnalyzing.value) return;
+  try {
+    const response = await axios.post('/api/share/analyze', null, {
+      params: {
+        account_id: selectedAccountId.value,
+        mode: 'full'
+      }
+    });
+    if (response.data.state) {
+      isAnalyzing.value = true;
+      analysisMode.value = 'full';
+      scannedCount.value = 0;
+      statsNormal.value = 0; statsViolated.value = 0;
+      statsInvalid.value = 0; statsExpired.value = 0; statsReviewing.value = 0;
+      shareData.value = [];
+      pagination.value.total = 0;
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(pollAnalysisStatus, 2000);
+      message.info('全量分析任务已在后台启动');
+    } else {
+      message.error(response.data.error || response.data.message || '启动全量分析失败');
+    }
+  } catch (error) {
+    message.error('请求失败');
+  }
+};
+
+const startFullAnalysis = () => {
+  if (isAnalyzing.value) return;
+  Modal.confirm({
+    title: '确认执行全量分析',
+    content: '全量分析将清空当前账号的历史分析结果，并重新扫描该账号下的所有分享链接（耗时取决于分享总数，可能需要数分钟）。是否继续？',
+    okText: '确认全量分析',
+    cancelText: '取消',
+    onOk: () => {
+      executeFullAnalysis();
+    }
+  });
 };
 
 const resetAnalysis = () => {
