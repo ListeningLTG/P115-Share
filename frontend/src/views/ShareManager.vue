@@ -72,7 +72,7 @@
         </a-button>
         <div v-if="isAnalyzing" style="font-size: 12px; color: #999">
           <template v-if="analysisMode === 'incremental'">
-            增量同步中: 已新增 {{ incrementalAdded }} 条...
+            增量同步中: 已新增 {{ incrementalAdded }} 条<span v-if="incrementalUpdated > 0">，更新 {{ incrementalUpdated }} 条</span>...
           </template>
           <template v-else>
             扫描中: {{ scannedCount }} / {{ statsTotal }} ({{ statsTotal > 0 ? (scannedCount / statsTotal * 100).toFixed(2) : 0 }}%)
@@ -348,6 +348,7 @@ const loading = ref(false);
 const isAnalyzing = ref(false);
 const analysisMode = ref<'full' | 'incremental' | ''>('');
 const incrementalAdded = ref(0);
+const incrementalUpdated = ref(0);
 const shareData = ref([]);
 const searchText = ref('');
 const statusFilter = ref('all');
@@ -514,6 +515,9 @@ const pollAnalysisStatus = async () => {
     if (data.incremental_added !== undefined) {
       incrementalAdded.value = data.incremental_added;
     }
+    if (data.incremental_updated !== undefined) {
+      incrementalUpdated.value = data.incremental_updated;
+    }
     statsTotal.value = data.total;
     statsNormal.value = data.normal;
     statsViolated.value = data.violated;
@@ -528,7 +532,13 @@ const pollAnalysisStatus = async () => {
         clearInterval(pollTimer);
         pollTimer = null;
         if (analysisMode.value === 'incremental') {
-          message.success(`增量分析完成，本次新增 ${data.incremental_added || 0} 条分享`);
+          const added = data.incremental_added || 0;
+          const updated = data.incremental_updated || 0;
+          if (updated > 0) {
+            message.success(`增量分析完成：新增 ${added} 条，更新 ${updated} 条分享状态`);
+          } else {
+            message.success(`增量分析完成，本次新增 ${added} 条分享`);
+          }
         } else {
           message.success('全量分析完成');
         }
@@ -559,6 +569,7 @@ const startIncrementalAnalysis = async () => {
       isAnalyzing.value = true;
       analysisMode.value = 'incremental';
       incrementalAdded.value = 0;
+      incrementalUpdated.value = 0;
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = setInterval(pollAnalysisStatus, 1500);
       message.info('增量分析已在后台启动');

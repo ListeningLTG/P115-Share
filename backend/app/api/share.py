@@ -97,6 +97,7 @@ def _get_state(account_id: int) -> dict:
             "is_analyzing": False,
             "analysis_mode": None,
             "incremental_added": 0,
+            "incremental_updated": 0,
             "total": 0,
             "normal": 0,
             "violated": 0,
@@ -181,6 +182,7 @@ async def perform_share_analysis(account_id: int):
     state["is_analyzing"] = True
     state["analysis_mode"] = "full"
     state["incremental_added"] = 0
+    state["incremental_updated"] = 0
     state["normal"] = 0
     state["violated"] = 0
     state["invalid"] = 0
@@ -284,7 +286,7 @@ async def perform_share_analysis(account_id: int):
 
 
 async def perform_incremental_share_analysis(account_id: int):
-    """对指定账号执行增量分享分析（仅获取自上次分析以来的新增分享状态）"""
+    """对指定账号执行增量分享分析（获取新增分享并同步最新页已有分享的状态变更，如审核中变为正常/违规）"""
     svc = await account_manager.get_service_for_analysis(account_id)
     if not svc or not svc.client:
         logger.warning(f"账号 {account_id} 未连接，无法执行增量分析")
@@ -297,8 +299,9 @@ async def perform_incremental_share_analysis(account_id: int):
     state["is_analyzing"] = True
     state["analysis_mode"] = "incremental"
     state["incremental_added"] = 0
+    state["incremental_updated"] = 0
 
-    # 查询本地已有分析结果中最大的 create_timestamp 及同时间戳已有的 share_code (防止同一秒多条分享去重问题)
+    # 查询本地已有分析结果中最大的 create_timestamp (判断本地是否有历史基准数据)
     async with async_session() as session:
         max_ts_result = await session.execute(
             select(func.max(ShareAnalysisResult.create_timestamp)).where(
@@ -306,16 +309,6 @@ async def perform_incremental_share_analysis(account_id: int):
             )
         )
         max_timestamp = max_ts_result.scalar() or 0
-
-        existing_codes = set()
-        if max_timestamp > 0:
-            codes_result = await session.execute(
-                select(ShareAnalysisResult.share_code).where(
-                    ShareAnalysisResult.account_id == account_id,
-                    ShareAnalysisResult.create_timestamp >= max_timestamp
-                )
-            )
-            existing_codes = {c for c in codes_result.scalars().all() if c}
 
     # 如果本地没有任何历史记录，自动转为全量分析
     if max_timestamp == 0:
@@ -326,6 +319,8 @@ async def perform_incremental_share_analysis(account_id: int):
     logger.info(f"账号 {account_id} 开始增量分析，基准时间戳: {max_timestamp} ({datetime.fromtimestamp(max_timestamp)})")
 
     new_items_count = 0
+    updated_items_count = 0
+
     try:
         offset = 0
         limit = 100
@@ -349,63 +344,115 @@ async def perform_incremental_share_analysis(account_id: int):
             if not items:
                 break
 
-            rows_to_insert = []
-            for item in items:
-                create_time = item.get("create_time", 0)
-                share_code = item.get("share_code")
+            page_codes = [it.get("share_code") for it in items if it.get("share_code")]
 
-                # 如果遇到比本地最新时间戳还要早的记录，说明已进入历史已知数据区间，立即终止扫描
-                if create_time < max_timestamp:
-                    stop_scan = True
-                    break
+            # 查询本页中已存在于本地数据库中的记录
+            async with async_session() as session:
+                existing_map = {}
+                if page_codes:
+                    existing_result = await session.execute(
+                        select(ShareAnalysisResult).where(
+                            ShareAnalysisResult.account_id == account_id,
+                            ShareAnalysisResult.share_code.in_(page_codes)
+                        )
+                    )
+                    existing_map = {r.share_code: r for r in existing_result.scalars().all()}
 
-                # 如果时间戳与最新时间戳相同，且已存在于本地库中，跳过
-                if create_time == max_timestamp and share_code in existing_codes:
-                    continue
+                rows_to_insert = []
+                page_has_existing = False
 
-                status_info = get_share_status(item)
-                create_time_str = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M:%S') if create_time else "-"
+                for item in items:
+                    share_code = item.get("share_code")
+                    if not share_code:
+                        continue
 
-                rows_to_insert.append(ShareAnalysisResult(
-                    account_id=account_id,
-                    snap_id=item.get("snap_id"),
-                    share_code=share_code,
-                    share_title=item.get("share_title"),
-                    share_url=item.get("share_url"),
-                    receive_code=item.get("receive_code", ""),
-                    file_size=item.get("file_size", 0),
-                    size_text=format_size(item.get("file_size", 0)),
-                    create_time=create_time_str,
-                    create_timestamp=create_time,
-                    share_state=item.get("share_state"),
-                    status_text=status_info["status_text"],
-                    is_violated=status_info["is_violated"],
-                    is_invalid=status_info["is_invalid"],
-                    is_expired=status_info["is_expired"],
-                    is_reviewing=status_info["is_reviewing"],
-                    receive_count=item.get("receive_count", 0),
-                ))
+                    create_time = item.get("create_time", 0)
+                    status_info = get_share_status(item)
 
-            if rows_to_insert:
-                async with async_session() as session:
+                    if share_code in existing_map:
+                        # 历史已有的分享：判断状态是否发生变化（如审核中 -> 正常/违规）
+                        page_has_existing = True
+                        row = existing_map[share_code]
+
+                        new_status_text = status_info["status_text"]
+                        new_is_violated = status_info["is_violated"]
+                        new_is_invalid = status_info["is_invalid"]
+                        new_is_expired = status_info["is_expired"]
+                        new_is_reviewing = status_info["is_reviewing"]
+                        new_share_state = item.get("share_state")
+                        new_receive_count = item.get("receive_count", 0)
+
+                        # 如果状态、审核标记、违规标记、失效标记或接收次数不同，则用最新状态覆盖历史已有
+                        if (
+                            row.status_text != new_status_text
+                            or row.is_reviewing != new_is_reviewing
+                            or row.is_violated != new_is_violated
+                            or row.is_invalid != new_is_invalid
+                            or row.is_expired != new_is_expired
+                            or row.share_state != new_share_state
+                            or row.receive_count != new_receive_count
+                        ):
+                            logger.info(
+                                f"增量分析更新分享状态: [{share_code}] {row.share_title} "
+                                f"{row.status_text}(审核中={row.is_reviewing}) -> {new_status_text}(审核中={new_is_reviewing})"
+                            )
+                            row.status_text = new_status_text
+                            row.is_reviewing = new_is_reviewing
+                            row.is_violated = new_is_violated
+                            row.is_invalid = new_is_invalid
+                            row.is_expired = new_is_expired
+                            row.share_state = new_share_state
+                            row.receive_count = new_receive_count
+                            row.analysis_time = datetime.utcnow()
+                            updated_items_count += 1
+                    else:
+                        # 本地库中没有的新增分享
+                        create_time_str = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M:%S') if create_time else "-"
+                        rows_to_insert.append(ShareAnalysisResult(
+                            account_id=account_id,
+                            snap_id=item.get("snap_id"),
+                            share_code=share_code,
+                            share_title=item.get("share_title"),
+                            share_url=item.get("share_url"),
+                            receive_code=item.get("receive_code", ""),
+                            file_size=item.get("file_size", 0),
+                            size_text=format_size(item.get("file_size", 0)),
+                            create_time=create_time_str,
+                            create_timestamp=create_time,
+                            share_state=item.get("share_state"),
+                            status_text=status_info["status_text"],
+                            is_violated=status_info["is_violated"],
+                            is_invalid=status_info["is_invalid"],
+                            is_expired=status_info["is_expired"],
+                            is_reviewing=status_info["is_reviewing"],
+                            receive_count=item.get("receive_count", 0),
+                        ))
+
+                if rows_to_insert:
                     session.add_all(rows_to_insert)
-                    await session.commit()
-                new_items_count += len(rows_to_insert)
-                state["incremental_added"] = new_items_count
+                    new_items_count += len(rows_to_insert)
 
-            # 如果单页返回条数小于 limit 或已触发退出条件，终止循环
-            if stop_scan or len(items) < limit:
+                # 提交本页的新增和状态更新
+                await session.commit()
+
+            state["incremental_added"] = new_items_count
+            state["incremental_updated"] = updated_items_count
+
+            # 判定下一页：如果本页已经包含了本地已有分享（说明已覆盖到历史已知数据），或者已返回最后一页，则终止遍历
+            if page_has_existing or len(items) < limit:
+                stop_scan = True
                 break
 
             offset += limit
             await asyncio.sleep(1.0)
 
-        # 增量抓取完成后，重新计算总体统计指标并保存
+        # 重新计算总体统计指标并保存
         await _refresh_analysis_stats(account_id)
         state["incremental_added"] = new_items_count
+        state["incremental_updated"] = updated_items_count
         state["last_updated"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         await _save_state_to_db(account_id)
-        logger.info(f"账号 {account_id} 增量分析完成，新增入库 {new_items_count} 条记录")
+        logger.info(f"账号 {account_id} 增量分析完成，新增入库 {new_items_count} 条，状态更新 {updated_items_count} 条")
 
     except Exception as e:
         logger.error(f"账号 {account_id} 增量分析异常: {e}")
@@ -550,6 +597,7 @@ async def start_analysis(
 
     state["analysis_mode"] = mode
     state["incremental_added"] = 0
+    state["incremental_updated"] = 0
     if mode == "full":
         background_tasks.add_task(perform_share_analysis, account_id)
         return {"state": True, "message": "全量分析已启动", "account_id": account_id, "mode": "full"}
@@ -569,6 +617,9 @@ async def reset_analysis(account_id: Optional[int] = None):
     # 重置内存状态
     _analysis_states[account_id] = {
         "is_analyzing": False,
+        "analysis_mode": None,
+        "incremental_added": 0,
+        "incremental_updated": 0,
         "total": 0, "normal": 0, "violated": 0,
         "expired": 0, "reviewing": 0, "scanned": 0,
         "last_updated": None,
@@ -598,6 +649,7 @@ async def get_analysis_status(account_id: Optional[int] = None):
             "is_analyzing": False,
             "analysis_mode": None,
             "incremental_added": 0,
+            "incremental_updated": 0,
             "total": 0,
             "normal": 0,
             "violated": 0,
